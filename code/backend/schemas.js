@@ -1,0 +1,54 @@
+const { z } = require('zod');
+
+const githubWebhookSchema = z.object({
+    action: z.string(),
+    repository: z.object({
+        full_name: z.string()
+    }).passthrough().optional(),
+    pull_request: z.object({
+        html_url: z.string()
+    }).passthrough().optional()
+}).passthrough();
+
+const jiraWebhookSchema = z.object({
+    issue: z.object({
+        key: z.string(),
+        fields: z.object({
+            issuetype: z.object({
+                name: z.string()
+            }).passthrough()
+        }).passthrough()
+    }).passthrough(),
+    changelog: z.object({
+        items: z.array(
+            z.object({
+                field: z.string(),
+                toString: z.string().nullable().optional()
+            }).passthrough()
+        )
+    }).passthrough().optional()
+}).passthrough();
+
+const projectCreateSchema = z.object({
+    projectKey: z.string().optional(),
+    name: z.string().optional(),
+    repoFullName: z.string().optional(),
+    jiraProjectKey: z.string().optional()
+}).passthrough();
+
+const validateBody = (schema) => (req, res, next) => {
+    try {
+        schema.parse(req.body);
+        next();
+    } catch (error) {
+        console.error("Payload validation failed:", error.issues || error.message || error);
+        return res.status(400).json({ error: "Validation failed", details: error.issues || error });
+    }
+};
+
+module.exports = {
+    githubWebhookSchema,
+    jiraWebhookSchema,
+    projectCreateSchema,
+    validateBody
+};

@@ -1,0 +1,12 @@
+.codex
+.cursor
+.gemini
+.vscode
+.zed
+
+# AutoQA Dynamic Data & Artifacts
+code/backend/data/*.json
+!code/backend/data/.gitkeep
+code/backend/uploads/
+code/backend/.env
+node_modules

@@ -1,0 +1,137 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: #121212;
+  color: #F8F8F2;
+  min-height: 100vh;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1E1E2F;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #6272A4;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #7c8ab8;
+}
+
+/* Animation keyframes */
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes progressBar {
+  from {
+    width: 0%;
+  }
+  to {
+    width: 100%;
+  }
+}
+
+.animate-pulse {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+.animate-slide-in {
+  animation: slideIn 0.3s ease-out;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-out;
+}
+
+.animate-progress {
+  animation: progressBar 3s ease-in-out;
+}
+
+/* Terminal styling */
+.terminal-log {
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.log-info {
+  color: #50FA7B;
+}
+
+.log-warn {
+  color: #FFB86C;
+}
+
+.log-error {
+  color: #FF5555;
+}
+
+/* Glass effect */
+.glass {
+  background: rgba(30, 30, 47, 0.8);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(98, 114, 164, 0.3);
+}
+
+/* Status colors */
+.status-completed {
+  color: #50FA7B;
+}
+
+.status-running {
+  color: #8BE9FD;
+}
+
+.status-pending {
+  color: #6272A4;
+}
+
+.status-failed {
+  color: #FF5555;
+}
+
+.status-blocked {
+  color: #FFB86C;
+}
