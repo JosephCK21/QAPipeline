@@ -79,6 +79,23 @@ function ProjectDashboard() {
     }
   };
 
+  const handleDeleteRun = async (runId, e) => {
+    e.stopPropagation();
+    if (!window.confirm('Delete this run and all its test cases? This cannot be undone.')) return;
+    try {
+      const res = await fetch(`http://localhost:3001/api/runs/${runId}`, { method: 'DELETE' });
+      if (res.ok) {
+        showToast('Run deleted — re-trigger the PR to start fresh.', 'success');
+        setProjectRuns(prev => prev.filter(r => r.runId !== runId));
+      } else {
+        const data = await res.json();
+        showToast(`Failed to delete run: ${data.error}`, 'error');
+      }
+    } catch (err) {
+      showToast('Error deleting run', 'error');
+    }
+  };
+
   const handleDeleteDocument = async (filePath) => {
       try {
           const res = await fetch(`http://localhost:3001/api/projects/${projectId}/jira-documents`, {
@@ -555,13 +572,22 @@ function ProjectDashboard() {
                       )}
                     </div>
 
-                    {/* Right: View Details */}
-                    <button
-                      onClick={() => navigate(`/projects/${projectId}/run/${run.runId}/scripts`)}
-                      className="flex-shrink-0 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100"
-                    >
-                      View Details
-                    </button>
+                    {/* Right: actions */}
+                    <div className="flex items-center gap-2 flex-shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                      <button
+                        onClick={() => navigate(`/projects/${projectId}/run/${run.runId}/scripts`)}
+                        className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium transition-colors"
+                      >
+                        View Details
+                      </button>
+                      <button
+                        onClick={(e) => handleDeleteRun(run.runId, e)}
+                        className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors"
+                        title="Delete run and all test cases"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
                   </div>
                 );
               })}

@@ -155,13 +155,22 @@ function detectRefinementCandidates(repoFullName, prChangedFilenames) {
 // Hard-limit retry controller — the core of the new stateful approach
 // ---------------------------------------------------------------------------
 async function executeTestCaseWithRetries({
-    testCase, sandboxDir, runId, prUrl, codeContextSection,
+    testCase, containerName, sandboxDir, runId, prUrl, codeContextSection,
     linkedProject, refinementCandidates, sendEvent,
     runSummary
 }) {
     let currentScript = testCase.testScript;
     let finalStatus = 'fail';
     let healAttempts = 0;
+
+    // The interaction id from the initial test case generation call.
+    // Each heal call returns its own new interaction id, which becomes the
+    // previousInteractionId for the next heal — forming a proper conversation chain.
+    // Falls back to manual attemptHistory injection when no id is available.
+    let currentInteractionId = testCase.generationInteractionId || null;
+
+    // Manual history — used only as a fallback when previousInteractionId is unavailable.
+    const attemptHistory = [];
 
     for (let attempt = 1; attempt <= MAX_HEAL_ATTEMPTS; attempt++) {
         const attemptStartedAt = new Date().toISOString();
@@ -175,12 +184,16 @@ async function executeTestCaseWithRetries({
         });
         sendEvent('log', { level: 'INFO', message: `[Sandbox] ${testCase.testCaseId} attempt ${attempt}/${MAX_HEAL_ATTEMPTS}` });
 
-        // Run the script
+        // Run the script inside the persistent container.
+        // testCase.testData is passed separately and injected as a preamble by the sandbox,
+        // so the script can reference all fixture values via the testData variable.
         const sandboxResult = await executeTest(
+            containerName,
             sandboxDir,
             testCase.language || 'javascript',
             currentScript,
-            `test_${testCase.testCaseId}_attempt${attempt}.spec.${testCase.language === 'python' ? 'py' : 'js'}`
+            `test_${testCase.testCaseId}_attempt${attempt}.spec.${testCase.language === 'python' ? 'py' : 'js'}`,
+            testCase.testData || {}
         );
 
         const attemptEndedAt = new Date().toISOString();
@@ -212,33 +225,46 @@ async function executeTestCaseWithRetries({
             break;
         }
 
+        // Record this failure in the history before healing
+        const failureOutput = sandboxResult.output || sandboxResult.error || 'No output';
+        attemptHistory.push({
+            attemptNumber: attempt,
+            scriptUsed: currentScript,
+            failureOutput: failureOutput.slice(0, 1500) // keep history compact
+        });
+
         // Failed — record the attempt
         sendEvent('test_case_attempt', {
             testCaseId: testCase.testCaseId,
             scenarioId: testCase.scenarioId,
             attempt,
             status: 'fail',
-            failureOutput: sandboxResult.output || sandboxResult.error || 'No output',
+            failureOutput,
             scriptSnapshot: currentScript,
             startedAt: attemptStartedAt,
             endedAt: attemptEndedAt
         });
-        const failureSnippet = (sandboxResult.output || sandboxResult.error || 'No output').slice(0, 600);
+        const failureSnippet = failureOutput.slice(0, 2000);
         sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId}: FAIL on attempt ${attempt}` });
         sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId} failure output: ${failureSnippet}` });
 
         if (attempt < MAX_HEAL_ATTEMPTS) {
-            // Heal: ask LLM to patch the script with failure context
             healAttempts++;
             runSummary.retryCount++;
-            sendEvent('log', { level: 'INFO', message: `[Healing] Requesting patch for ${testCase.testCaseId} (attempt ${attempt + 1})...` });
+            const healMode = currentInteractionId ? 'stateful (previous_interaction_id)' : 'stateless (manual history)';
+            sendEvent('log', { level: 'INFO', message: `[Healing] Requesting patch for ${testCase.testCaseId} (attempt ${attempt + 1}, ${healMode})...` });
             try {
-                currentScript = await repairTestCaseScript({
+                const healResult = await repairTestCaseScript({
                     testCase: { ...testCase, testScript: currentScript },
-                    failureOutput: sandboxResult.output || sandboxResult.error || 'Unknown failure',
+                    failureOutput,
                     codeContextSection,
-                    attemptNumber: attempt + 1
+                    attemptNumber: attempt + 1,
+                    previousInteractionId: currentInteractionId,  // stateful chain
+                    attemptHistory  // fallback when no interaction id
                 });
+                currentScript = healResult.repairedScript;
+                // Thread the heal interaction id forward so the next heal also chains
+                currentInteractionId = healResult.interactionId || currentInteractionId;
             } catch (healErr) {
                 sendEvent('log', { level: 'ERROR', message: `[Healing] LLM repair failed: ${healErr.message}` });
                 break; // Can't heal — give up early
@@ -293,6 +319,9 @@ async function runPipeline(runId, prUrl, repoFullName) {
     };
 
     const emitSummary = () => sendEvent('run_summary_updated', { runId, ...runSummary });
+
+    // Declared here so the catch block can always clean up the container.
+    let _sandboxContainerName = null;
 
     try {
         // Phase 1: Initializing
@@ -349,10 +378,16 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // Phase 4: Test Generation
         sendEvent('phase_update', { phase: 'Test Generation', status: 'running' });
 
-        // Create sandbox once, shared across all test cases in this run
-        const sandboxDir = await createSandbox(runId, prDetails);
+        // Create sandbox once — returns a persistent container shared by all test cases
+        const { sandboxDir, containerName } = await createSandbox(runId, prDetails);
+        _sandboxContainerName = containerName;
 
         let overallSuccess = false;
+
+        // Accumulates compact summaries of test cases already generated in this run.
+        // Passed into each subsequent scenario's generation call so the LLM avoids
+        // duplicating coverage already handled by an earlier scenario.
+        const alreadyGeneratedSummary = [];
 
         for (const scenarioMapping of mappedScenarios) {
             const scenarioId = scenarioMapping.id || scenarioMapping.scenarioId;
@@ -374,14 +409,19 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 : null;
 
             let generatedTestCases = [];
+            let generationInteractionId = null; // stored to chain healing calls via previous_interaction_id
             try {
-                generatedTestCases = await generateTestCasesForScenario({
+                const genResult = await generateTestCasesForScenario({
                     scenario: { id: scenarioId, description: scenarioDescription, type: scenarioType, priority: scenarioPriority },
                     codeContextSection,
                     prDiffSection,
                     dependenciesSection: codeContext.dependencies || '',
-                    refinementContext
+                    refinementContext,
+                    alreadyGeneratedSummary  // cross-scenario awareness
                 });
+                generatedTestCases = genResult.testCases;
+                generationInteractionId = genResult.interactionId;
+                sendEvent('log', { level: 'INFO', message: `[Generation] Interaction ID: ${generationInteractionId || 'unavailable'} (used for stateful healing)` });
             } catch (genErr) {
                 sendEvent('log', { level: 'ERROR', message: `Test case generation failed for ${scenarioId}: ${genErr.message}` });
                 sendEvent('scenario_execution_updated', { scenarioId, status: 'error', totals: { passed: 0, failed: 0, running: 0 } });
@@ -398,22 +438,23 @@ async function runPipeline(runId, prUrl, repoFullName) {
             const persistedCases = [];
             for (const tc of generatedTestCases) {
                 const saved = {
-                    testCaseId:        tc.testCaseId,
+                    testCaseId:              tc.testCaseId,
                     scenarioId,
-                    projectKey:        linkedProject?.jiraProjectKey || '',
+                    projectKey:              linkedProject?.jiraProjectKey || '',
                     runId,
                     prUrl,
-                    title:             tc.title,
-                    steps:             tc.steps || [],
-                    testData:          tc.testData || {},
-                    testScript:        tc.testScript || '',
-                    language:          tc.language || 'javascript',
-                    status:            'pending',
-                    version:           tc.isRefinement ? baseVersion : 1,
-                    previousVersionId: tc.isRefinement ? (refinementForScenario?.testCase.testCaseId || null) : null,
-                    codeFiles:         tc.codeFiles || [],
-                    healAttempts:      0,
-                    createdAt:         new Date().toISOString()
+                    title:                   tc.title,
+                    steps:                   tc.steps || [],
+                    testData:                tc.testData || {},
+                    testScript:              tc.testScript || '',
+                    language:                tc.language || 'javascript',
+                    status:                  'pending',
+                    version:                 tc.isRefinement ? baseVersion : 1,
+                    previousVersionId:       tc.isRefinement ? (refinementForScenario?.testCase.testCaseId || null) : null,
+                    codeFiles:               tc.codeFiles || [],
+                    healAttempts:            0,
+                    generationInteractionId, // enables stateful heal chaining
+                    createdAt:               new Date().toISOString()
                 };
                 upsertTestCase(saved);
                 persistedCases.push(saved);
@@ -426,6 +467,17 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 isRefinement: !!refinementContext
             });
 
+            // Update the cross-scenario awareness summary so subsequent scenarios
+            // in this loop can avoid duplicating coverage already generated above.
+            for (const tc of persistedCases) {
+                alreadyGeneratedSummary.push({
+                    scenarioId,
+                    title: tc.title,
+                    type: scenarioType,
+                    coveredInputs: Object.keys(tc.testData || {})
+                });
+            }
+
             // Phase 5: Sandbox execution with stateful retry per test case
             sendEvent('phase_update', { phase: 'Sandbox Testing', status: 'running' });
 
@@ -435,6 +487,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
             for (const tc of persistedCases) {
                 const tcStatus = await executeTestCaseWithRetries({
                     testCase: tc,
+                    containerName,
                     sandboxDir,
                     runId,
                     prUrl,
@@ -478,7 +531,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('phase_update', { phase: 'Pass', status: overallSuccess ? 'completed' : 'failed' });
 
         emitSummary();
-        cleanupSandbox(runId);
+        cleanupSandbox(runId, containerName);
         sendEvent('complete', { success: overallSuccess });
 
     } catch (error) {
@@ -488,7 +541,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('phase_update', { phase: 'Test Generation', status: 'error' });
         sendEvent('log', { level: 'ERROR', message: `Fatal Error: ${error.message}` });
         sendEvent('error', { message: error.message });
-        cleanupSandbox(runId);
+        cleanupSandbox(runId, _sandboxContainerName);
     }
 }
 

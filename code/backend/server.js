@@ -883,6 +883,22 @@ app.get('/api/runs/:runId', (req, res) => {
     }
 });
 
+app.delete('/api/runs/:runId', (req, res) => {
+    try {
+        const { deleteRunData } = require('./db');
+        const run = getRun(req.params.runId);
+        if (!run) {
+            return res.status(404).json({ error: 'Run not found' });
+        }
+        deleteRunData(req.params.runId);
+        if (global.io) global.io.emit('refresh_data');
+        res.json({ success: true, runId: req.params.runId });
+    } catch (error) {
+        console.error('[Delete Run] Failed:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.listen = undefined; // Avoid accidentally using app.listen
 server.listen(PORT, async () => {
     console.log(`Backend server running on http://localhost:${PORT}`);

@@ -1,5 +1,5 @@
 const { Type } = require('@google/genai');
-const { genAI } = require('./geminiService');
+const { genAI, emitLlmTrace } = require('./geminiService');
 
 function safeParseJSON(text) {
     if (!text) return {};
@@ -149,6 +149,8 @@ async function generateScenariosFromJiraContext({ epic, story, docTexts }) {
         const model = process.env.GEMINI_MODEL || 'gemma-4-31b-it';
         const prompt = buildPrompt({ epic, story, docTexts });
 
+        const _jiraStartMs = Date.now();
+        emitLlmTrace({ caller: 'generateScenariosFromJiraContext', model, phase: 'request', prompt });
         const response = await genAI.models.generateContent({
             model,
             contents: prompt,
@@ -158,6 +160,7 @@ async function generateScenariosFromJiraContext({ epic, story, docTexts }) {
             }
         });
 
+        emitLlmTrace({ caller: 'generateScenariosFromJiraContext', model, phase: 'response', response: response.text, durationMs: Date.now() - _jiraStartMs });
         const parsed = safeParseJSON(response.text);
         return normalizeResult(parsed, story, epic);
     } catch (error) {

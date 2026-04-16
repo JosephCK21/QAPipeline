@@ -35,6 +35,7 @@ function App() {
   const [toast, setToast] = useState(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0); // For forcing child components to re-fetch data
+  const [llmTraces, setLlmTraces] = useState([]);
 
   // Load initial data and Socket.io listeners
   useEffect(() => {
@@ -91,6 +92,10 @@ function App() {
         setRefreshKey(prev => prev + 1); // Trigger useEffects in child components
     });
 
+    socket.on('llm_trace', (trace) => {
+        setLlmTraces(prev => [...prev.slice(-199), trace]); // keep last 200
+    });
+
     return () => socket.disconnect();
   }, []);
 
@@ -140,7 +145,9 @@ function App() {
     showToast,
     sidebarCollapsed,
     setSidebarCollapsed,
-    refreshKey // Exporting to child components to trigger data refresh automatically
+    refreshKey, // Exporting to child components to trigger data refresh automatically
+    llmTraces,
+    setLlmTraces
   };
 
   return (

@@ -1,4 +1,4 @@
-const { genAI } = require('./geminiService');
+const { genAI, emitLlmTrace } = require('./geminiService');
 
 function safeParseJSON(text) {
     if (!text) return {};
@@ -189,15 +189,19 @@ Return a JSON object with "mappings" and "unresolvedChanges" arrays.`;
     console.log(`[prScenarioMappingService] Calling LLM (${model}) with ${enrichedFiles.length} file(s) and ${scenarios.length} scenario(s)`);
 
     try {
+        const _prStartMs = Date.now();
+        emitLlmTrace({ caller: 'mapPrChangesToScenarios', model, phase: 'request', prompt });
         const interaction = await genAI.interactions.create({
             model,
             input: prompt,
+            response_mime_type: 'application/json',
             response_format: MAPPING_RESPONSE_SCHEMA
         });
 
         const outputs = Array.isArray(interaction.outputs) ? interaction.outputs : [];
         const textOutput = outputs.filter(o => o.type === 'text').pop();
         const rawText = textOutput?.text || '';
+        emitLlmTrace({ caller: 'mapPrChangesToScenarios', model, phase: 'response', response: rawText, durationMs: Date.now() - _prStartMs });
         console.log(`[prScenarioMappingService] Raw LLM response (first 500 chars): ${rawText.slice(0, 500)}`);
         const parsed = safeParseJSON(rawText);
         console.log(`[prScenarioMappingService] Parsed mappings: ${Array.isArray(parsed?.mappings) ? parsed.mappings.length : 'parse error'}`);
