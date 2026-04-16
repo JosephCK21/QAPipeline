@@ -121,13 +121,19 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
 - List the codeFiles array with paths of PR files this test case exercises
 - Set isRefinement: ${refinementContext ? 'true' : 'false'}
 
-The script must be immediately runnable in a Node.js or Python test environment.
-Use require/import style matching the codebase. Test data must be concrete values.`;
+IMPORTANT RULES FOR THE testScript:
+- The script runs inside an isolated Docker container where the full app source code is already present.
+- The app's dependencies (express, etc.) are pre-installed but the server is NOT already running.
+- For Node.js Express apps: use "supertest" — require the server module, pass it directly to supertest, and do NOT call app.listen() yourself. Example: const request = require('supertest'); const app = require('./todoServer'); const res = await request(app).post('/todos').send({...});
+- Never make raw HTTP calls to localhost URLs or assume a server is running externally.
+- Use CommonJS require() style (not ES modules import).
+- The test framework is Jest — use describe/it/expect blocks.
+- Test data must be concrete hardcoded values, never placeholders.`;
 
     const interaction = await genAI.interactions.create({
         model,
         input: prompt,
-        response_format: { type: "json_schema", json_schema: { schema: TEST_CASE_RESPONSE_SCHEMA } }
+        response_format: TEST_CASE_RESPONSE_SCHEMA
     });
 
     const text = extractInteractionText(interaction);

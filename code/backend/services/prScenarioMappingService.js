@@ -1,4 +1,3 @@
-const { Type } = require('@google/genai');
 const { genAI } = require('./geminiService');
 
 function safeParseJSON(text) {
@@ -26,46 +25,41 @@ function safeParseJSON(text) {
     }
 }
 
-function responseSchema() {
-    return {
-        type: Type.OBJECT,
-        properties: {
-            mappings: {
-                type: Type.ARRAY,
-                items: {
-                    type: Type.OBJECT,
-                    properties: {
-                        scenarioId: { type: Type.STRING },
-                        requirementId: { type: Type.STRING },
-                        confidence: { type: Type.NUMBER },
-                        rationale: { type: Type.STRING },
-                        impactedFiles: {
-                            type: Type.ARRAY,
-                            items: { type: Type.STRING }
-                        }
-                    },
-                    required: ['scenarioId', 'requirementId', 'confidence', 'rationale', 'impactedFiles']
-                }
-            },
-            unresolvedChanges: {
-                type: Type.ARRAY,
-                items: {
-                    type: Type.OBJECT,
-                    properties: {
-                        filename: { type: Type.STRING },
-                        reason: { type: Type.STRING }
-                    },
-                    required: ['filename', 'reason']
-                }
+const MAPPING_RESPONSE_SCHEMA = {
+    type: 'object',
+    properties: {
+        mappings: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    scenarioId:     { type: 'string' },
+                    requirementId:  { type: 'string' },
+                    confidence:     { type: 'number' },
+                    rationale:      { type: 'string' },
+                    impactedFiles:  { type: 'array', items: { type: 'string' } }
+                },
+                required: ['scenarioId', 'requirementId', 'confidence', 'rationale', 'impactedFiles']
             }
         },
-        required: ['mappings', 'unresolvedChanges']
-    };
-}
+        unresolvedChanges: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    filename: { type: 'string' },
+                    reason:   { type: 'string' }
+                },
+                required: ['filename', 'reason']
+            }
+        }
+    },
+    required: ['mappings', 'unresolvedChanges']
+};
 
 function normalizeScenarioItem(item) {
     return {
-        id: String(item?.id || '').trim(),
+        id: String(item?.scenarioId || item?.id || '').trim(),
         description: String(item?.description || '').trim(),
         type: String(item?.type || '').trim(),
         relatedReq: String(item?.relatedReq || item?.parentReq || '').trim(),
@@ -115,13 +109,38 @@ function normalizeResult(parsed, files, scenarios) {
     return { mappings, unresolvedChanges };
 }
 
+const CODE_EXTENSIONS = new Set([
+    '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+    '.py', '.rb', '.java', '.go', '.cs', '.cpp', '.c', '.h',
+    '.php', '.swift', '.kt', '.rs', '.scala',
+    '.html', '.css', '.scss', '.sass', '.less',
+    '.json', '.yaml', '.yml', '.toml', '.env',
+    '.sh', '.bash', '.ps1', '.sql'
+]);
+
+function isCodeFile(filename) {
+    const ext = filename.includes('.') ? '.' + filename.split('.').pop().toLowerCase() : '';
+    return CODE_EXTENSIONS.has(ext);
+}
+
 async function mapPrChangesToScenarios({ prDetails, jiraRtmEntry, documentTexts = [] }) {
-    const files = Array.isArray(prDetails?.files) ? prDetails.files : [];
+    const allFiles = Array.isArray(prDetails?.files) ? prDetails.files : [];
+    const skipped = allFiles.filter(f => !isCodeFile(f.filename));
+    const files = allFiles.filter(f => isCodeFile(f.filename));
+    if (skipped.length > 0) {
+        console.log(`[prScenarioMappingService] Skipping ${skipped.length} non-code file(s) from mapping: ${skipped.map(f => f.filename).join(', ')}`);
+    }
     const scenarios = (Array.isArray(jiraRtmEntry?.scenarios) ? jiraRtmEntry.scenarios : [])
         .map(normalizeScenarioItem)
         .filter((scenario) => scenario.id && !scenario.obsolete);
 
+    console.log(`[prScenarioMappingService] Files in PR: ${files.length} | Active scenarios after normalization: ${scenarios.length}`);
+    if (scenarios.length > 0) {
+        console.log(`[prScenarioMappingService] Scenario IDs: ${scenarios.map(s => s.id).slice(0, 10).join(', ')}`);
+    }
+
     if (!files.length || !scenarios.length) {
+        console.warn(`[prScenarioMappingService] Early return — files: ${files.length}, scenarios: ${scenarios.length}`);
         return {
             mappings: [],
             unresolvedChanges: files.map((file) => ({
@@ -131,39 +150,65 @@ async function mapPrChangesToScenarios({ prDetails, jiraRtmEntry, documentTexts 
         };
     }
 
-    const model = process.env.GEMINI_MODEL || 'gemma-4-31b-it';
+    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-    const reducedFiles = files.map((file) => ({
+    // Include both the patch/diff AND the full file content so the LLM has complete context
+    const enrichedFiles = files.map((file) => ({
         filename: file.filename,
         status: file.status,
-        patch: String(file.patch || '').slice(0, 8000)
+        patch: String(file.patch || '').slice(0, 6000),
+        fullContent: String(file.content || '').slice(0, 6000)
     }));
 
-    const prompt = `You are an expert QA impact analyst.\n\nMap PR changes to the most relevant RTM scenarios.\n\nOutput strict JSON only.\n\nScenario catalog:\n${JSON.stringify(scenarios, null, 2)}\n\nPR context:\n${JSON.stringify({
-        title: prDetails?.title || '',
-        branch: prDetails?.branch || '',
-        files: reducedFiles
-    }, null, 2)}\n\nAdditional project context from uploaded documents:\n${JSON.stringify(documentTexts.slice(0, 5), null, 2)}\n\nRules:\n1) A PR file can map to multiple scenarios.\n2) Only map to scenarios that are actually relevant.\n3) Confidence must be between 0 and 1.\n4) Include unresolvedChanges for files where no reliable mapping exists.`;
+    const prompt = `You are an expert QA impact analyst.
+
+Your job is to map which RTM test scenarios are relevant to the changes in this pull request.
+
+SCENARIO CATALOG (these are the only valid scenarioId values):
+${JSON.stringify(scenarios, null, 2)}
+
+PULL REQUEST CONTEXT:
+Title: ${prDetails?.title || 'N/A'}
+Branch: ${prDetails?.branch || 'N/A'}
+
+CHANGED FILES (with diffs and full content):
+${JSON.stringify(enrichedFiles, null, 2)}
+
+PROJECT DOCUMENTS:
+${JSON.stringify(documentTexts.slice(0, 5), null, 2)}
+
+MAPPING RULES:
+1) Map ONLY to scenarioId values from the catalog above — do not invent new IDs.
+2) A changed file can map to multiple scenarios.
+3) Only include scenarios that are genuinely affected by the code changes.
+4) confidence must be a number between 0 and 1.
+5) For every changed file you cannot map confidently, include it in unresolvedChanges.
+
+Return a JSON object with "mappings" and "unresolvedChanges" arrays.`;
+
+    console.log(`[prScenarioMappingService] Calling LLM (${model}) with ${enrichedFiles.length} file(s) and ${scenarios.length} scenario(s)`);
 
     try {
-        const response = await genAI.models.generateContent({
+        const interaction = await genAI.interactions.create({
             model,
-            contents: prompt,
-            config: {
-                responseSchema: responseSchema(),
-                responseMimeType: 'application/json'
-            }
+            input: prompt,
+            response_format: MAPPING_RESPONSE_SCHEMA
         });
 
-        const parsed = safeParseJSON(response.text);
+        const outputs = Array.isArray(interaction.outputs) ? interaction.outputs : [];
+        const textOutput = outputs.filter(o => o.type === 'text').pop();
+        const rawText = textOutput?.text || '';
+        console.log(`[prScenarioMappingService] Raw LLM response (first 500 chars): ${rawText.slice(0, 500)}`);
+        const parsed = safeParseJSON(rawText);
+        console.log(`[prScenarioMappingService] Parsed mappings: ${Array.isArray(parsed?.mappings) ? parsed.mappings.length : 'parse error'}`);
         return normalizeResult(parsed, files, scenarios);
     } catch (error) {
-        console.error('[prScenarioMappingService.mapPrChangesToScenarios] Failed:', error.message);
+        console.error('[prScenarioMappingService.mapPrChangesToScenarios] Failed:', error?.message, error?.status, JSON.stringify(error?.errorDetails || ''));
         return {
             mappings: [],
             unresolvedChanges: files.map((file) => ({
                 filename: String(file?.filename || '').trim(),
-                reason: `Mapping service fallback: ${error.message}`
+                reason: `Mapping service error: ${error.message}`
             })).filter((item) => item.filename)
         };
     }

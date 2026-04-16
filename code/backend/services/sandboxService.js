@@ -68,10 +68,23 @@ async function createSandbox(runId, prDetails) {
             const timeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
             await execPromise(cloneCmd, { timeout: timeoutMs });
             console.log(`[Sandbox] Cloned repo: ${prDetails.headRepoFullName} @ ${prDetails.headRef}`);
+
+            // Pre-install the app's own dependencies once so tests can require them.
+            // This avoids re-downloading express/etc on every test attempt.
+            const pkgJsonPath = path.join(sandboxDir, 'package.json');
+            try {
+                await fs.access(pkgJsonPath);
+                const isWin = process.platform === 'win32';
+                const volumeDir = isWin ? sandboxDir.replace(/\\/g, '/') : sandboxDir;
+                const installCmd = `docker run --rm -v "${volumeDir}:/app" -w /app node:20-slim sh -c "npm install --no-audit --no-fund --silent"`;
+                await execPromise(installCmd, { timeout: timeoutMs });
+                console.log(`[Sandbox] Pre-installed app dependencies.`);
+            } catch (installErr) {
+                console.warn(`[Sandbox] App dependency pre-install skipped or failed: ${installErr.message}`);
+            }
             
-            // Still overlay the mock data or other AI-generated flat files directly
-            // prDetails.files usually contains 'mock_data.json' because we inject it in pipeline.js
-            await Promise.all(prDetails.files.map(async file => {
+            // Overlay mock data if present
+            await Promise.all((prDetails.files || []).map(async file => {
                if (file.filename === 'mock_data.json') {
                    const filePath = path.join(sandboxDir, 'mock_data.json');
                    await fs.writeFile(filePath, file.content, 'utf8');
@@ -80,7 +93,7 @@ async function createSandbox(runId, prDetails) {
         } else {
             // Fallback for flat structure if repo info is missing
             await Promise.all(
-                prDetails.files.map(async file => {
+                (prDetails.files || []).map(async file => {
                     const filePath = path.join(sandboxDir, path.basename(file.filename));
                     await fs.writeFile(filePath, file.content, 'utf8');
                 })
@@ -90,7 +103,7 @@ async function createSandbox(runId, prDetails) {
         console.error('[Sandbox] Failed to clone repo, falling back to flat file drop', err);
         // Fallback
         await Promise.all(
-            prDetails.files.map(async file => {
+            (prDetails.files || []).map(async file => {
                 const filePath = path.join(sandboxDir, path.basename(file.filename));
                 await fs.writeFile(filePath, file.content, 'utf8');
             })
@@ -122,8 +135,10 @@ async function executeTest(sandboxDir, testLanguage, testContent, testFilename) 
         if (testLanguage === 'javascript') {
             const depsStr = ['jest', ...dependencies].join(' ');
             
-            // Build the shell command that runs inside the container
-            const containerScript = `npm init -y && npm install ${depsStr} --no-audit --no-fund && npx jest ${testFilename}`;
+            // Do NOT run `npm init -y` — that would overwrite the cloned app's package.json
+            // and lose all of its dependencies (express, etc.).
+            // Instead just install the test-specific packages on top of what's already there.
+            const containerScript = `npm install ${depsStr} --no-audit --no-fund --silent && npx jest ${testFilename} --no-coverage 2>&1`;
             
             // Run Node.js container, mount sandbox directory, execute script
             executeCmd = `docker run --rm -v "${volumeDir}:/app" -w /app node:20-slim sh -c "${containerScript}"`;

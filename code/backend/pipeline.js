@@ -73,16 +73,20 @@ async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent) {
         }
 
         const projectScenarios = getScenariosByProject(linkedProject.jiraProjectKey || linkedProject.id);
+        sendEvent('log', { level: 'INFO', message: `PR mapping: found ${projectScenarios?.length || 0} scenario(s) in DB for project key "${linkedProject.jiraProjectKey || linkedProject.id}"` });
         if (!projectScenarios || projectScenarios.length === 0) {
             sendEvent('log', { level: 'WARN', message: `PR mapping skipped: no scenarios found for project` });
             return null;
         }
 
         const prDetails = await fetchPRDetails(prUrl);
+        sendEvent('log', { level: 'INFO', message: `PR mapping: fetched PR with ${prDetails?.files?.length || 0} changed file(s): ${(prDetails?.files || []).map(f => f.filename).join(', ')}` });
         sendEvent('pr_details', prDetails);
 
         const docs = getDocsForProject(linkedProject.id);
         const documentTexts = await extractTextFromFiles(docs);
+        sendEvent('log', { level: 'INFO', message: `PR mapping: ${documentTexts?.length || 0} project document(s) loaded` });
+
         const jiraRtmEntry = { scenarios: projectScenarios };
 
         const mapping = await mapPrChangesToScenarios({ prDetails, jiraRtmEntry, documentTexts });
@@ -91,7 +95,7 @@ async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent) {
 
         return { ...mapping, _prDetails: prDetails };
     } catch (error) {
-        sendEvent('log', { level: 'WARN', message: `PR mapping failed: ${error.message}` });
+        sendEvent('log', { level: 'WARN', message: `PR mapping failed: ${error.message} | stack: ${error.stack?.split('\n')[1] || ''}` });
         return null;
     }
 }
@@ -113,7 +117,13 @@ async function buildCodeContext(prDetails) {
     if (!owner || !repo) return { fullFiles: [], testFiles: [], dependencies: '' };
 
     const ref = prDetails.headRef || 'main';
-    const changedPaths = (prDetails.files || []).map(f => f.filename);
+    const NON_CODE_EXTS = new Set(['.md', '.txt', '.rst', '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.lock', '.log']);
+    const changedPaths = (prDetails.files || [])
+        .map(f => f.filename)
+        .filter(p => {
+            const ext = p.includes('.') ? '.' + p.split('.').pop().toLowerCase() : '';
+            return !NON_CODE_EXTS.has(ext);
+        });
 
     const [fullFiles, testFiles, dependencies] = await Promise.all([
         fetchFullFileContents(owner, repo, ref, changedPaths),
@@ -213,7 +223,9 @@ async function executeTestCaseWithRetries({
             startedAt: attemptStartedAt,
             endedAt: attemptEndedAt
         });
+        const failureSnippet = (sandboxResult.output || sandboxResult.error || 'No output').slice(0, 600);
         sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId}: FAIL on attempt ${attempt}` });
+        sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId} failure output: ${failureSnippet}` });
 
         if (attempt < MAX_HEAL_ATTEMPTS) {
             // Heal: ask LLM to patch the script with failure context
@@ -338,7 +350,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('phase_update', { phase: 'Test Generation', status: 'running' });
 
         // Create sandbox once, shared across all test cases in this run
-        const sandboxDir = await createSandbox(runId);
+        const sandboxDir = await createSandbox(runId, prDetails);
 
         let overallSuccess = false;
 

@@ -297,18 +297,51 @@ function listRuns(repoFullName) {
 }
 
 function deleteProjectData(projectKey, repoFullName, localProjectId) {
-    if (projectKey) {
-        db.prepare('DELETE FROM rtm_scenarios WHERE projectKey = ?').run(projectKey);
-    }
-    if (localProjectId) {
-        db.prepare('DELETE FROM story_sync_log WHERE localProjectId = ?').run(localProjectId);
-        // Delete runs by localProjectId (covers Jira-only projects that have no GitHub repo)
-        db.prepare('DELETE FROM run_history WHERE localProjectId = ?').run(localProjectId);
-    }
-    if (repoFullName) {
-        // Also delete any runs that were created before localProjectId was tracked
-        db.prepare('DELETE FROM run_history WHERE repoFullName = ?').run(repoFullName);
-    }
+    // Run the entire cascade inside a single transaction so it is atomic.
+    db.transaction(() => {
+        // 1. Delete test cases — by projectKey first, then catch any orphans that
+        //    are linked only via a scenarioId belonging to this project's scenarios.
+        if (projectKey) {
+            db.prepare('DELETE FROM test_cases WHERE projectKey = ?').run(projectKey);
+        }
+
+        // 2. Delete test cases tied to runs for this project (covers empty-projectKey rows).
+        if (localProjectId) {
+            db.prepare(`
+                DELETE FROM test_cases WHERE runId IN (
+                    SELECT runId FROM run_history WHERE localProjectId = ?
+                )
+            `).run(localProjectId);
+        }
+        if (repoFullName) {
+            db.prepare(`
+                DELETE FROM test_cases WHERE runId IN (
+                    SELECT runId FROM run_history WHERE repoFullName = ?
+                )
+            `).run(repoFullName);
+        }
+
+        // 3. Delete scenarios.
+        if (projectKey) {
+            db.prepare('DELETE FROM rtm_scenarios WHERE projectKey = ?').run(projectKey);
+        }
+
+        // 4. Delete story sync log.
+        if (localProjectId) {
+            db.prepare('DELETE FROM story_sync_log WHERE localProjectId = ?').run(localProjectId);
+        }
+        if (projectKey) {
+            db.prepare('DELETE FROM story_sync_log WHERE projectKey = ?').run(projectKey);
+        }
+
+        // 5. Delete runs.
+        if (localProjectId) {
+            db.prepare('DELETE FROM run_history WHERE localProjectId = ?').run(localProjectId);
+        }
+        if (repoFullName) {
+            db.prepare('DELETE FROM run_history WHERE repoFullName = ?').run(repoFullName);
+        }
+    })();
 }
 
 // -- TEST CASE HELPERS --

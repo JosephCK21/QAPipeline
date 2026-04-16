@@ -1,7 +1,7 @@
 const { z } = require('zod');
 
 const githubWebhookSchema = z.object({
-    action: z.string(),
+    action: z.string().optional(),
     repository: z.object({
         full_name: z.string()
     }).passthrough().optional(),
