@@ -113,13 +113,13 @@ function ProjectSettings() {
   };
 
   if (loading) {
-    return <div className="p-8 text-gray-400">Loading project settings...</div>;
+    return <div className="p-8 text-[#5E6C84]">Loading project settings...</div>;
   }
 
   return (
     <div className="space-y-6 relative overflow-hidden h-full">
       {/* Header Info */}
-      <div className="flex justify-between items-start bg-gray-900 border border-gray-800 p-6 rounded-lg">
+      <div className="flex justify-between items-start bg-[#F4F5F7] border border-[#DFE1E6] p-6 rounded-lg">
         <div>
           <button 
             onClick={() => navigate(`/projects/${projectId}`)}
@@ -131,7 +131,7 @@ function ProjectSettings() {
             <SettingsIcon className="w-6 h-6 mr-2 text-indigo-400" />
             Project Settings
           </h1>
-          <div className="flex space-x-4 text-sm text-gray-400">
+          <div className="flex space-x-4 text-sm text-[#5E6C84]">
             {project?.jiraProjectKey && (
               <span className="flex items-center"><Activity className="w-4 h-4 mr-1 text-blue-500" /> Jira: {project.jiraProjectKey}</span>
             )}
@@ -144,14 +144,14 @@ function ProjectSettings() {
 
       <div className="space-y-6">
            {/* Integrations Panel */}
-           <div className="bg-gray-900 border border-gray-800 rounded-lg p-6">
-               <h3 className="text-lg font-medium text-gray-200 mb-4">Integrations</h3>
+           <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg p-6">
+               <h3 className="text-lg font-medium text-[#172B4D] mb-4">Integrations</h3>
                <div className="space-y-6">
                    <div className="flex flex-col md:flex-row md:items-center space-y-4 md:space-y-0 md:space-x-4">
                        <div className="w-full md:w-1/3">
-                           <label className="block text-sm font-medium text-gray-400 mb-1">Jira Space</label>
+                           <label className="block text-sm font-medium text-[#5E6C84] mb-1">Jira Space</label>
                            <select
-                               className="w-full bg-gray-800 border border-gray-700 text-gray-300 rounded-md py-2 px-3 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                               className="w-full bg-[#F1F2F4] border border-[#C1C7D0] text-[#5E6C84] rounded-md py-2 px-3 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                                value={selectedJiraSpace || ''}
                                onChange={(e) => setSelectedJiraSpace(e.target.value)}
                            >
@@ -174,9 +174,9 @@ function ProjectSettings() {
                    
                    <div className="flex flex-col md:flex-row md:items-center space-y-4 md:space-y-0 md:space-x-4">
                        <div className="w-full md:w-1/3">
-                           <label className="block text-sm font-medium text-gray-400 mb-1">GitHub Repository</label>
+                           <label className="block text-sm font-medium text-[#5E6C84] mb-1">GitHub Repository</label>
                            <select
-                               className="w-full bg-gray-800 border border-gray-700 text-gray-300 rounded-md py-2 px-3 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                               className="w-full bg-[#F1F2F4] border border-[#C1C7D0] text-[#5E6C84] rounded-md py-2 px-3 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                                value={selectedGithubRepo || ''}
                                onChange={(e) => setSelectedGithubRepo(e.target.value)}
                            >
@@ -199,42 +199,42 @@ function ProjectSettings() {
                </div>
            </div>
 
-           <div className="bg-gray-900 border border-gray-800 rounded-lg p-6">
-              <h3 className="text-lg font-medium text-gray-200 mb-4">Pipeline Execution Behaviors</h3>
+           <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg p-6">
+              <h3 className="text-lg font-medium text-[#172B4D] mb-4">Pipeline Execution Behaviors</h3>
               <BranchPolicyMatrix />
            </div>
 
            {/* Danger Zone */}
-           <div className="bg-[#2A1515] border border-red-900/50 rounded-lg p-6 mt-10">
+           <div className="bg-[#FFEBE6] border border-[#FFBDAD] rounded-lg p-6 mt-10">
               <h3 className="text-lg font-medium text-red-500 mb-2 flex items-center">
                   <AlertTriangle className="w-5 h-5 mr-2" />
                   Danger Zone
               </h3>
-              <p className="text-sm text-gray-400 mb-6">
+              <p className="text-sm text-[#5E6C84] mb-6">
                   Deleting this project will permanently remove all linked integrations, downloaded RTM baselines, execution histories, uploaded documents, and metrics. This action is irreversible.
               </p>
               
               {!showDeleteConfirm ? (
                   <button
                       onClick={() => setShowDeleteConfirm(true)}
-                      className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-md text-sm font-medium transition-colors"
+                      className="px-4 py-2 bg-[#C9372C] hover:bg-red-700 text-white rounded-md text-sm font-medium transition-colors"
                   >
                       Delete Project
                   </button>
               ) : (
-                  <div className="flex items-center space-x-4 bg-black/30 p-4 rounded-md border border-red-900/50">
-                      <span className="text-sm font-medium text-red-400">Are you absolutely sure?</span>
+                  <div className="flex items-center space-x-4 bg-black/30 p-4 rounded-md border border-[#FFBDAD]">
+                      <span className="text-sm font-medium text-[#C9372C]">Are you absolutely sure?</span>
                       <button
                           onClick={handleDeleteProject}
                           disabled={isDeleting}
-                          className="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-md text-sm font-medium transition-colors"
+                          className="px-4 py-2 bg-[#C9372C] hover:bg-red-700 disabled:opacity-50 text-white rounded-md text-sm font-medium transition-colors"
                       >
                           {isDeleting ? 'Deleting...' : 'Yes, Delete Project'}
                       </button>
                       <button
                           onClick={() => setShowDeleteConfirm(false)}
                           disabled={isDeleting}
-                          className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-md text-sm font-medium transition-colors"
+                          className="px-4 py-2 bg-[#F1F2F4] hover:bg-[#DFE1E6] text-[#5E6C84] rounded-md text-sm font-medium transition-colors"
                       >
                           Cancel
                       </button>

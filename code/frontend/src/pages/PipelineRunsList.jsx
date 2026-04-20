@@ -48,55 +48,55 @@ function PipelineRunsList() {
   const getStatusIcon = (status) => {
     switch (status) {
       case 'completed':
-        return <CheckCircle2 className="w-5 h-5 text-[#50FA7B]" />;
+        return <CheckCircle2 className="w-5 h-5 text-[#00875A]" />;
       case 'failed':
       case 'error':
-        return <XCircle className="w-5 h-5 text-[#FF5555]" />;
+        return <XCircle className="w-5 h-5 text-[#C9372C]" />;
       case 'running':
       case 'in_progress':
       default:
-        return <Loader className="w-5 h-5 text-[#8BE9FD] animate-spin" />;
+        return <Loader className="w-5 h-5 text-[#0C66E4] animate-spin" />;
     }
   };
 
   const getStatusText = (status) => {
     switch (status) {
       case 'completed':
-        return <span className="text-[#50FA7B] font-medium">Completed</span>;
+        return <span className="text-[#00875A] font-medium">Completed</span>;
       case 'failed':
       case 'error':
-        return <span className="text-[#FF5555] font-medium">Failed</span>;
+        return <span className="text-[#C9372C] font-medium">Failed</span>;
       case 'running':
       case 'in_progress':
       default:
-        return <span className="text-[#8BE9FD] font-medium animate-pulse">Running</span>;
+        return <span className="text-[#0C66E4] font-medium animate-pulse">Running</span>;
     }
   };
 
   return (
     <div className="space-y-6 animate-fade-in">
       {/* Header Section */}
-      <div className="bg-[#1E1E2F] border border-[#282A36] p-4 rounded-xl flex items-center justify-between">
+      <div className="bg-[#FFFFFF] border border-[#DFE1E6] p-4 rounded-xl flex items-center justify-between">
         <div className="flex flex-col">
           <div className="flex items-center gap-2 mb-2">
-            <Activity className="w-4 h-4 text-[#8BE9FD]" />
-            <h1 className="text-xl font-bold text-white">Pipeline Runs</h1>
+            <Activity className="w-4 h-4 text-[#0C66E4]" />
+            <h1 className="text-xl font-bold text-[#172B4D]">Pipeline Runs</h1>
           </div>
-          <p className="text-xs text-[#F8F8F2]/60 max-w-2xl">
+          <p className="text-xs text-[#172B4D]/60 max-w-2xl">
             Live execution history of all QA pipelines triggered by GitHub events.
           </p>
         </div>
         
-        <div className="bg-[#282A36] px-3 py-2 rounded-lg border border-[#6272A4]/30 flex flex-col items-center">
-            <span className="text-xl font-bold text-[#F8F8F2]">{runs.length}</span>
-            <span className="text-xs text-[#6272A4] uppercase tracking-wider font-semibold">Total Runs</span>
+        <div className="bg-[#DFE1E6] px-3 py-2 rounded-lg border border-[#5E6C84]/30 flex flex-col items-center">
+            <span className="text-xl font-bold text-[#172B4D]">{runs.length}</span>
+            <span className="text-xs text-[#5E6C84] uppercase tracking-wider font-semibold">Total Runs</span>
         </div>
       </div>
 
       {/* Table Section */}
-      <div className="bg-[#1E1E2F] rounded-xl border border-[#282A36]">
+      <div className="bg-[#FFFFFF] rounded-xl border border-[#DFE1E6]">
         {loading ? (
-            <div className="p-12 flex flex-col justify-center items-center text-[#6272A4]">
+            <div className="p-12 flex flex-col justify-center items-center text-[#5E6C84]">
                 <Loader className="w-8 h-8 animate-spin mb-4" />
                 <p>Loading pipeline runs...</p>
             </div>
@@ -104,7 +104,7 @@ function PipelineRunsList() {
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-b border-[#282A36] text-sm font-medium text-[#6272A4] bg-[#282A36]/30">
+                  <tr className="border-b border-[#DFE1E6] text-sm font-medium text-[#5E6C84] bg-[#DFE1E6]/30">
                     <th className="p-4 py-3">Run ID</th>
                     <th className="p-4 py-3">Status</th>
                     <th className="p-4 py-3">Trigger</th>
@@ -112,7 +112,7 @@ function PipelineRunsList() {
                     <th className="p-4 py-3">Details</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-[#282A36]">
+                <tbody className="divide-y divide-[#DFE1E6]">
                   {runs.map(run => {
                     // find error in events
                     const errorEvent = run.events?.find(e => e.type === 'error');
@@ -123,7 +123,7 @@ function PipelineRunsList() {
                     return (
                     <tr 
                       key={run.runId}
-                      className="hover:bg-[#282A36]/50 transition-colors group cursor-pointer"
+                      className="hover:bg-[#DFE1E6]/50 transition-colors group cursor-pointer"
                       onClick={() => {
                         if (linkedProject?.id) {
                           navigate(`/projects/${linkedProject.id}?workspace=github-runs&runId=${run.runId}`);
@@ -140,8 +140,8 @@ function PipelineRunsList() {
                     >
                       <td className="p-4">
                         <div className="flex items-center gap-2">
-                            <PlayCircle className="w-5 h-5 text-[#6272A4]" />
-                            <span className="font-mono text-[#F8F8F2] group-hover:text-[#8BE9FD] transition-colors">
+                            <PlayCircle className="w-5 h-5 text-[#5E6C84]" />
+                            <span className="font-mono text-[#172B4D] group-hover:text-[#0C66E4] transition-colors">
                               {run.runId.substring(0, 8)}...
                             </span>
                         </div>
@@ -153,22 +153,22 @@ function PipelineRunsList() {
                         </div>
                       </td>
                       <td className="p-4">
-                        <span className="text-sm text-[#F8F8F2] bg-[#6272A4]/20 px-2 py-1 rounded">
+                        <span className="text-sm text-[#172B4D] bg-[#5E6C84]/20 px-2 py-1 rounded">
                             {run.repository?.full_name || 'Manual'}
                         </span>
                       </td>
-                      <td className="p-4 text-sm text-[#6272A4] flex items-center gap-1">
+                      <td className="p-4 text-sm text-[#5E6C84] flex items-center gap-1">
                         <Clock className="w-4 h-4" />
                         {new Date(run.createdAt || run.startedAt || Date.now()).toLocaleString()}
                       </td>
                       <td className="p-4 text-sm max-w-xs">
                           {displayError ? (
-                              <div className="flex items-start gap-1 text-[#FF5555] bg-[#FF5555]/10 p-1.5 rounded">
+                              <div className="flex items-start gap-1 text-[#C9372C] bg-[#C9372C]/10 p-1.5 rounded">
                                   <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
                                   <span className="truncate">{displayError}</span>
                               </div>
                           ) : (
-                              <span className="text-[#6272A4] italic">
+                              <span className="text-[#5E6C84] italic">
                                   {run.events?.length || 0} events recorded
                               </span>
                           )}
@@ -177,7 +177,7 @@ function PipelineRunsList() {
                   )})}
                   {runs.length === 0 && (
                       <tr>
-                        <td colSpan="5" className="p-8 text-center text-[#6272A4]">
+                        <td colSpan="5" className="p-8 text-center text-[#5E6C84]">
                             No pipeline runs found.
                         </td>
                       </tr>

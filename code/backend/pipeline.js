@@ -4,7 +4,7 @@ const { findProjectByGithubRepo } = require('./services/projectStore');
 const { getDocsForProject } = require('./services/documentAssociationStore');
 const { extractTextFromFiles } = require('./services/documentParserService');
 const { mapPrChangesToScenarios } = require('./services/prScenarioMappingService');
-const { generateTestCasesForScenario, repairTestCaseScript } = require('./services/geminiService');
+const { generateTestCasesForScenario, repairTestCaseScript } = require('./services/llmService');
 
 const {
     updateRun, createRun, getScenariosByProject,
@@ -163,13 +163,14 @@ async function executeTestCaseWithRetries({
     let finalStatus = 'fail';
     let healAttempts = 0;
 
-    // The interaction id from the initial test case generation call.
-    // Each heal call returns its own new interaction id, which becomes the
-    // previousInteractionId for the next heal — forming a proper conversation chain.
-    // Falls back to manual attemptHistory injection when no id is available.
-    let currentInteractionId = testCase.generationInteractionId || null;
+    // Stateful bookkeeping for the conversation between the pipeline and the LLM:
+    //   - conversationId: shared Conversations API id for this test case (preferred chain mechanism)
+    //   - currentInteractionId: latest response.id, used as fallback/zdr-mode chain
+    // Both are populated from the initial test-case generation call and mutated after every heal.
+    const conversationId = testCase.conversationId || null;
+    let currentInteractionId = testCase.latestResponseId || testCase.generationInteractionId || null;
 
-    // Manual history — used only as a fallback when previousInteractionId is unavailable.
+    // Manual history — used only as a fallback when neither conversation nor previous_response_id is available.
     const attemptHistory = [];
 
     for (let attempt = 1; attempt <= MAX_HEAL_ATTEMPTS; attempt++) {
@@ -209,6 +210,8 @@ async function executeTestCaseWithRetries({
                 testScript: currentScript,
                 status: 'pass',
                 healAttempts,
+                conversationId,
+                latestResponseId: currentInteractionId,
                 lastRunAt: attemptEndedAt
             });
 
@@ -251,7 +254,9 @@ async function executeTestCaseWithRetries({
         if (attempt < MAX_HEAL_ATTEMPTS) {
             healAttempts++;
             runSummary.retryCount++;
-            const healMode = currentInteractionId ? 'stateful (previous_interaction_id)' : 'stateless (manual history)';
+            const healMode = conversationId
+                ? `stateful (conversation=${conversationId})`
+                : (currentInteractionId ? `stateful (previous_response_id=${currentInteractionId})` : 'stateless (manual history)');
             sendEvent('log', { level: 'INFO', message: `[Healing] Requesting patch for ${testCase.testCaseId} (attempt ${attempt + 1}, ${healMode})...` });
             try {
                 const healResult = await repairTestCaseScript({
@@ -259,15 +264,24 @@ async function executeTestCaseWithRetries({
                     failureOutput,
                     codeContextSection,
                     attemptNumber: attempt + 1,
-                    previousInteractionId: currentInteractionId,  // stateful chain
-                    attemptHistory  // fallback when no interaction id
+                    conversationId,
+                    previousInteractionId: currentInteractionId,
+                    attemptHistory
                 });
                 currentScript = healResult.repairedScript;
-                // Thread the heal interaction id forward so the next heal also chains
                 currentInteractionId = healResult.interactionId || currentInteractionId;
+
+                // Persist the latest response id so a server restart can resume the chain.
+                upsertTestCase({
+                    ...testCase,
+                    testScript: currentScript,
+                    healAttempts,
+                    conversationId,
+                    latestResponseId: currentInteractionId
+                });
             } catch (healErr) {
                 sendEvent('log', { level: 'ERROR', message: `[Healing] LLM repair failed: ${healErr.message}` });
-                break; // Can't heal — give up early
+                break;
             }
         }
     }
@@ -281,6 +295,8 @@ async function executeTestCaseWithRetries({
             testScript: currentScript,
             status: 'fail',
             healAttempts,
+            conversationId,
+            latestResponseId: currentInteractionId,
             lastRunAt: new Date().toISOString()
         });
 
@@ -408,8 +424,14 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 ? { version: refinementForScenario.testCase.version, testScript: refinementForScenario.testCase.testScript }
                 : null;
 
+            // When refining, reuse the prior test case's conversation so the model
+            // keeps the full reasoning history of why the previous version existed.
+            const priorConversationId = refinementForScenario?.testCase?.conversationId || null;
+            const priorResponseId = refinementForScenario?.testCase?.latestResponseId || null;
+
             let generatedTestCases = [];
-            let generationInteractionId = null; // stored to chain healing calls via previous_interaction_id
+            let generationInteractionId = null;
+            let scenarioConversationId = priorConversationId;
             try {
                 const genResult = await generateTestCasesForScenario({
                     scenario: { id: scenarioId, description: scenarioDescription, type: scenarioType, priority: scenarioPriority },
@@ -417,11 +439,14 @@ async function runPipeline(runId, prUrl, repoFullName) {
                     prDiffSection,
                     dependenciesSection: codeContext.dependencies || '',
                     refinementContext,
-                    alreadyGeneratedSummary  // cross-scenario awareness
+                    alreadyGeneratedSummary,
+                    conversationId: priorConversationId,
+                    previousInteractionId: priorResponseId
                 });
                 generatedTestCases = genResult.testCases;
                 generationInteractionId = genResult.interactionId;
-                sendEvent('log', { level: 'INFO', message: `[Generation] Interaction ID: ${generationInteractionId || 'unavailable'} (used for stateful healing)` });
+                scenarioConversationId = genResult.conversationId || scenarioConversationId;
+                sendEvent('log', { level: 'INFO', message: `[Generation] conversation=${scenarioConversationId || 'n/a'} response=${generationInteractionId || 'unavailable'} (stateful chain anchors)` });
             } catch (genErr) {
                 sendEvent('log', { level: 'ERROR', message: `Test case generation failed for ${scenarioId}: ${genErr.message}` });
                 sendEvent('scenario_execution_updated', { scenarioId, status: 'error', totals: { passed: 0, failed: 0, running: 0 } });
@@ -453,7 +478,11 @@ async function runPipeline(runId, prUrl, repoFullName) {
                     previousVersionId:       tc.isRefinement ? (refinementForScenario?.testCase.testCaseId || null) : null,
                     codeFiles:               tc.codeFiles || [],
                     healAttempts:            0,
-                    generationInteractionId, // enables stateful heal chaining
+                    // Stateful anchors — conversation owns the chain; response id is the latest turn,
+                    // also retained as generationInteractionId for backward compatibility with in-flight runs.
+                    conversationId:          scenarioConversationId,
+                    latestResponseId:        generationInteractionId,
+                    generationInteractionId,
                     createdAt:               new Date().toISOString()
                 };
                 upsertTestCase(saved);

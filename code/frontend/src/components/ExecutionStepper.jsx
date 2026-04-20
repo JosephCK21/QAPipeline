@@ -11,47 +11,47 @@ function ExecutionStepper({ phases, animated = false }) {
   const getStatusIcon = (status) => {
     switch (status) {
       case 'completed':
-        return <Check className="w-5 h-5 text-white" />;
+        return <Check className="w-5 h-5 text-[#172B4D]" />;
       case 'running':
-        return <Loader2 className="w-5 h-5 text-white animate-spin" />;
+        return <Loader2 className="w-5 h-5 text-[#172B4D] animate-spin" />;
       case 'pending':
-        return <Clock className="w-5 h-5 text-[#6272A4]" />;
+        return <Clock className="w-5 h-5 text-[#5E6C84]" />;
       case 'failed':
-        return <AlertCircle className="w-5 h-5 text-white" />;
+        return <AlertCircle className="w-5 h-5 text-[#172B4D]" />;
       case 'blocked':
-        return <Ban className="w-5 h-5 text-white" />;
+        return <Ban className="w-5 h-5 text-[#172B4D]" />;
       default:
-        return <Clock className="w-5 h-5 text-[#6272A4]" />;
+        return <Clock className="w-5 h-5 text-[#5E6C84]" />;
     }
   };
 
   const getStatusColor = (status) => {
     switch (status) {
       case 'completed':
-        return 'bg-[#50FA7B]';
+        return 'bg-[#00875A]';
       case 'running':
-        return 'bg-[#8BE9FD]';
+        return 'bg-[#0C66E4]';
       case 'pending':
-        return 'bg-[#282A36] border-2 border-[#6272A4]';
+        return 'bg-[#DFE1E6] border-2 border-[#5E6C84]';
       case 'failed':
-        return 'bg-[#FF5555]';
+        return 'bg-[#C9372C]';
       case 'blocked':
-        return 'bg-[#FFB86C]';
+        return 'bg-[#B65C00]';
       default:
-        return 'bg-[#282A36] border-2 border-[#6272A4]';
+        return 'bg-[#DFE1E6] border-2 border-[#5E6C84]';
     }
   };
 
   const getLineColor = (status) => {
     switch (status) {
       case 'completed':
-        return 'bg-[#50FA7B]';
+        return 'bg-[#00875A]';
       case 'running':
-        return 'bg-gradient-to-r from-[#50FA7B] to-[#8BE9FD]';
+        return 'bg-gradient-to-r from-[#00875A] to-[#0C66E4]';
       case 'failed':
-        return 'bg-[#FF5555]';
+        return 'bg-[#C9372C]';
       default:
-        return 'bg-[#282A36]';
+        return 'bg-[#DFE1E6]';
     }
   };
 
@@ -74,7 +74,7 @@ function ExecutionStepper({ phases, animated = false }) {
             {/* Circle */}
             <div 
               className={`w-12 h-12 rounded-full flex items-center justify-center ${getStatusColor(phase.status)} transition-all duration-300 shadow-lg ${
-                phase.status === 'running' ? 'ring-4 ring-[#8BE9FD]/30' : ''
+                phase.status === 'running' ? 'ring-4 ring-[#0C66E4]/30' : ''
               }`}
             >
               {getStatusIcon(phase.status)}
@@ -83,15 +83,15 @@ function ExecutionStepper({ phases, animated = false }) {
             {/* Label */}
             <div className="mt-3 text-center">
               <p className={`text-sm font-medium ${
-                phase.status === 'completed' ? 'text-[#50FA7B]' :
-                phase.status === 'running' ? 'text-[#8BE9FD]' :
-                phase.status === 'failed' ? 'text-[#FF5555]' :
-                phase.status === 'blocked' ? 'text-[#FFB86C]' :
-                'text-[#6272A4]'
+                phase.status === 'completed' ? 'text-[#00875A]' :
+                phase.status === 'running' ? 'text-[#0C66E4]' :
+                phase.status === 'failed' ? 'text-[#C9372C]' :
+                phase.status === 'blocked' ? 'text-[#B65C00]' :
+                'text-[#5E6C84]'
               }`}>
                 {phase.name}
               </p>
-              <p className="text-xs text-[#6272A4] mt-1">
+              <p className="text-xs text-[#5E6C84] mt-1">
                 {phase.duration !== '-' ? phase.duration : 
                   phase.status === 'running' ? 'In Progress...' : 'Waiting...'}
               </p>

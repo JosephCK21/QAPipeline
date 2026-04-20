@@ -1,7 +1,7 @@
 const { fetchIssue, fetchChildStoriesForEpic, postScenarioComment } = require('./services/jiraService');
 const { getDocsForProject } = require('./services/documentAssociationStore');
 const { extractTextFromFiles } = require('./services/documentParserService');
-const { generateTestScenarios, generateTestScenariosForEpic } = require('./services/geminiService');
+const { generateTestScenarios, generateTestScenariosForEpic } = require('./services/llmService');
 const { upsertScenario, markScenariosObsolete, updateRun, createRun, computeStoryHash, upsertStorySyncRecord } = require('./db');
 const { getProjectById } = require('./services/projectStore');
 

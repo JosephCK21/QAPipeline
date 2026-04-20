@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Activity, ShieldCheck, Bug, Clock, GitCommit, Search, ChevronRight, ChevronDown, X, AlertTriangle, Settings, CheckCircle2, XCircle, Loader, PlayCircle, FileText, Upload, Trash2, Code2, Database, ListChecks, RefreshCw, GitBranch } from 'lucide-react';
 import { useAppContext } from '../App';
+import { computeAllEpicMetrics } from '../lib/epicMetrics';
 
 function ProjectDashboard() {
   const { projectId } = useParams();
@@ -203,6 +204,11 @@ function ProjectDashboard() {
     return acc;
   }, {});
 
+  const epicMetrics = useMemo(
+    () => computeAllEpicMetrics(groupedRequirements, rtm.scenarios),
+    [groupedRequirements, rtm.scenarios]
+  );
+
   const openScenarioDetails = (scenario) => {
       setSelectedItem(scenario);
       setPanelMode('scenario');
@@ -227,18 +233,18 @@ function ProjectDashboard() {
   };
 
   if (loading) {
-    return <div className="p-8 text-gray-400">Loading project dashboard...</div>;
+    return <div className="p-8 text-[#5E6C84]">Loading project dashboard...</div>;
   }
 
   return (
     <div className="space-y-6 relative overflow-hidden h-full">
       {/* Header Info */}
-      <div className="flex justify-between items-start bg-gray-900 border border-gray-800 p-6 rounded-lg">
+      <div className="flex justify-between items-start bg-[#F4F5F7] border border-[#DFE1E6] p-6 rounded-lg">
         <div>
           <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-400 mb-2">
             {project?.name || 'Project Dashboard'}
           </h1>
-          <div className="flex space-x-4 text-sm text-gray-400">
+          <div className="flex space-x-4 text-sm text-[#5E6C84]">
             {project?.jiraProjectKey && (
               <span className="flex items-center"><Activity className="w-4 h-4 mr-1 text-blue-500" /> Jira: {project.jiraProjectKey}</span>
             )}
@@ -258,7 +264,7 @@ function ProjectDashboard() {
             </button>
             <button 
               onClick={() => navigate(`/projects/${projectId}/settings`)}
-              className="flex items-center px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-md border border-gray-700 transition-colors text-sm font-medium"
+              className="flex items-center px-4 py-2 bg-[#F1F2F4] hover:bg-[#DFE1E6] text-[#172B4D] rounded-md border border-[#C1C7D0] transition-colors text-sm font-medium"
             >
               <Settings className="w-4 h-4 mr-2" />
               Project Settings
@@ -268,56 +274,56 @@ function ProjectDashboard() {
 
       {/* KPI Cards */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <div className="bg-gray-900 border border-gray-800 p-4 rounded-lg flex items-center justify-between">
+        <div className="bg-[#F4F5F7] border border-[#DFE1E6] p-4 rounded-lg flex items-center justify-between">
           <div>
-            <p className="text-gray-400 text-sm">Feature Coverage</p>
-            <p className="text-2xl font-bold text-white">{rtmStats.coverage}%</p>
+            <p className="text-[#5E6C84] text-sm">Feature Coverage</p>
+            <p className="text-2xl font-bold text-[#172B4D]">{rtmStats.coverage}%</p>
           </div>
           <div className="p-3 bg-blue-500/10 rounded-full"><ShieldCheck className="text-blue-400 w-6 h-6" /></div>
         </div>
-        <div className="bg-gray-900 border border-gray-800 p-4 rounded-lg flex items-center justify-between">
+        <div className="bg-[#F4F5F7] border border-[#DFE1E6] p-4 rounded-lg flex items-center justify-between">
           <div>
-            <p className="text-gray-400 text-sm">Active Requirements</p>
-            <p className="text-2xl font-bold text-white">{rtmStats.totalReqs}</p>
+            <p className="text-[#5E6C84] text-sm">Active Requirements</p>
+            <p className="text-2xl font-bold text-[#172B4D]">{rtmStats.totalReqs}</p>
           </div>
           <div className="p-3 bg-indigo-500/10 rounded-full"><Activity className="text-indigo-400 w-6 h-6" /></div>
         </div>
-        <div className="bg-gray-900 border border-gray-800 p-4 rounded-lg flex items-center justify-between">
+        <div className="bg-[#F4F5F7] border border-[#DFE1E6] p-4 rounded-lg flex items-center justify-between">
           <div>
-            <p className="text-gray-400 text-sm">Tested Scenarios</p>
-            <p className="text-2xl font-bold text-white">{rtmStats.testedScenarios} / {rtmStats.totalScenarios}</p>
+            <p className="text-[#5E6C84] text-sm">Tested Scenarios</p>
+            <p className="text-2xl font-bold text-[#172B4D]">{rtmStats.testedScenarios} / {rtmStats.totalScenarios}</p>
           </div>
-          <div className="p-3 bg-green-500/10 rounded-full"><Bug className="text-green-400 w-6 h-6" /></div>
+          <div className="p-3 bg-green-500/10 rounded-full"><Bug className="text-[#00875A] w-6 h-6" /></div>
         </div>
-        <div className="bg-gray-900 border border-gray-800 p-4 rounded-lg flex items-center justify-between">
+        <div className="bg-[#F4F5F7] border border-[#DFE1E6] p-4 rounded-lg flex items-center justify-between">
           <div>
-            <p className="text-gray-400 text-sm">Pending Execution</p>
-            <p className="text-2xl font-bold text-white">{Math.max(0, rtmStats.totalScenarios - rtmStats.testedScenarios)}</p>
+            <p className="text-[#5E6C84] text-sm">Pending Execution</p>
+            <p className="text-2xl font-bold text-[#172B4D]">{Math.max(0, rtmStats.totalScenarios - rtmStats.testedScenarios)}</p>
           </div>
           <div className="p-3 bg-yellow-500/10 rounded-full"><Clock className="text-yellow-400 w-6 h-6" /></div>
         </div>
       </div>
 
-      <div className="border-b border-gray-800">
+      <div className="border-b border-[#DFE1E6]">
         <nav className="-mb-px flex space-x-8">
-          <button onClick={() => setActiveTab('rtm')} className={`${activeTab === 'rtm' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-gray-500 hover:text-gray-300'} whitespace-nowrap pb-4 px-1 border-b-2 font-medium`}>Traceability Matrix</button>
-          <button onClick={() => setActiveTab('runs')} className={`${activeTab === 'runs' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-gray-500 hover:text-gray-300'} whitespace-nowrap pb-4 px-1 border-b-2 font-medium`}>Pipeline Runs</button>
-          <button onClick={() => setActiveTab('docs')} className={`${activeTab === 'docs' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-gray-500 hover:text-gray-300'} whitespace-nowrap pb-4 px-1 border-b-2 font-medium`}>Context Documents</button>
+          <button onClick={() => setActiveTab('rtm')} className={`${activeTab === 'rtm' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]'} whitespace-nowrap pb-4 px-1 border-b-2 font-medium`}>Traceability Matrix</button>
+          <button onClick={() => setActiveTab('runs')} className={`${activeTab === 'runs' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]'} whitespace-nowrap pb-4 px-1 border-b-2 font-medium`}>Pipeline Runs</button>
+          <button onClick={() => setActiveTab('docs')} className={`${activeTab === 'docs' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]'} whitespace-nowrap pb-4 px-1 border-b-2 font-medium`}>Context Documents</button>
         </nav>
       </div>
 
       {/* RTM View */}
       {activeTab === 'rtm' && (
-        <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-          <div className="p-4 border-b border-gray-800 flex justify-between items-center">
+        <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg overflow-hidden">
+          <div className="p-4 border-b border-[#DFE1E6] flex justify-between items-center">
              <div className="relative w-64">
                 <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                  <Search className="h-4 w-4 text-gray-500" />
+                  <Search className="h-4 w-4 text-[#8993A4]" />
                 </div>
                 <input
                   type="text"
                   placeholder="Search requirements..."
-                  className="block w-full pl-10 pr-3 py-2 border border-gray-700 rounded-md leading-5 bg-gray-800 text-gray-300 placeholder-gray-500 focus:outline-none focus:bg-gray-800 focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
+                  className="block w-full pl-10 pr-3 py-2 border border-[#C1C7D0] rounded-md leading-5 bg-[#F1F2F4] text-[#5E6C84] placeholder-gray-500 focus:outline-none focus:bg-[#F1F2F4] focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                 />
@@ -326,20 +332,101 @@ function ProjectDashboard() {
           
           <div className="overflow-x-auto">
             <table className="min-w-full divide-y border-collapse divide-gray-800">
-                <thead className="bg-[#1A1A24]">
+                <thead className="bg-[#F4F5F7]">
                   <tr>
-                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider w-1/4">Requirement</th>
-                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Test Scenarios</th>
-                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider w-[140px]">Test Cases</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-[#5E6C84] uppercase tracking-wider w-1/4">Requirement</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-[#5E6C84] uppercase tracking-wider">Test Scenarios</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-[#5E6C84] uppercase tracking-wider w-[140px]">Test Cases</th>
                   </tr>
                 </thead>
-                <tbody className="bg-gray-900 divide-y divide-gray-800">
+                <tbody className="bg-[#F4F5F7] divide-y divide-gray-800">
                     {Object.keys(groupedRequirements).length > 0 ? (
-                      Object.entries(groupedRequirements).map(([epicKey, reqs]) => (
+                      Object.entries(groupedRequirements).map(([epicKey, reqs]) => {
+                        const em = epicMetrics[epicKey] || {
+                          total: 0, done: 0, notDone: 0, passed: 0, failed: 0, donePct: 0,
+                          totalScenarios: 0, passedScenariosStrict: 0, failedScenarios: 0, pendingScenarios: 0, scenarioPassPct: 0,
+                        };
+                        return (
                         <React.Fragment key={epicKey}>
-                          <tr className="bg-[#1A1A2E]">
-                            <td colSpan="3" className="px-6 py-2 text-xs font-bold text-indigo-400 uppercase tracking-wider border-b border-indigo-500/20">
-                              Epic: {epicKey}
+                          <tr className="bg-[#F4F5F7]">
+                            <td colSpan="3" className="px-6 py-3 border-b border-indigo-500/20">
+                              <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                                {/* Epic label */}
+                                <span className="text-xs font-bold text-indigo-400 uppercase tracking-wider">
+                                  Epic: {epicKey}
+                                </span>
+
+                                {em.totalScenarios > 0 ? (
+                                  <>
+                                    {/* Scenario pass progress bar */}
+                                    <div className="flex-1 min-w-[120px] max-w-[180px] h-1.5 bg-[#DFE1E6] rounded-full overflow-hidden">
+                                      <div
+                                        className="h-full rounded-full bg-gradient-to-r from-green-500 to-emerald-400 transition-all"
+                                        style={{ width: `${em.scenarioPassPct}%` }}
+                                      />
+                                    </div>
+
+                                    {/* Scenario chips */}
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-500/10 border border-indigo-500/20 rounded text-[10px] text-indigo-300">
+                                      <Activity className="w-3 h-3" />
+                                      {em.totalScenarios} scenario{em.totalScenarios !== 1 ? 's' : ''}
+                                    </span>
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-500/10 border border-green-500/20 rounded text-[10px] text-[#00875A]">
+                                      <ShieldCheck className="w-3 h-3" />
+                                      {em.passedScenariosStrict} passing
+                                    </span>
+                                    {em.failedScenarios > 0 && (
+                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-red-500/10 border border-red-500/20 rounded text-[10px] text-[#C9372C]">
+                                        <XCircle className="w-3 h-3" />
+                                        {em.failedScenarios} failing
+                                      </span>
+                                    )}
+                                    {em.pendingScenarios > 0 && (
+                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-yellow-500/10 border border-yellow-500/20 rounded text-[10px] text-yellow-300">
+                                        <Clock className="w-3 h-3" />
+                                        {em.pendingScenarios} pending
+                                      </span>
+                                    )}
+
+                                    {/* Divider */}
+                                    <span className="text-gray-700 text-[10px]">|</span>
+
+                                    {/* Test-case chips */}
+                                    {em.total > 0 ? (
+                                      <>
+                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-500/10 border border-indigo-500/20 rounded text-[10px] text-indigo-300">
+                                          <ListChecks className="w-3 h-3" />
+                                          {em.total} test case{em.total !== 1 ? 's' : ''}
+                                        </span>
+                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-500/10 border border-green-500/20 rounded text-[10px] text-[#00875A]">
+                                          <CheckCircle2 className="w-3 h-3" />
+                                          {em.passed} passed
+                                        </span>
+                                        {em.failed > 0 && (
+                                          <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-red-500/10 border border-red-500/20 rounded text-[10px] text-[#C9372C]">
+                                            <XCircle className="w-3 h-3" />
+                                            {em.failed} failed
+                                          </span>
+                                        )}
+                                        {em.notDone > 0 && (
+                                          <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-yellow-500/10 border border-yellow-500/20 rounded text-[10px] text-yellow-300">
+                                            <Clock className="w-3 h-3" />
+                                            {em.notDone} not done
+                                          </span>
+                                        )}
+                                      </>
+                                    ) : (
+                                      <span className="text-[10px] text-[#8993A4] italic">No test cases yet</span>
+                                    )}
+
+                                    <span className="text-[10px] text-[#8993A4] ml-auto">
+                                      {em.scenarioPassPct}% scenarios passing
+                                    </span>
+                                  </>
+                                ) : (
+                                  <span className="text-[10px] text-[#8993A4] italic">No scenarios generated yet</span>
+                                )}
+                              </div>
                             </td>
                           </tr>
                           {reqs.map((req) => {
@@ -348,10 +435,10 @@ function ProjectDashboard() {
                             const passedTestCases = reqScenarios.reduce((n, s) => n + (s.testCases?.filter(tc => tc.status === 'pass').length || 0), 0);
                             const failedTestCases = reqScenarios.reduce((n, s) => n + (s.testCases?.filter(tc => tc.status === 'fail').length || 0), 0);
                             return (
-                              <tr key={req.reqId} className="hover:bg-gray-800/10 transition-colors group">
-                                <td className="px-6 py-4 align-top w-1/4 border-r border-gray-800">
-                                    <div className="font-semibold text-gray-200 mb-1">{req.reqId}</div>
-                                    <div className="text-sm text-gray-400 line-clamp-3">{req.description}</div>
+                              <tr key={req.reqId} className="hover:bg-[#F1F2F4]/10 transition-colors group">
+                                <td className="px-6 py-4 align-top w-1/4 border-r border-[#DFE1E6]">
+                                    <div className="font-semibold text-[#172B4D] mb-1">{req.reqId}</div>
+                                    <div className="text-sm text-[#5E6C84] line-clamp-3">{req.description}</div>
                                     {req.lastSyncedAt && (
                                       <span className="inline-flex mt-2 px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 text-[10px] font-medium rounded text-indigo-300" title={`Last synced: ${new Date(req.lastSyncedAt).toLocaleString()}`}>
                                         Synced {new Date(req.lastSyncedAt).toLocaleDateString()}
@@ -363,11 +450,11 @@ function ProjectDashboard() {
                                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                                             {reqScenarios.map(scen => {
                                                 const typeBadge = {
-                                                  'Happy Path': 'bg-green-500/15 border-green-500/30 text-green-300',
-                                                  'Negative':   'bg-red-500/15 border-red-500/30 text-red-300',
-                                                  'Edge Case':  'bg-amber-500/15 border-amber-500/30 text-amber-300',
+                                                  'Happy Path': 'bg-green-500/15 border-green-500/30 text-[#00875A]',
+                                                  'Negative':   'bg-red-500/15 border-red-500/30 text-[#C9372C]',
+                                                  'Edge Case':  'bg-amber-500/15 border-amber-500/30 text-[#B65C00]',
                                                   'Boundary':   'bg-orange-500/15 border-orange-500/30 text-orange-300',
-                                                }[scen.type] || 'bg-gray-500/15 border-gray-500/30 text-gray-300';
+                                                }[scen.type] || 'bg-gray-500/15 border-gray-500/30 text-[#5E6C84]';
 
                                                 const isExpanded = !!expandedScenarios[scen.id];
                                                 const tcs = scen.testCases || [];
@@ -379,7 +466,7 @@ function ProjectDashboard() {
                                                     {/* Scenario Card */}
                                                     <div 
                                                       onClick={() => openScenarioDetails(scen)}
-                                                      className="bg-[#1e1e2d] hover:bg-[#252538] cursor-pointer transition p-3 rounded border border-gray-700/50 flex flex-col group/card"
+                                                      className="bg-[#FFFFFF] hover:bg-[#F1F2F4] cursor-pointer transition p-3 rounded border border-[#DFE1E6] flex flex-col group/card"
                                                     >
                                                       <div className="flex justify-between items-start mb-2">
                                                           <span className="text-xs font-mono text-indigo-400 truncate pr-2" title={scen.id}>{scen.id}</span>
@@ -392,7 +479,7 @@ function ProjectDashboard() {
                                                       <span className={`self-start text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border mb-2 ${typeBadge}`}>
                                                         {scen.type || 'Scenario'}
                                                       </span>
-                                                      <p className="text-xs text-gray-300 line-clamp-3 mb-2">{scen.description}</p>
+                                                      <p className="text-xs text-[#5E6C84] line-clamp-3 mb-2">{scen.description}</p>
                                                       <div className="mt-auto flex justify-between items-center">
                                                           <div className="flex items-center gap-2">
                                                               {tcs.length > 0 && (
@@ -407,10 +494,10 @@ function ProjectDashboard() {
                                                                 </button>
                                                               )}
                                                               {tcs.length === 0 && (
-                                                                <span className="text-[10px] text-gray-600 italic">No test cases</span>
+                                                                <span className="text-[10px] text-[#8993A4] italic">No test cases</span>
                                                               )}
                                                           </div>
-                                                          <ChevronRight className="w-4 h-4 text-gray-600 group-hover/card:text-indigo-400 transition-colors" />
+                                                          <ChevronRight className="w-4 h-4 text-[#8993A4] group-hover/card:text-indigo-400 transition-colors" />
                                                       </div>
                                                     </div>
 
@@ -419,10 +506,10 @@ function ProjectDashboard() {
                                                       <div className="mt-1 ml-2 border-l-2 border-indigo-500/30 pl-2 space-y-1">
                                                         {tcs.map(tc => {
                                                           const tcStatusColor = tc.status === 'pass'
-                                                            ? 'bg-green-500/10 border-green-500/30 text-green-300 hover:bg-green-500/20'
+                                                            ? 'bg-green-500/10 border-green-500/30 text-[#00875A] hover:bg-green-500/20'
                                                             : tc.status === 'fail'
-                                                            ? 'bg-red-500/10 border-red-500/30 text-red-300 hover:bg-red-500/20'
-                                                            : 'bg-gray-700/30 border-gray-600/30 text-gray-400 hover:bg-gray-700/50';
+                                                            ? 'bg-red-500/10 border-red-500/30 text-[#C9372C] hover:bg-red-500/20'
+                                                            : 'bg-[#DFE1E6]/30 border-[#C1C7D0]/30 text-[#5E6C84] hover:bg-[#DFE1E6]/50';
 
                                                           return (
                                                             <div
@@ -436,8 +523,8 @@ function ProjectDashboard() {
                                                                   {tc.version > 1 && (
                                                                     <span className="text-[9px] px-1 bg-blue-500/20 text-blue-300 rounded border border-blue-500/30">v{tc.version}</span>
                                                                   )}
-                                                                  {tc.status === 'pass' && <CheckCircle2 className="w-3 h-3 text-green-400" />}
-                                                                  {tc.status === 'fail' && <XCircle className="w-3 h-3 text-red-400" />}
+                                                                  {tc.status === 'pass' && <CheckCircle2 className="w-3 h-3 text-[#00875A]" />}
+                                                                  {tc.status === 'fail' && <XCircle className="w-3 h-3 text-[#C9372C]" />}
                                                                   {(!tc.status || tc.status === 'pending') && <Clock className="w-3 h-3 text-yellow-400" />}
                                                                   <ChevronRight className="w-3 h-3 opacity-60" />
                                                                 </div>
@@ -453,28 +540,28 @@ function ProjectDashboard() {
                                             })}
                                         </div>
                                     ) : (
-                                        <div className="text-sm text-gray-500 italic py-6 text-center bg-gray-800/30 rounded border border-dashed border-gray-700">No scenarios generated yet.</div>
+                                        <div className="text-sm text-[#8993A4] italic py-6 text-center bg-[#F1F2F4]/30 rounded border border-dashed border-[#C1C7D0]">No scenarios generated yet.</div>
                                     )}
                                 </td>
-                                <td className="px-6 py-4 align-top w-[160px] border-l border-gray-800">
+                                <td className="px-6 py-4 align-top w-[160px] border-l border-[#DFE1E6]">
                                     {totalTestCases > 0 ? (
                                       <div className="space-y-1.5">
                                         <span className="inline-flex items-center gap-1 px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 text-xs font-medium rounded text-indigo-300 w-full justify-center">
                                           <ListChecks className="w-3 h-3" /> {totalTestCases} test case{totalTestCases !== 1 ? 's' : ''}
                                         </span>
                                         {passedTestCases > 0 && (
-                                          <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-500/10 border border-green-500/20 text-[10px] font-medium rounded text-green-300 w-full justify-center">
+                                          <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-500/10 border border-green-500/20 text-[10px] font-medium rounded text-[#00875A] w-full justify-center">
                                             <CheckCircle2 className="w-3 h-3" /> {passedTestCases}/{totalTestCases} passed
                                           </span>
                                         )}
                                         {failedTestCases > 0 && (
-                                          <span className="inline-flex items-center gap-1 px-2 py-1 bg-red-500/10 border border-red-500/20 text-[10px] font-medium rounded text-red-300 w-full justify-center">
+                                          <span className="inline-flex items-center gap-1 px-2 py-1 bg-red-500/10 border border-red-500/20 text-[10px] font-medium rounded text-[#C9372C] w-full justify-center">
                                             <XCircle className="w-3 h-3" /> {failedTestCases} failed
                                           </span>
                                         )}
                                       </div>
                                     ) : (
-                                      <span className="inline-flex items-center gap-1 px-2 py-1 bg-gray-700/30 border border-gray-700/50 text-xs font-medium rounded text-gray-500">
+                                      <span className="inline-flex items-center gap-1 px-2 py-1 bg-[#DFE1E6]/30 border border-[#DFE1E6] text-xs font-medium rounded text-[#8993A4]">
                                         <Clock className="w-3 h-3" /> Awaiting PR
                                       </span>
                                     )}
@@ -483,10 +570,11 @@ function ProjectDashboard() {
                             );
                           })}
                         </React.Fragment>
-                      ))
+                        );
+                      })
                     ) : (
                       <tr>
-                        <td colSpan="3" className="px-6 py-12 text-center text-gray-500">
+                        <td colSpan="3" className="px-6 py-12 text-center text-[#8993A4]">
                             No requirements found. Click "Sync Jira" to pull stories in "Selected for Development" and generate test scenarios.
                         </td>
                       </tr>
@@ -499,16 +587,16 @@ function ProjectDashboard() {
 
       {/* Pipeline Runs View */}
       {activeTab === 'runs' && (
-        <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden p-4">
+        <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg overflow-hidden p-4">
           <div className="flex items-center gap-2 mb-6">
             <Activity className="w-5 h-5 text-blue-400" />
-            <h3 className="text-lg font-bold text-gray-200">Execution History</h3>
+            <h3 className="text-lg font-bold text-[#172B4D]">Execution History</h3>
           </div>
           
           {projectRuns.length === 0 ? (
-            <div className="text-center py-12 bg-gray-800/30 rounded-lg border border-dashed border-gray-700">
-              <PlayCircle className="w-8 h-8 text-gray-600 mx-auto mb-3" />
-              <p className="text-gray-400">No QA pipelines have run for this project yet.</p>
+            <div className="text-center py-12 bg-[#F1F2F4]/30 rounded-lg border border-dashed border-[#C1C7D0]">
+              <PlayCircle className="w-8 h-8 text-[#8993A4] mx-auto mb-3" />
+              <p className="text-[#5E6C84]">No QA pipelines have run for this project yet.</p>
             </div>
           ) : (
             <div className="space-y-2">
@@ -521,7 +609,7 @@ function ProjectDashboard() {
                 const isCompleted = run.status === 'completed';
 
                 return (
-                  <div key={run.runId} className="bg-[#1e1e2d] border border-gray-800 rounded-lg px-4 py-3 flex items-center justify-between gap-4 group hover:bg-[#252538] transition-colors">
+                  <div key={run.runId} className="bg-[#FFFFFF] border border-[#DFE1E6] rounded-lg px-4 py-3 flex items-center justify-between gap-4 group hover:bg-[#F1F2F4] transition-colors">
                     {/* Left: status icon + run ID + timestamp */}
                     <div className="flex items-center gap-3 min-w-0">
                       <div className="flex-shrink-0">
@@ -531,12 +619,12 @@ function ProjectDashboard() {
                       </div>
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-mono text-gray-200">#{run.runId.substring(0, 8)}</span>
-                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${isCompleted ? 'bg-green-500/15 text-green-300' : isFailed ? 'bg-red-500/15 text-red-300' : 'bg-blue-500/15 text-blue-300'}`}>
+                          <span className="text-sm font-mono text-[#172B4D]">#{run.runId.substring(0, 8)}</span>
+                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${isCompleted ? 'bg-green-500/15 text-[#00875A]' : isFailed ? 'bg-red-500/15 text-[#C9372C]' : 'bg-blue-500/15 text-blue-300'}`}>
                             {isCompleted ? 'Passed' : isFailed ? 'Failed' : 'Running'}
                           </span>
                         </div>
-                        <span className="text-[10px] text-gray-500 flex items-center gap-1 mt-0.5">
+                        <span className="text-[10px] text-[#8993A4] flex items-center gap-1 mt-0.5">
                           <Clock className="w-3 h-3" />
                           {new Date(run.createdAt || Date.now()).toLocaleString()}
                         </span>
@@ -546,22 +634,22 @@ function ProjectDashboard() {
                     {/* Middle: mini live counters */}
                     <div className="hidden md:flex items-center gap-3 text-[11px]">
                       {summary.scenarioCount > 0 && (
-                        <span className="flex items-center gap-1 text-gray-400">
+                        <span className="flex items-center gap-1 text-[#5E6C84]">
                           <Activity className="w-3 h-3" />{summary.scenarioCount} scenario{summary.scenarioCount !== 1 ? 's' : ''}
                         </span>
                       )}
                       {summary.testCaseCount > 0 && (
-                        <span className="flex items-center gap-1 text-gray-400">
+                        <span className="flex items-center gap-1 text-[#5E6C84]">
                           <ListChecks className="w-3 h-3" />{summary.testCaseCount} case{summary.testCaseCount !== 1 ? 's' : ''}
                         </span>
                       )}
                       {summary.passedCount > 0 && (
-                        <span className="flex items-center gap-1 text-green-400">
+                        <span className="flex items-center gap-1 text-[#00875A]">
                           <CheckCircle2 className="w-3 h-3" />{summary.passedCount} pass
                         </span>
                       )}
                       {summary.failedCount > 0 && (
-                        <span className="flex items-center gap-1 text-red-400">
+                        <span className="flex items-center gap-1 text-[#C9372C]">
                           <XCircle className="w-3 h-3" />{summary.failedCount} fail
                         </span>
                       )}
@@ -582,7 +670,7 @@ function ProjectDashboard() {
                       </button>
                       <button
                         onClick={(e) => handleDeleteRun(run.runId, e)}
-                        className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors"
+                        className="p-1.5 text-[#8993A4] hover:text-[#C9372C] hover:bg-red-400/10 rounded transition-colors"
                         title="Delete run and all test cases"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -598,11 +686,11 @@ function ProjectDashboard() {
 
       {/* Documents View */}
       {activeTab === 'docs' && (
-        <div className="bg-gray-900 border border-gray-800 rounded-lg p-6">
+        <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg p-6">
           <div className="flex items-center justify-between mb-6">
             <div className="flex items-center gap-2">
               <FileText className="w-5 h-5 text-indigo-400" />
-              <h3 className="text-lg font-bold text-gray-200">Context Documents</h3>
+              <h3 className="text-lg font-bold text-[#172B4D]">Context Documents</h3>
             </div>
             <div>
               <input
@@ -624,31 +712,31 @@ function ProjectDashboard() {
             </div>
           </div>
           
-          <div className="mb-4 text-sm text-gray-400">
+          <div className="mb-4 text-sm text-[#5E6C84]">
             Upload PDF, DOCX, or TXT files. The text will be extracted and passed to the LLM during Test Scenario generation to provide additional context.
           </div>
 
           {documents.length === 0 ? (
-            <div className="text-center py-12 bg-gray-800/30 rounded border border-dashed border-gray-700">
-              <FileText className="w-8 h-8 text-gray-600 mx-auto mb-3" />
-              <p className="text-gray-400">No context documents uploaded for this project yet.</p>
+            <div className="text-center py-12 bg-[#F1F2F4]/30 rounded border border-dashed border-[#C1C7D0]">
+              <FileText className="w-8 h-8 text-[#8993A4] mx-auto mb-3" />
+              <p className="text-[#5E6C84]">No context documents uploaded for this project yet.</p>
             </div>
           ) : (
             <div className="space-y-3">
               {documents.map((doc, idx) => (
-                <div key={idx} className="bg-[#1e1e2d] border border-gray-800 rounded p-4 flex items-center justify-between">
+                <div key={idx} className="bg-[#FFFFFF] border border-[#DFE1E6] rounded p-4 flex items-center justify-between">
                   <div className="flex items-center gap-3">
                     <div className="p-2 bg-indigo-500/10 rounded">
                       <FileText className="w-5 h-5 text-indigo-400" />
                     </div>
                     <div>
-                      <p className="text-sm font-medium text-gray-200">{doc.originalName || doc.path.split(/[\\/]/).pop()}</p>
-                      <p className="text-xs text-gray-500 mt-1">Uploaded {new Date(doc.uploadedAt).toLocaleString()}</p>
+                      <p className="text-sm font-medium text-[#172B4D]">{doc.originalName || doc.path.split(/[\\/]/).pop()}</p>
+                      <p className="text-xs text-[#8993A4] mt-1">Uploaded {new Date(doc.uploadedAt).toLocaleString()}</p>
                     </div>
                   </div>
                   <button 
                     onClick={() => handleDeleteDocument(doc.path)}
-                    className="p-2 text-gray-400 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors"
+                    className="p-2 text-[#5E6C84] hover:text-[#C9372C] hover:bg-red-400/10 rounded transition-colors"
                     title="Remove document"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -661,54 +749,54 @@ function ProjectDashboard() {
       )}
 
       {/* Slide-In Details Panel */}
-      <div className={`fixed inset-y-0 right-0 w-full max-w-[560px] bg-gray-900 border-l border-gray-800 shadow-[0_0_40px_rgba(0,0,0,0.5)] transform transition-transform duration-300 ease-in-out z-40 overflow-y-auto ${isPanelOpen ? 'translate-x-0' : 'translate-x-full'}`}>
+      <div className={`fixed inset-y-0 right-0 w-full max-w-[560px] bg-[#F4F5F7] border-l border-[#DFE1E6] shadow-[0_0_40px_rgba(0,0,0,0.5)] transform transition-transform duration-300 ease-in-out z-40 overflow-y-auto ${isPanelOpen ? 'translate-x-0' : 'translate-x-full'}`}>
 
           {/* SCENARIO PANEL */}
           {isPanelOpen && panelMode === 'scenario' && selectedItem && (
               <div className="h-full flex flex-col">
-                  <div className="flex justify-between items-start p-6 border-b border-gray-800 bg-[#161622] sticky top-0 z-10">
+                  <div className="flex justify-between items-start p-6 border-b border-[#DFE1E6] bg-[#F4F5F7] sticky top-0 z-10">
                       <div className="pr-4">
                           <p className="text-sm font-medium text-indigo-400 font-mono mb-1">{selectedItem.id}</p>
-                          <h2 className="text-xl font-bold text-white leading-tight">Scenario Detail</h2>
+                          <h2 className="text-xl font-bold text-[#172B4D] leading-tight">Scenario Detail</h2>
                           <div className="flex items-center mt-3 text-sm">
-                             {selectedItem.execStatus === 'pass' && <><ShieldCheck className="w-4 h-4 text-green-500 mr-2"/><span className="text-green-400 font-medium">Passed</span></>}
-                             {selectedItem.execStatus === 'fail' && <><AlertTriangle className="w-4 h-4 text-red-500 mr-2"/><span className="text-red-400 font-medium">Failed</span></>}
+                             {selectedItem.execStatus === 'pass' && <><ShieldCheck className="w-4 h-4 text-green-500 mr-2"/><span className="text-[#00875A] font-medium">Passed</span></>}
+                             {selectedItem.execStatus === 'fail' && <><AlertTriangle className="w-4 h-4 text-red-500 mr-2"/><span className="text-[#C9372C] font-medium">Failed</span></>}
                              {(!selectedItem.execStatus || selectedItem.execStatus === 'pending') && <><Clock className="w-4 h-4 text-yellow-500 mr-2"/><span className="text-yellow-400 font-medium">Pending execution</span></>}
                           </div>
                       </div>
-                      <button onClick={closePanel} className="text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 p-2 rounded-full transition-colors flex-shrink-0 mt-1">
+                      <button onClick={closePanel} className="text-[#5E6C84] hover:text-[#172B4D] bg-[#F1F2F4] hover:bg-[#DFE1E6] p-2 rounded-full transition-colors flex-shrink-0 mt-1">
                           <X className="w-5 h-5"/>
                       </button>
                   </div>
                   <div className="p-6 space-y-6 flex-1">
                       <div>
-                          <h4 className="text-xs uppercase tracking-widest font-bold text-gray-500 mb-2 flex items-center"><span className="w-1 h-4 bg-indigo-500 rounded mr-2"/>Description</h4>
-                          <p className="text-gray-300 text-sm leading-relaxed bg-[#1e1e2d] p-4 rounded border border-gray-800">{selectedItem.description}</p>
+                          <h4 className="text-xs uppercase tracking-widest font-bold text-[#8993A4] mb-2 flex items-center"><span className="w-1 h-4 bg-indigo-500 rounded mr-2"/>Description</h4>
+                          <p className="text-[#5E6C84] text-sm leading-relaxed bg-[#FFFFFF] p-4 rounded border border-[#DFE1E6]">{selectedItem.description}</p>
                       </div>
                       <div className="grid grid-cols-2 gap-3">
-                          <div className="bg-[#1e1e2d] p-3 rounded border border-gray-800"><span className="text-xs text-gray-500 block mb-1">Type</span><span className="text-sm font-medium text-white">{selectedItem.type || '—'}</span></div>
-                          <div className="bg-[#1e1e2d] p-3 rounded border border-gray-800"><span className="text-xs text-gray-500 block mb-1">Priority</span><span className="text-sm font-medium text-white">{selectedItem.priority || '—'}</span></div>
+                          <div className="bg-[#FFFFFF] p-3 rounded border border-[#DFE1E6]"><span className="text-xs text-[#8993A4] block mb-1">Type</span><span className="text-sm font-medium text-[#172B4D]">{selectedItem.type || '—'}</span></div>
+                          <div className="bg-[#FFFFFF] p-3 rounded border border-[#DFE1E6]"><span className="text-xs text-[#8993A4] block mb-1">Priority</span><span className="text-sm font-medium text-[#172B4D]">{selectedItem.priority || '—'}</span></div>
                       </div>
 
                       {/* Test Cases Summary inside scenario panel */}
                       {(selectedItem.testCases?.length > 0) && (
                           <div>
-                              <h4 className="text-xs uppercase tracking-widest font-bold text-gray-500 mb-2 flex items-center"><span className="w-1 h-4 bg-green-500 rounded mr-2"/>Test Cases ({selectedItem.testCases.length})</h4>
+                              <h4 className="text-xs uppercase tracking-widest font-bold text-[#8993A4] mb-2 flex items-center"><span className="w-1 h-4 bg-green-500 rounded mr-2"/>Test Cases ({selectedItem.testCases.length})</h4>
                               <div className="space-y-2">
                                   {selectedItem.testCases.map(tc => (
                                       <div key={tc.testCaseId}
                                           onClick={() => openTestCaseDetails(tc, selectedItem)}
-                                          className="cursor-pointer flex items-center justify-between p-3 bg-[#1e1e2d] hover:bg-[#252538] rounded border border-gray-700/50 transition-colors">
+                                          className="cursor-pointer flex items-center justify-between p-3 bg-[#FFFFFF] hover:bg-[#F1F2F4] rounded border border-[#DFE1E6] transition-colors">
                                           <div>
                                               <span className="text-xs font-mono text-indigo-400">{tc.testCaseId}</span>
                                               {tc.version > 1 && <span className="ml-2 text-[9px] px-1 bg-blue-500/20 text-blue-300 rounded border border-blue-500/30">v{tc.version}</span>}
-                                              <p className="text-xs text-gray-300 mt-0.5">{tc.title}</p>
+                                              <p className="text-xs text-[#5E6C84] mt-0.5">{tc.title}</p>
                                           </div>
                                           <div className="flex items-center gap-2 flex-shrink-0">
-                                              {tc.status === 'pass' && <CheckCircle2 className="w-4 h-4 text-green-400"/>}
-                                              {tc.status === 'fail' && <XCircle className="w-4 h-4 text-red-400"/>}
+                                              {tc.status === 'pass' && <CheckCircle2 className="w-4 h-4 text-[#00875A]"/>}
+                                              {tc.status === 'fail' && <XCircle className="w-4 h-4 text-[#C9372C]"/>}
                                               {(!tc.status || tc.status === 'pending') && <Clock className="w-4 h-4 text-yellow-400"/>}
-                                              <ChevronRight className="w-4 h-4 text-gray-500"/>
+                                              <ChevronRight className="w-4 h-4 text-[#8993A4]"/>
                                           </div>
                                       </div>
                                   ))}
@@ -718,7 +806,7 @@ function ProjectDashboard() {
 
                       {selectedItem.lastPRTested && (
                           <div>
-                              <h4 className="text-xs uppercase tracking-widest font-bold text-gray-500 mb-2 flex items-center"><span className="w-1 h-4 bg-blue-500 rounded mr-2"/>Last PR Trace</h4>
+                              <h4 className="text-xs uppercase tracking-widest font-bold text-[#8993A4] mb-2 flex items-center"><span className="w-1 h-4 bg-blue-500 rounded mr-2"/>Last PR Trace</h4>
                               <div className="bg-blue-900/10 border border-blue-900 p-3 rounded"><span className="text-xs text-blue-400 block mb-1">Run ID</span><span className="text-sm text-blue-300 font-mono">{selectedItem.lastPRTested}</span></div>
                           </div>
                       )}
@@ -729,35 +817,35 @@ function ProjectDashboard() {
           {/* TEST CASE PANEL */}
           {isPanelOpen && panelMode === 'testcase' && selectedTestCase && (
               <div className="h-full flex flex-col">
-                  <div className="flex justify-between items-start p-6 border-b border-gray-800 bg-[#161622] sticky top-0 z-10">
+                  <div className="flex justify-between items-start p-6 border-b border-[#DFE1E6] bg-[#F4F5F7] sticky top-0 z-10">
                       <div className="pr-4 min-w-0">
-                          <p className="text-[10px] text-gray-500 mb-1">
+                          <p className="text-[10px] text-[#8993A4] mb-1">
                               {selectedTestCase.parentScenario?.id} → <span className="text-indigo-400 font-mono">{selectedTestCase.testCaseId}</span>
                               {selectedTestCase.version > 1 && <span className="ml-2 text-[9px] px-1 bg-blue-500/20 text-blue-300 rounded border border-blue-500/30">v{selectedTestCase.version}</span>}
                           </p>
-                          <h2 className="text-lg font-bold text-white leading-tight">{selectedTestCase.title}</h2>
+                          <h2 className="text-lg font-bold text-[#172B4D] leading-tight">{selectedTestCase.title}</h2>
                           <div className="flex items-center mt-2 text-xs gap-3">
-                              {selectedTestCase.status === 'pass' && <span className="flex items-center gap-1 text-green-400"><CheckCircle2 className="w-3.5 h-3.5"/>Passed</span>}
-                              {selectedTestCase.status === 'fail' && <span className="flex items-center gap-1 text-red-400"><XCircle className="w-3.5 h-3.5"/>Failed</span>}
+                              {selectedTestCase.status === 'pass' && <span className="flex items-center gap-1 text-[#00875A]"><CheckCircle2 className="w-3.5 h-3.5"/>Passed</span>}
+                              {selectedTestCase.status === 'fail' && <span className="flex items-center gap-1 text-[#C9372C]"><XCircle className="w-3.5 h-3.5"/>Failed</span>}
                               {(!selectedTestCase.status || selectedTestCase.status === 'pending') && <span className="flex items-center gap-1 text-yellow-400"><Clock className="w-3.5 h-3.5"/>Pending</span>}
-                              {selectedTestCase.language && <span className="flex items-center gap-1 text-gray-400"><Code2 className="w-3.5 h-3.5"/>{selectedTestCase.language}</span>}
+                              {selectedTestCase.language && <span className="flex items-center gap-1 text-[#5E6C84]"><Code2 className="w-3.5 h-3.5"/>{selectedTestCase.language}</span>}
                           </div>
                       </div>
                       <div className="flex items-center gap-2 flex-shrink-0">
-                          <button onClick={() => { setPanelMode('scenario'); setSelectedItem(selectedTestCase.parentScenario); }} className="text-gray-400 hover:text-indigo-400 bg-gray-800 hover:bg-gray-700 p-2 rounded-full transition-colors" title="Back to scenario">
+                          <button onClick={() => { setPanelMode('scenario'); setSelectedItem(selectedTestCase.parentScenario); }} className="text-[#5E6C84] hover:text-indigo-400 bg-[#F1F2F4] hover:bg-[#DFE1E6] p-2 rounded-full transition-colors" title="Back to scenario">
                               <ChevronRight className="w-4 h-4 rotate-180"/>
                           </button>
-                          <button onClick={closePanel} className="text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 p-2 rounded-full transition-colors">
+                          <button onClick={closePanel} className="text-[#5E6C84] hover:text-[#172B4D] bg-[#F1F2F4] hover:bg-[#DFE1E6] p-2 rounded-full transition-colors">
                               <X className="w-5 h-5"/>
                           </button>
                       </div>
                   </div>
 
                   {/* Tab bar */}
-                  <div className="flex border-b border-gray-800 bg-[#1a1a26]">
+                  <div className="flex border-b border-[#DFE1E6] bg-[#F4F5F7]">
                       {[['steps','Steps','ListChecks'], ['script','Test Script','Code2'], ['data','Test Data','Database']].map(([key, label, _]) => (
                           <button key={key} onClick={() => setTcPanelTab(key)}
-                              className={`px-5 py-3 text-xs font-medium border-b-2 transition-colors ${tcPanelTab === key ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-gray-500 hover:text-gray-300'}`}>
+                              className={`px-5 py-3 text-xs font-medium border-b-2 transition-colors ${tcPanelTab === key ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]'}`}>
                               {label}
                           </button>
                       ))}
@@ -768,15 +856,15 @@ function ProjectDashboard() {
                       {tcPanelTab === 'steps' && (
                           <div className="space-y-3">
                               {(selectedTestCase.steps || []).length === 0
-                                  ? <p className="text-sm text-gray-500 italic">No steps recorded.</p>
+                                  ? <p className="text-sm text-[#8993A4] italic">No steps recorded.</p>
                                   : (selectedTestCase.steps || []).map((step, i) => (
-                                      <div key={i} className="bg-[#1e1e2d] border border-gray-800 rounded p-3">
+                                      <div key={i} className="bg-[#FFFFFF] border border-[#DFE1E6] rounded p-3">
                                           <div className="flex items-start gap-3">
                                               <span className="flex-shrink-0 w-5 h-5 rounded-full bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 text-[10px] flex items-center justify-center font-bold">{i + 1}</span>
                                               <div className="min-w-0">
-                                                  <p className="text-xs text-gray-200 font-medium mb-1">{step.action}</p>
+                                                  <p className="text-xs text-[#172B4D] font-medium mb-1">{step.action}</p>
                                                   {step.expectedResult && (
-                                                      <p className="text-[10px] text-gray-500 italic">Expected: {step.expectedResult}</p>
+                                                      <p className="text-[10px] text-[#8993A4] italic">Expected: {step.expectedResult}</p>
                                                   )}
                                               </div>
                                           </div>
@@ -785,10 +873,10 @@ function ProjectDashboard() {
                               }
                               {selectedTestCase.codeFiles?.length > 0 && (
                                   <div className="mt-4">
-                                      <h5 className="text-xs text-gray-500 uppercase tracking-wider mb-2 flex items-center gap-1"><GitBranch className="w-3 h-3"/>Covers Files</h5>
+                                      <h5 className="text-xs text-[#8993A4] uppercase tracking-wider mb-2 flex items-center gap-1"><GitBranch className="w-3 h-3"/>Covers Files</h5>
                                       <div className="space-y-1">
                                           {selectedTestCase.codeFiles.map(f => (
-                                              <span key={f} className="block text-[11px] font-mono text-gray-400 bg-gray-800/50 px-2 py-1 rounded">{f}</span>
+                                              <span key={f} className="block text-[11px] font-mono text-[#5E6C84] bg-[#F1F2F4] px-2 py-1 rounded">{f}</span>
                                           ))}
                                       </div>
                                   </div>
@@ -800,8 +888,8 @@ function ProjectDashboard() {
                       {tcPanelTab === 'script' && (
                           <div>
                               {selectedTestCase.testScript
-                                  ? <pre className="text-xs text-gray-300 bg-[#0d0d14] p-4 rounded border border-gray-800 overflow-auto whitespace-pre-wrap font-mono leading-relaxed">{selectedTestCase.testScript}</pre>
-                                  : <p className="text-sm text-gray-500 italic">No test script generated yet.</p>
+                                  ? <pre className="text-xs text-[#5E6C84] bg-[#FAFBFC] p-4 rounded border border-[#DFE1E6] overflow-auto whitespace-pre-wrap font-mono leading-relaxed">{selectedTestCase.testScript}</pre>
+                                  : <p className="text-sm text-[#8993A4] italic">No test script generated yet.</p>
                               }
                           </div>
                       )}
@@ -810,15 +898,15 @@ function ProjectDashboard() {
                       {tcPanelTab === 'data' && (
                           <div>
                               {selectedTestCase.testData && Object.keys(selectedTestCase.testData).length > 0
-                                  ? <pre className="text-xs text-gray-300 bg-[#0d0d14] p-4 rounded border border-gray-800 overflow-auto whitespace-pre-wrap font-mono">{JSON.stringify(selectedTestCase.testData, null, 2)}</pre>
-                                  : <p className="text-sm text-gray-500 italic">No test data recorded.</p>
+                                  ? <pre className="text-xs text-[#5E6C84] bg-[#FAFBFC] p-4 rounded border border-[#DFE1E6] overflow-auto whitespace-pre-wrap font-mono">{JSON.stringify(selectedTestCase.testData, null, 2)}</pre>
+                                  : <p className="text-sm text-[#8993A4] italic">No test data recorded.</p>
                               }
                           </div>
                       )}
                   </div>
 
                   {/* Footer meta */}
-                  <div className="px-6 py-3 border-t border-gray-800 bg-[#161622] text-[10px] text-gray-600 flex items-center justify-between">
+                  <div className="px-6 py-3 border-t border-[#DFE1E6] bg-[#F4F5F7] text-[10px] text-[#8993A4] flex items-center justify-between">
                       <span>Created {selectedTestCase.createdAt ? new Date(selectedTestCase.createdAt).toLocaleString() : '—'}</span>
                       {selectedTestCase.healAttempts > 0 && <span className="flex items-center gap-1 text-orange-400"><RefreshCw className="w-3 h-3"/>{selectedTestCase.healAttempts} heal attempt{selectedTestCase.healAttempts !== 1 ? 's' : ''}</span>}
                       {selectedTestCase.prUrl && <a href={selectedTestCase.prUrl} target="_blank" rel="noreferrer" className="text-indigo-400 hover:underline truncate max-w-[160px]" title={selectedTestCase.prUrl}>PR ↗</a>}

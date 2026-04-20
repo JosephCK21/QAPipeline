@@ -1,30 +1,13 @@
-const { Type } = require('@google/genai');
-const { genAI, emitLlmTrace } = require('./geminiService');
-
-function safeParseJSON(text) {
-    if (!text) return {};
-
-    try {
-        return JSON.parse(text);
-    } catch (error) {
-        const blockMatch = String(text).match(/```(?:json)?\s*([\s\S]*?)```/i);
-        if (blockMatch) {
-            try {
-                return JSON.parse(blockMatch[1]);
-            } catch (innerError) {
-                // Continue to fallback parsing.
-            }
-        }
-
-        const first = String(text).indexOf('{');
-        const last = String(text).lastIndexOf('}');
-        if (first !== -1 && last !== -1 && last > first) {
-            return JSON.parse(String(text).slice(first, last + 1));
-        }
-
-        throw error;
-    }
-}
+const {
+    client,
+    DEFAULT_MODEL,
+    SCENARIO_EFFORT,
+    REASONING_SUMMARY,
+    emitLlmTrace,
+    extractResponseText,
+    extractReasoningSummary,
+    safeParseJSON
+} = require('./llmService');
 
 function toText(value) {
     return String(value || '').trim();
@@ -33,6 +16,25 @@ function toText(value) {
 function normalizeStoryKey(storyKey) {
     return toText(storyKey).replace('-', '');
 }
+
+// Static instructions — held separately so the same prefix hashes identically
+// across calls and benefits from OpenAI prompt caching.
+const JIRA_SCENARIO_INSTRUCTIONS = `You are a senior QA engineer generating test scenarios for a software feature.
+
+## Your Task
+Generate a comprehensive set of test scenarios for a User Story. Each scenario must:
+1. Be traceable to the given User Story (use relatedReq: "<storyKey>").
+2. Be one of three types: Positive (happy path), Negative (failure / error handling), or Edge Case (boundary / unusual input).
+3. Have a clear, human-readable title that describes what is being verified.
+4. Have a 1-2 sentence description of the expected system behavior.
+5. Have a unique ID in the format: SCN-{storyKey without dash}-{3-digit number}.
+
+Cover at minimum: 1 positive scenario, 1 negative scenario, 1 edge case.
+Generate as many additional scenarios as the story warrants — do not artificially limit to 3.
+
+Also produce one rtmEntry summarising this story as a requirement row.
+
+Respond only with valid JSON matching the schema. No preamble, no markdown fences.`;
 
 function buildPrompt({ epic, story, docTexts }) {
     const cleanEpic = epic || {};
@@ -43,9 +45,7 @@ function buildPrompt({ epic, story, docTexts }) {
     const hasAcceptance = Boolean(acceptance);
     const hasDocs = docs.length > 0;
 
-    return `You are a senior QA engineer generating test scenarios for a software feature.
-
-## Epic Context
+    return `## Epic Context
 Epic ID: ${toText(cleanEpic.key)}
 Epic Title: ${toText(cleanEpic.summary)}
 Epic Description:
@@ -57,55 +57,44 @@ Story Title: ${toText(cleanStory.summary)}
 Story Description:
 ${toText(cleanStory.description)}
 ${hasAcceptance ? `\nAcceptance Criteria:\n${acceptance}\n` : ''}
-${hasDocs ? `\n## Supporting Documentation\nThe following supplementary documents have been uploaded for additional context:\n${docs.join('\n\n---\n\n')}\n` : ''}
-## Your Task
-Generate a comprehensive set of test scenarios for this User Story. Each scenario must:
-1. Be traceable to the User Story above (use relatedReq: "${toText(cleanStory.key)}").
-2. Be one of three types: Positive (happy path), Negative (failure / error handling), or Edge Case (boundary / unusual input).
-3. Have a clear, human-readable title that describes what is being verified.
-4. Have a 1-2 sentence description of the expected system behavior.
-5. Have a unique ID in the format: SCN-{storyKey without dash}-{3-digit number} (e.g., SCN-${normalizeStoryKey(cleanStory.key)}-001).
-
-Cover at minimum: 1 positive scenario, 1 negative scenario, 1 edge case.
-Generate as many additional scenarios as the story warrants — do not artificially limit to 3.
-
-Also produce one rtmEntry summarising this story as a requirement row.
-
-Respond only with valid JSON matching the schema. No preamble, no markdown fences.`;
+${hasDocs ? `\n## Supporting Documentation\n${docs.join('\n\n---\n\n')}\n` : ''}
+Use relatedReq = "${toText(cleanStory.key)}" for every scenario.
+Example scenario id prefix: SCN-${normalizeStoryKey(cleanStory.key)}-001.`;
 }
 
-function responseSchema() {
-    return {
-        type: Type.OBJECT,
-        properties: {
-            scenarios: {
-                type: Type.ARRAY,
-                items: {
-                    type: Type.OBJECT,
-                    properties: {
-                        id: { type: Type.STRING },
-                        title: { type: Type.STRING },
-                        type: { type: Type.STRING, enum: ['Positive', 'Negative', 'Edge Case'] },
-                        description: { type: Type.STRING },
-                        relatedReq: { type: Type.STRING }
-                    },
-                    required: ['id', 'title', 'type', 'description', 'relatedReq']
-                }
-            },
-            rtmEntry: {
-                type: Type.OBJECT,
+const JIRA_SCENARIO_SCHEMA = {
+    type: 'object',
+    properties: {
+        scenarios: {
+            type: 'array',
+            items: {
+                type: 'object',
                 properties: {
-                    reqId: { type: Type.STRING },
-                    description: { type: Type.STRING },
-                    epicKey: { type: Type.STRING },
-                    epicSummary: { type: Type.STRING }
+                    id:          { type: 'string' },
+                    title:       { type: 'string' },
+                    type:        { type: 'string', enum: ['Positive', 'Negative', 'Edge Case'] },
+                    description: { type: 'string' },
+                    relatedReq:  { type: 'string' }
                 },
-                required: ['reqId', 'description', 'epicKey', 'epicSummary']
+                required: ['id', 'title', 'type', 'description', 'relatedReq'],
+                additionalProperties: false
             }
         },
-        required: ['scenarios', 'rtmEntry']
-    };
-}
+        rtmEntry: {
+            type: 'object',
+            properties: {
+                reqId:       { type: 'string' },
+                description: { type: 'string' },
+                epicKey:     { type: 'string' },
+                epicSummary: { type: 'string' }
+            },
+            required: ['reqId', 'description', 'epicKey', 'epicSummary'],
+            additionalProperties: false
+        }
+    },
+    required: ['scenarios', 'rtmEntry'],
+    additionalProperties: false
+};
 
 function normalizeResult(parsed, story, epic) {
     const cleanStory = story || {};
@@ -142,26 +131,43 @@ async function generateScenariosFromJiraContext({ epic, story, docTexts }) {
     const issueKey = story?.key || 'unknown-story';
 
     try {
-        if (!genAI) {
-            throw new Error('Gemini client is unavailable from geminiService');
+        if (!client) {
+            throw new Error('OpenAI client is unavailable from llmService');
         }
 
-        const model = process.env.GEMINI_MODEL || 'gemma-4-31b-it';
+        const model = DEFAULT_MODEL;
         const prompt = buildPrompt({ epic, story, docTexts });
 
         const _jiraStartMs = Date.now();
         emitLlmTrace({ caller: 'generateScenariosFromJiraContext', model, phase: 'request', prompt });
-        const response = await genAI.models.generateContent({
+        const response = await client.responses.create({
             model,
-            contents: prompt,
-            config: {
-                responseSchema: responseSchema(),
-                responseMimeType: 'application/json'
-            }
+            instructions: JIRA_SCENARIO_INSTRUCTIONS,
+            input: prompt,
+            text: {
+                format: {
+                    type: 'json_schema',
+                    name: 'JiraScenarios',
+                    schema: JIRA_SCENARIO_SCHEMA,
+                    strict: true
+                }
+            },
+            reasoning: { effort: SCENARIO_EFFORT, summary: REASONING_SUMMARY },
+            store: true
         });
 
-        emitLlmTrace({ caller: 'generateScenariosFromJiraContext', model, phase: 'response', response: response.text, durationMs: Date.now() - _jiraStartMs });
-        const parsed = safeParseJSON(response.text);
+        const rawText = extractResponseText(response);
+        const reasoningSummary = extractReasoningSummary(response);
+        emitLlmTrace({
+            caller: 'generateScenariosFromJiraContext',
+            model,
+            phase: 'response',
+            response: rawText,
+            reasoningSummary,
+            durationMs: Date.now() - _jiraStartMs,
+            responseId: response.id
+        });
+        const parsed = safeParseJSON(rawText);
         return normalizeResult(parsed, story, epic);
     } catch (error) {
         console.error(`[jiraScenarioService.generateScenariosFromJiraContext] Failed for ${issueKey}:`, error.message);

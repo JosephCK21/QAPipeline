@@ -14,3 +14,6 @@ node_modules
 code/backend/data/autoqa.db
 code/backend/data/autoqa.db-shm
 code/backend/data/autoqa.db-wal
+
+# Frontend build output
+code/frontend/dist/

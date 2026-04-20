@@ -8,130 +8,108 @@
   box-sizing: border-box;
 }
 
+html,
 body {
-  font-family: 'Inter', sans-serif;
-  background-color: #121212;
-  color: #F8F8F2;
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background-color: #F4F5F7;
+  color: #172B4D;
   min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Custom scrollbar */
+/* Light-theme scrollbar — slim, unobtrusive */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #1E1E2F;
+  background: #F4F5F7;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #6272A4;
-  border-radius: 4px;
+  background: #C1C7D0;
+  border: 2px solid #F4F5F7;
+  border-radius: 6px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #7c8ab8;
+  background: #8993A4;
+}
+
+/* Firefox */
+* {
+  scrollbar-color: #C1C7D0 #F4F5F7;
+  scrollbar-width: thin;
 }
 
 /* Animation keyframes */
 @keyframes pulse {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.5;
-  }
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.5; }
 }
 
 @keyframes slideIn {
-  from {
-    transform: translateX(-100%);
-    opacity: 0;
-  }
-  to {
-    transform: translateX(0);
-    opacity: 1;
-  }
+  from { transform: translateX(100%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
 }
 
 @keyframes fadeIn {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes progressBar {
-  from {
-    width: 0%;
-  }
-  to {
-    width: 100%;
-  }
+  from { width: 0%; }
+  to   { width: 100%; }
 }
 
-.animate-pulse {
-  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-}
+.animate-pulse      { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+.animate-slide-in   { animation: slideIn 0.3s ease-out; }
+.animate-fade-in    { animation: fadeIn 0.25s ease-out; }
+.animate-progress   { animation: progressBar 3s ease-in-out; }
 
-.animate-slide-in {
-  animation: slideIn 0.3s ease-out;
-}
-
-.animate-fade-in {
-  animation: fadeIn 0.3s ease-out;
-}
-
-.animate-progress {
-  animation: progressBar 3s ease-in-out;
-}
-
-/* Terminal styling */
+/* Terminal / log panel */
 .terminal-log {
-  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
   font-size: 13px;
   line-height: 1.6;
+  background: #FAFBFC;
+  color: #172B4D;
+  border-radius: 6px;
 }
 
-.log-info {
-  color: #50FA7B;
-}
+.log-info  { color: #0C66E4; }
+.log-warn  { color: #B65C00; }
+.log-error { color: #C9372C; }
 
-.log-warn {
-  color: #FFB86C;
-}
-
-.log-error {
-  color: #FF5555;
-}
-
-/* Glass effect */
+/* Soft glass card — now a subtle white panel with a low-elevation shadow */
 .glass {
-  background: rgba(30, 30, 47, 0.8);
-  backdrop-filter: blur(10px);
-  border: 1px solid rgba(98, 114, 164, 0.3);
+  background: #FFFFFF;
+  backdrop-filter: none;
+  border: 1px solid #DFE1E6;
+  box-shadow: 0 1px 2px rgba(9, 30, 66, 0.08), 0 0 1px rgba(9, 30, 66, 0.12);
 }
 
-/* Status colors */
-.status-completed {
-  color: #50FA7B;
+/* Status colors — used by existing status badge code paths */
+.status-completed { color: #00875A; }
+.status-running   { color: #0C66E4; }
+.status-pending   { color: #5E6C84; }
+.status-failed    { color: #C9372C; }
+.status-blocked   { color: #B65C00; }
+
+/* Focus ring — modern, subtle */
+*:focus-visible {
+  outline: 2px solid #0C66E4;
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
-.status-running {
-  color: #8BE9FD;
-}
-
-.status-pending {
-  color: #6272A4;
-}
-
-.status-failed {
-  color: #FF5555;
-}
-
-.status-blocked {
-  color: #FFB86C;
+button:focus,
+a:focus,
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
 }

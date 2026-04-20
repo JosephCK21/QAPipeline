@@ -1,9 +1,9 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useAppContext } from '../App';
-import { 
+import {
   FolderKanban,
-  Play, 
+  Play,
   ChevronLeft,
   ChevronRight,
   Zap
@@ -20,57 +20,60 @@ function Sidebar() {
   ];
 
   return (
-    <aside className={`fixed left-0 top-0 h-full bg-[#1E1E2F] border-r border-[#282A36] transition-all duration-300 z-40 ${
+    <aside className={`fixed left-0 top-0 h-full bg-white border-r border-[#DFE1E6] transition-all duration-300 z-40 ${
       sidebarCollapsed ? 'w-16' : 'w-64'
     }`}>
       {/* Logo */}
-      <div className="h-16 flex items-center justify-between px-4 border-b border-[#282A36]">
+      <div className="h-16 flex items-center justify-between px-4 border-b border-[#DFE1E6]">
         {!sidebarCollapsed && (
           <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-gradient-to-br from-[#6272A4] to-[#50FA7B] rounded-lg flex items-center justify-center">
+            <div className="w-8 h-8 bg-gradient-to-br from-[#0C66E4] to-[#0747A6] rounded-lg flex items-center justify-center shadow-sm">
               <Zap className="w-5 h-5 text-white" />
             </div>
-            <span className="font-bold text-lg text-[#F8F8F2]">QA Pipeline</span>
+            <span className="font-bold text-lg text-[#172B4D] tracking-tight">QA Pipeline</span>
           </div>
         )}
         {sidebarCollapsed && (
-          <div className="w-8 h-8 bg-gradient-to-br from-[#6272A4] to-[#50FA7B] rounded-lg flex items-center justify-center mx-auto">
+          <div className="w-8 h-8 bg-gradient-to-br from-[#0C66E4] to-[#0747A6] rounded-lg flex items-center justify-center mx-auto shadow-sm">
             <Zap className="w-5 h-5 text-white" />
           </div>
         )}
       </div>
 
       {/* Navigation */}
-      <nav className="p-4 space-y-2">
+      <nav className="p-3 space-y-1">
         {navItems.map((item, index) => {
           const Icon = item.icon;
           const isActive = item.path === '/'
             ? location.pathname === '/'
             : location.pathname.startsWith(item.path);
-          
+
           return (
             <Link
               key={index}
               to={item.path}
-              className={`flex items-center gap-3 px-3 py-3 rounded-lg transition-all duration-200 group ${
-                isActive 
-                  ? 'bg-[#6272A4] text-white' 
-                  : 'text-[#6272A4] hover:bg-[#282A36] hover:text-[#F8F8F2]'
+              className={`relative flex items-center gap-3 px-3 py-2.5 rounded-md transition-all duration-150 group ${
+                isActive
+                  ? 'bg-[#E9F2FF] text-[#0747A6] font-medium'
+                  : 'text-[#44546F] hover:bg-[#F1F2F4] hover:text-[#172B4D]'
               }`}
             >
-              <Icon className={`w-5 h-5 flex-shrink-0 ${isActive ? 'text-white' : 'text-[#6272A4] group-hover:text-[#F8F8F2]'}`} />
+              {isActive && (
+                <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-[#0C66E4] rounded-r-full" />
+              )}
+              <Icon className={`w-[18px] h-[18px] flex-shrink-0 ${isActive ? 'text-[#0C66E4]' : 'text-[#5E6C84] group-hover:text-[#172B4D]'}`} />
               {!sidebarCollapsed && (
                 <>
-                  <span className="flex-1 text-sm font-medium truncate">{item.label}</span>
+                  <span className="flex-1 text-sm truncate">{item.label}</span>
                   {item.badge > 0 && (
-                    <span className="px-2 py-0.5 text-xs font-bold bg-[#50FA7B] text-[#1E1E2F] rounded-full">
+                    <span className="px-1.5 py-0.5 text-[10px] font-bold bg-[#0C66E4] text-white rounded-full min-w-[18px] text-center">
                       {item.badge}
                     </span>
                   )}
                 </>
               )}
               {sidebarCollapsed && item.badge > 0 && (
-                <span className="absolute left-10 px-1.5 py-0.5 text-xs font-bold bg-[#50FA7B] text-[#1E1E2F] rounded-full">
+                <span className="absolute right-1 top-1 px-1.5 py-0.5 text-[10px] font-bold bg-[#0C66E4] text-white rounded-full">
                   {item.badge}
                 </span>
               )}
@@ -82,19 +85,20 @@ function Sidebar() {
       {/* Collapse Toggle */}
       <button
         onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-        className="absolute bottom-4 right-0 transform translate-x-1/2 w-6 h-6 bg-[#282A36] border border-[#6272A4] rounded-full flex items-center justify-center text-[#6272A4] hover:text-[#F8F8F2] hover:bg-[#6272A4] transition-all duration-200"
+        className="absolute bottom-4 right-0 transform translate-x-1/2 w-6 h-6 bg-white border border-[#C1C7D0] rounded-full flex items-center justify-center text-[#5E6C84] hover:text-[#0C66E4] hover:border-[#0C66E4] hover:shadow-sm transition-all duration-150"
+        aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
       >
-        {sidebarCollapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
+        {sidebarCollapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronLeft className="w-3.5 h-3.5" />}
       </button>
 
       {/* Immutable Boundary Notice */}
       {!sidebarCollapsed && (
-        <div className="absolute bottom-16 left-4 right-4 p-3 bg-[#282A36] rounded-lg border border-[#6272A4]/30">
-          <div className="flex items-center gap-2 text-xs text-[#6272A4]">
-            <div className="w-2 h-2 bg-[#50FA7B] rounded-full animate-pulse" />
+        <div className="absolute bottom-16 left-3 right-3 p-3 bg-[#E3FCEF] rounded-md border border-[#ABF5D1]">
+          <div className="flex items-center gap-2 text-xs text-[#006644] font-medium">
+            <div className="w-1.5 h-1.5 bg-[#00875A] rounded-full animate-pulse" />
             <span>Immutable Boundary Active</span>
           </div>
-          <p className="text-xs text-[#6272A4]/70 mt-1">AI write access: test assets only</p>
+          <p className="text-[11px] text-[#006644]/80 mt-1 leading-relaxed">AI write access: test assets only</p>
         </div>
       )}
     </aside>

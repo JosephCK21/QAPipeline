@@ -77,6 +77,8 @@ function initDb() {
             previousVersionId TEXT,
             codeFiles        TEXT,
             healAttempts     INTEGER DEFAULT 0,
+            conversationId   TEXT,
+            latestResponseId TEXT,
             createdAt        TEXT,
             lastRunAt        TEXT
         );
@@ -103,6 +105,20 @@ function initDb() {
         }
     } catch (e) {
         // Column already exists or table doesn't exist yet — both are fine
+    }
+
+    // Safe migration: add conversationId / latestResponseId to test_cases for
+    // resumable stateful LLM chains across server restarts.
+    try {
+        const columns = db.pragma('table_info(test_cases)');
+        if (!columns.find(c => c.name === 'conversationId')) {
+            db.exec('ALTER TABLE test_cases ADD COLUMN conversationId TEXT');
+        }
+        if (!columns.find(c => c.name === 'latestResponseId')) {
+            db.exec('ALTER TABLE test_cases ADD COLUMN latestResponseId TEXT');
+        }
+    } catch (e) {
+        // Columns already exist or table doesn't exist yet — both fine.
     }
 
     // Migrate story_sync_log from single-column PK to composite (storyKey, localProjectId)
@@ -351,19 +367,23 @@ function upsertTestCase(tc) {
         INSERT INTO test_cases (
             testCaseId, scenarioId, projectKey, runId, prUrl,
             title, steps, testData, testScript, language,
-            status, version, previousVersionId, codeFiles, healAttempts, createdAt, lastRunAt
+            status, version, previousVersionId, codeFiles, healAttempts,
+            conversationId, latestResponseId, createdAt, lastRunAt
         ) VALUES (
             @testCaseId, @scenarioId, @projectKey, @runId, @prUrl,
             @title, @steps, @testData, @testScript, @language,
-            @status, @version, @previousVersionId, @codeFiles, @healAttempts, @createdAt, @lastRunAt
+            @status, @version, @previousVersionId, @codeFiles, @healAttempts,
+            @conversationId, @latestResponseId, @createdAt, @lastRunAt
         )
         ON CONFLICT(testCaseId) DO UPDATE SET
-            status        = excluded.status,
-            testScript    = excluded.testScript,
-            testData      = excluded.testData,
-            steps         = excluded.steps,
-            healAttempts  = excluded.healAttempts,
-            lastRunAt     = excluded.lastRunAt
+            status           = excluded.status,
+            testScript       = excluded.testScript,
+            testData         = excluded.testData,
+            steps            = excluded.steps,
+            healAttempts     = excluded.healAttempts,
+            conversationId   = COALESCE(excluded.conversationId, test_cases.conversationId),
+            latestResponseId = COALESCE(excluded.latestResponseId, test_cases.latestResponseId),
+            lastRunAt        = excluded.lastRunAt
     `);
     stmt.run({
         testCaseId:        tc.testCaseId,
@@ -381,6 +401,8 @@ function upsertTestCase(tc) {
         previousVersionId: tc.previousVersionId || null,
         codeFiles:         JSON.stringify(tc.codeFiles || []),
         healAttempts:      tc.healAttempts || 0,
+        conversationId:    tc.conversationId || null,
+        latestResponseId:  tc.latestResponseId || null,
         createdAt:         tc.createdAt || new Date().toISOString(),
         lastRunAt:         tc.lastRunAt || null
     });
