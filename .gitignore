@@ -10,3 +10,7 @@ code/backend/data/*.json
 code/backend/uploads/
 code/backend/.env
 node_modules
+
+code/backend/data/autoqa.db
+code/backend/data/autoqa.db-shm
+code/backend/data/autoqa.db-wal
