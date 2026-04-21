@@ -121,6 +121,24 @@ function initDb() {
         // Columns already exist or table doesn't exist yet — both fine.
     }
 
+    // Safe migration: add regression bookkeeping to test_cases so bug-fix
+    // regression runs can record a clean pass vs adapted (healed) vs regression_fail,
+    // and keep the original failing script + output as a potential regression signal.
+    try {
+        const columns = db.pragma('table_info(test_cases)');
+        if (!columns.find(c => c.name === 'regression')) {
+            db.exec('ALTER TABLE test_cases ADD COLUMN regression TEXT');
+        }
+        if (!columns.find(c => c.name === 'originalScript')) {
+            db.exec('ALTER TABLE test_cases ADD COLUMN originalScript TEXT');
+        }
+        if (!columns.find(c => c.name === 'originalFailureOutput')) {
+            db.exec('ALTER TABLE test_cases ADD COLUMN originalFailureOutput TEXT');
+        }
+    } catch (e) {
+        // Columns already exist or table doesn't exist yet — both fine.
+    }
+
     // Migrate story_sync_log from single-column PK to composite (storyKey, localProjectId)
     try {
         const tableInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='story_sync_log'").get();
@@ -368,43 +386,53 @@ function upsertTestCase(tc) {
             testCaseId, scenarioId, projectKey, runId, prUrl,
             title, steps, testData, testScript, language,
             status, version, previousVersionId, codeFiles, healAttempts,
-            conversationId, latestResponseId, createdAt, lastRunAt
+            conversationId, latestResponseId,
+            regression, originalScript, originalFailureOutput,
+            createdAt, lastRunAt
         ) VALUES (
             @testCaseId, @scenarioId, @projectKey, @runId, @prUrl,
             @title, @steps, @testData, @testScript, @language,
             @status, @version, @previousVersionId, @codeFiles, @healAttempts,
-            @conversationId, @latestResponseId, @createdAt, @lastRunAt
+            @conversationId, @latestResponseId,
+            @regression, @originalScript, @originalFailureOutput,
+            @createdAt, @lastRunAt
         )
         ON CONFLICT(testCaseId) DO UPDATE SET
-            status           = excluded.status,
-            testScript       = excluded.testScript,
-            testData         = excluded.testData,
-            steps            = excluded.steps,
-            healAttempts     = excluded.healAttempts,
-            conversationId   = COALESCE(excluded.conversationId, test_cases.conversationId),
-            latestResponseId = COALESCE(excluded.latestResponseId, test_cases.latestResponseId),
-            lastRunAt        = excluded.lastRunAt
+            status                = excluded.status,
+            testScript            = excluded.testScript,
+            testData              = excluded.testData,
+            steps                 = excluded.steps,
+            healAttempts          = excluded.healAttempts,
+            conversationId        = COALESCE(excluded.conversationId, test_cases.conversationId),
+            latestResponseId      = COALESCE(excluded.latestResponseId, test_cases.latestResponseId),
+            regression            = COALESCE(excluded.regression, test_cases.regression),
+            originalScript        = COALESCE(excluded.originalScript, test_cases.originalScript),
+            originalFailureOutput = COALESCE(excluded.originalFailureOutput, test_cases.originalFailureOutput),
+            lastRunAt             = excluded.lastRunAt
     `);
     stmt.run({
-        testCaseId:        tc.testCaseId,
-        scenarioId:        tc.scenarioId,
-        projectKey:        tc.projectKey || null,
-        runId:             tc.runId || null,
-        prUrl:             tc.prUrl || null,
-        title:             tc.title || '',
-        steps:             JSON.stringify(tc.steps || []),
-        testData:          JSON.stringify(tc.testData || {}),
-        testScript:        tc.testScript || '',
-        language:          tc.language || 'javascript',
-        status:            tc.status || 'pending',
-        version:           tc.version || 1,
-        previousVersionId: tc.previousVersionId || null,
-        codeFiles:         JSON.stringify(tc.codeFiles || []),
-        healAttempts:      tc.healAttempts || 0,
-        conversationId:    tc.conversationId || null,
-        latestResponseId:  tc.latestResponseId || null,
-        createdAt:         tc.createdAt || new Date().toISOString(),
-        lastRunAt:         tc.lastRunAt || null
+        testCaseId:            tc.testCaseId,
+        scenarioId:            tc.scenarioId,
+        projectKey:            tc.projectKey || null,
+        runId:                 tc.runId || null,
+        prUrl:                 tc.prUrl || null,
+        title:                 tc.title || '',
+        steps:                 JSON.stringify(tc.steps || []),
+        testData:              JSON.stringify(tc.testData || {}),
+        testScript:            tc.testScript || '',
+        language:              tc.language || 'javascript',
+        status:                tc.status || 'pending',
+        version:               tc.version || 1,
+        previousVersionId:     tc.previousVersionId || null,
+        codeFiles:             JSON.stringify(tc.codeFiles || []),
+        healAttempts:          tc.healAttempts || 0,
+        conversationId:        tc.conversationId || null,
+        latestResponseId:      tc.latestResponseId || null,
+        regression:            tc.regression || null,
+        originalScript:        tc.originalScript || null,
+        originalFailureOutput: tc.originalFailureOutput || null,
+        createdAt:             tc.createdAt || new Date().toISOString(),
+        lastRunAt:             tc.lastRunAt || null
     });
 }
 

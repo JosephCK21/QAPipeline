@@ -4,7 +4,7 @@ import { useAppContext } from '../App';
 import {
   ArrowLeft, AlertTriangle, Loader, CheckCircle2, XCircle, Clock,
   ChevronRight, ChevronDown, Code2, Database, ListChecks, RefreshCw,
-  Activity, GitBranch, Terminal
+  Activity, GitBranch, Terminal, ShieldAlert, Wrench
 } from 'lucide-react';
 
 // ---------------------------------------------------------------------------
@@ -40,6 +40,27 @@ function statusBadge(status) {
 }
 
 // ---------------------------------------------------------------------------
+// Regression pill — shown on attempts and test-case headers when a regression
+// run stamped the outcome.
+// ---------------------------------------------------------------------------
+function RegressionPill({ regression }) {
+  if (!regression || regression === 'clean_pass') return null;
+
+  const styleMap = {
+    adapted:         { cls: 'bg-[#FFF7D6] border-[#F8E08E] text-[#B65C00]', icon: <Wrench className="w-3 h-3" />,       label: 'Adapted' },
+    regression_fail: { cls: 'bg-[#FFEBE6] border-[#FFBDAD] text-[#C9372C]', icon: <ShieldAlert className="w-3 h-3" />, label: 'Regression' },
+    pending:         { cls: 'bg-[#DEEBFF] border-[#B3D4FF] text-[#0747A6]', icon: <RefreshCw className="w-3 h-3" />,    label: 'Regression run' }
+  };
+  const entry = styleMap[regression];
+  if (!entry) return null;
+  return (
+    <span className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border font-semibold ${entry.cls}`}>
+      {entry.icon}{entry.label}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Attempt Timeline Row
 // ---------------------------------------------------------------------------
 function AttemptRow({ attempt }) {
@@ -56,6 +77,7 @@ function AttemptRow({ attempt }) {
         <div className="flex items-center gap-2">
           {statusIcon(attempt.status, 'w-3.5 h-3.5')}
           <span className={statusColor(attempt.status)}>{label}</span>
+          <RegressionPill regression={attempt.regression} />
           {attempt.startedAt && (
             <span className="text-[#8993A4] text-[10px]">{new Date(attempt.startedAt).toLocaleTimeString()}</span>
           )}
@@ -111,7 +133,7 @@ function TestCasePanel({ testCase, attempts }) {
     <div className="flex flex-col h-full">
       {/* Header */}
       <div className="p-4 border-b border-[#DFE1E6] bg-[#F4F5F7]">
-        <div className="flex items-center gap-2 mb-1">
+        <div className="flex items-center gap-2 mb-1 flex-wrap">
           <span className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${statusBadge(testCase.status)}`}>
             {testCase.status || 'pending'}
           </span>
@@ -123,6 +145,7 @@ function TestCasePanel({ testCase, attempts }) {
               <RefreshCw className="w-3 h-3" />{testCase.healAttempts} heal{testCase.healAttempts !== 1 ? 's' : ''}
             </span>
           )}
+          <RegressionPill regression={testCase.regression} />
         </div>
         <p className="text-xs font-mono text-indigo-400">{testCase.testCaseId}</p>
         <p className="text-sm font-semibold text-[#172B4D] mt-0.5 leading-tight">{testCase.title}</p>
@@ -132,6 +155,32 @@ function TestCasePanel({ testCase, attempts }) {
           </p>
         )}
       </div>
+
+      {/* Regression banner — shown when the test case was adapted or failed in a regression run */}
+      {(testCase.regression === 'adapted' || testCase.regression === 'regression_fail') && testCase.originalFailureOutput && (
+        <div className={`px-4 py-3 border-b ${testCase.regression === 'adapted' ? 'bg-[#FFF7D6] border-[#F8E08E]' : 'bg-[#FFEBE6] border-[#FFBDAD]'}`}>
+          <p className="text-[10px] uppercase tracking-wider font-semibold flex items-center gap-1 mb-1" style={{ color: testCase.regression === 'adapted' ? '#B65C00' : '#C9372C' }}>
+            <ShieldAlert className="w-3 h-3" />
+            {testCase.regression === 'adapted'
+              ? 'Potential regression — original script failed, adapted version passed'
+              : 'Regression failure — existing script could not be made green'}
+          </p>
+          <details className="text-[11px]">
+            <summary className="cursor-pointer text-[#5E6C84] hover:text-[#172B4D]">Show original failure output</summary>
+            <pre className="mt-2 font-mono whitespace-pre-wrap overflow-auto max-h-48 bg-white border border-[#DFE1E6] p-2 rounded text-[#C9372C]">
+              {testCase.originalFailureOutput}
+            </pre>
+            {testCase.originalScript && (
+              <>
+                <summary className="cursor-pointer text-[#5E6C84] hover:text-[#172B4D] mt-2">Show original script</summary>
+                <pre className="mt-2 font-mono whitespace-pre-wrap overflow-auto max-h-64 bg-white border border-[#DFE1E6] p-2 rounded text-[#5E6C84]">
+                  {testCase.originalScript}
+                </pre>
+              </>
+            )}
+          </details>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex border-b border-[#DFE1E6] bg-[#F4F5F7]">
@@ -303,6 +352,7 @@ function ScriptDetail() {
   }
 
   const prDetails = events.find(e => e.type === 'pr_details')?.data || {};
+  const prClassification = events.find(e => e.type === 'pr_classification')?.data || null;
   const isRunning = runData.status === 'running';
   const isFailed = runData.status === 'failed' || runData.status === 'error';
   const isCompleted = runData.status === 'completed';
@@ -319,15 +369,29 @@ function ScriptDetail() {
       {/* Run Header */}
       <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2 mb-1">
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
             <span className="text-sm font-mono text-[#5E6C84]">Run #{runId.substring(0, 8)}</span>
             <span className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${statusBadge(isCompleted ? 'pass' : isFailed ? 'fail' : 'running')}`}>
               {isCompleted ? 'Completed' : isFailed ? 'Failed' : 'Running'}
             </span>
             {isRunning && <Loader className="w-3.5 h-3.5 text-blue-400 animate-spin" />}
+            {prClassification?.isBugFix && (
+              <span
+                title={prClassification.rationale || 'Classified as a bug fix'}
+                className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded border font-semibold bg-[#EAE6FF] border-[#C0B6F2] text-[#5E4DB2]"
+              >
+                <ShieldAlert className="w-3 h-3" /> Regression Run
+                {prClassification.source && <span className="opacity-70">· {prClassification.source}</span>}
+              </span>
+            )}
           </div>
           {prDetails.title && <p className="text-base font-bold text-[#172B4D]">{prDetails.title}</p>}
           {prDetails.branch && <p className="text-xs text-[#8993A4] mt-1 flex items-center gap-1"><GitBranch className="w-3 h-3"/>{prDetails.branch}</p>}
+          {prClassification?.isBugFix && prClassification.rationale && (
+            <p className="text-[11px] text-[#5E4DB2] mt-1 max-w-2xl">
+              <span className="font-semibold">Why:</span> {prClassification.rationale}
+            </p>
+          )}
         </div>
 
         {/* Mini counters */}

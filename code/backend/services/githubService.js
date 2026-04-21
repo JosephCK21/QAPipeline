@@ -64,6 +64,7 @@ async function fetchPRDetails(url) {
 
     return {
         title: pr.title,
+        body: pr.body || '',
         author: pr.user.login,
         branch: `${pr.head.ref} -> ${pr.base.ref}`,
         headRef: pr.head.ref,

@@ -4,11 +4,12 @@ const { findProjectByGithubRepo } = require('./services/projectStore');
 const { getDocsForProject } = require('./services/documentAssociationStore');
 const { extractTextFromFiles } = require('./services/documentParserService');
 const { mapPrChangesToScenarios } = require('./services/prScenarioMappingService');
+const { classifyPrAsBugFix } = require('./services/prClassificationService');
 const { generateTestCasesForScenario, repairTestCaseScript } = require('./services/llmService');
 
 const {
     updateRun, createRun, getScenariosByProject,
-    getTestCasesByProject, markTestCaseSuperseded,
+    getTestCasesByProject, getTestCasesByScenario, markTestCaseSuperseded,
     upsertTestCase, updateTestCaseStatus
 } = require('./db');
 
@@ -157,11 +158,17 @@ function detectRefinementCandidates(repoFullName, prChangedFilenames) {
 async function executeTestCaseWithRetries({
     testCase, containerName, sandboxDir, runId, prUrl, codeContextSection,
     linkedProject, refinementCandidates, sendEvent,
-    runSummary
+    runSummary,
+    regressionMode = false
 }) {
     let currentScript = testCase.testScript;
     let finalStatus = 'fail';
     let healAttempts = 0;
+
+    // Regression mode only: capture the pristine script + the first failure output
+    // so we can surface them as a potential-regression signal even when healing succeeds.
+    const originalScriptSnapshot = regressionMode ? (testCase.testScript || '') : null;
+    let firstFailureOutput = null;
 
     // Stateful bookkeeping for the conversation between the pipeline and the LLM:
     //   - conversationId: shared Conversations API id for this test case (preferred chain mechanism)
@@ -204,6 +211,12 @@ async function executeTestCaseWithRetries({
             runSummary.passedCount++;
             runSummary.runningCount = Math.max(0, runSummary.runningCount - 1);
 
+            // Regression stamping: clean_pass when the pristine script passed first try,
+            // 'adapted' when healing had to change it to make it green.
+            const regressionStamp = regressionMode
+                ? (healAttempts === 0 ? 'clean_pass' : 'adapted')
+                : null;
+
             // Persist final passing script back onto the test case
             upsertTestCase({
                 ...testCase,
@@ -212,6 +225,9 @@ async function executeTestCaseWithRetries({
                 healAttempts,
                 conversationId,
                 latestResponseId: currentInteractionId,
+                regression:            regressionStamp,
+                originalScript:        regressionStamp === 'adapted' ? originalScriptSnapshot : null,
+                originalFailureOutput: regressionStamp === 'adapted' ? firstFailureOutput : null,
                 lastRunAt: attemptEndedAt
             });
 
@@ -221,10 +237,16 @@ async function executeTestCaseWithRetries({
                 attempt,
                 status: 'pass',
                 output: sandboxResult.output,
+                regression: regressionStamp,
                 startedAt: attemptStartedAt,
                 endedAt: attemptEndedAt
             });
-            sendEvent('log', { level: 'INFO', message: `[Sandbox] ${testCase.testCaseId}: PASS on attempt ${attempt}` });
+            sendEvent('log', {
+                level: 'INFO',
+                message: regressionStamp === 'adapted'
+                    ? `[Sandbox] ${testCase.testCaseId}: PASS on attempt ${attempt} (adapted — original failure retained as potential regression)`
+                    : `[Sandbox] ${testCase.testCaseId}: PASS on attempt ${attempt}`
+            });
             break;
         }
 
@@ -236,6 +258,12 @@ async function executeTestCaseWithRetries({
             failureOutput: failureOutput.slice(0, 1500) // keep history compact
         });
 
+        // Regression mode: remember the very first failure so we can retain it
+        // alongside an adapted/healed script as a potential-regression signal.
+        if (regressionMode && firstFailureOutput === null) {
+            firstFailureOutput = failureOutput;
+        }
+
         // Failed — record the attempt
         sendEvent('test_case_attempt', {
             testCaseId: testCase.testCaseId,
@@ -244,6 +272,7 @@ async function executeTestCaseWithRetries({
             status: 'fail',
             failureOutput,
             scriptSnapshot: currentScript,
+            regression: regressionMode ? 'pending' : null,
             startedAt: attemptStartedAt,
             endedAt: attemptEndedAt
         });
@@ -290,6 +319,8 @@ async function executeTestCaseWithRetries({
         runSummary.failedCount++;
         runSummary.runningCount = Math.max(0, runSummary.runningCount - 1);
 
+        const regressionStamp = regressionMode ? 'regression_fail' : null;
+
         upsertTestCase({
             ...testCase,
             testScript: currentScript,
@@ -297,6 +328,9 @@ async function executeTestCaseWithRetries({
             healAttempts,
             conversationId,
             latestResponseId: currentInteractionId,
+            regression:            regressionStamp,
+            originalScript:        regressionMode ? originalScriptSnapshot : null,
+            originalFailureOutput: regressionMode ? firstFailureOutput : null,
             lastRunAt: new Date().toISOString()
         });
 
@@ -305,13 +339,166 @@ async function executeTestCaseWithRetries({
             scenarioId: testCase.scenarioId,
             attempt: MAX_HEAL_ATTEMPTS,
             status: 'final_fail',
+            regression: regressionStamp,
             endedAt: new Date().toISOString()
         });
-        sendEvent('log', { level: 'ERROR', message: `[Sandbox] ${testCase.testCaseId}: FINAL FAIL after ${MAX_HEAL_ATTEMPTS} attempts (${healAttempts} heal(s))` });
+        sendEvent('log', {
+            level: 'ERROR',
+            message: regressionMode
+                ? `[Regression] ${testCase.testCaseId}: REGRESSION FAIL — existing script could not be made green after ${MAX_HEAL_ATTEMPTS} attempts (${healAttempts} heal(s))`
+                : `[Sandbox] ${testCase.testCaseId}: FINAL FAIL after ${MAX_HEAL_ATTEMPTS} attempts (${healAttempts} heal(s))`
+        });
     }
 
     updateTestCaseStatus(testCase.testCaseId, finalStatus);
     return finalStatus;
+}
+
+// ---------------------------------------------------------------------------
+// Epic-wide regression runner
+//
+// Triggered when the PR is classified as "just a bug fix". We skip new test
+// generation and instead re-execute every existing, latest-version test case
+// for every scenario under every epic that the PR touches.
+//
+// Reuses executeTestCaseWithRetries with regressionMode=true so healing still
+// runs (per user choice) but each test case ends up stamped as one of:
+//   - clean_pass:       passed on the first attempt, no heal needed
+//   - adapted:          passed but only after healing — original failure is
+//                       retained as a potential regression signal
+//   - regression_fail:  could not be made green after MAX_HEAL_ATTEMPTS
+// ---------------------------------------------------------------------------
+async function runEpicRegression({
+    runId, prUrl, mappedScenarios, linkedProject, prDetails,
+    codeContextSection, containerName, sandboxDir, sendEvent, runSummary
+}) {
+    // 1. Resolve which epic(s) the PR touches via the mapped scenarios.
+    const projectKey = linkedProject?.jiraProjectKey || linkedProject?.id;
+    const allProjectScenarios = getScenariosByProject(projectKey) || [];
+    const scenarioById = new Map(allProjectScenarios.map((s) => [s.scenarioId, s]));
+
+    const epicIds = new Set();
+    for (const m of mappedScenarios) {
+        const scenarioId = m.id || m.scenarioId;
+        const scenario = scenarioById.get(scenarioId);
+        if (scenario?.epicId) epicIds.add(scenario.epicId);
+    }
+
+    if (epicIds.size === 0) {
+        sendEvent('log', { level: 'WARN', message: '[Regression] No epic could be resolved from mapped scenarios — nothing to regress.' });
+        return { success: true, scenarios: [] };
+    }
+
+    // 2. Collect every non-obsolete scenario under those epics.
+    const epicScenarios = allProjectScenarios.filter((s) =>
+        epicIds.has(s.epicId) && s.status !== 'obsolete'
+    );
+
+    sendEvent('log', {
+        level: 'INFO',
+        message: `[Regression] Epic(s): ${Array.from(epicIds).join(', ')} — ${epicScenarios.length} scenario(s) to re-test`
+    });
+
+    // 3. Load the latest runnable test cases for each scenario.
+    const scenarioPlans = [];
+    let totalTestCases = 0;
+    for (const scenario of epicScenarios) {
+        const cases = getTestCasesByScenario(scenario.scenarioId)
+            .filter((tc) => tc.testScript && tc.testScript.trim().length > 0);
+
+        // getTestCasesByScenario orders by version DESC, so the first row per
+        // (scenarioId) is the latest version. Keep only that — older versions
+        // are superseded history, not the current surface area.
+        const latestByScenario = new Map();
+        for (const tc of cases) {
+            if (!latestByScenario.has(tc.scenarioId)) {
+                latestByScenario.set(tc.scenarioId, []);
+            }
+            const bucket = latestByScenario.get(tc.scenarioId);
+            if (bucket.length === 0 || bucket[0].version === tc.version) {
+                bucket.push(tc);
+            }
+        }
+        const runnableCases = Array.from(latestByScenario.values()).flat();
+
+        if (runnableCases.length > 0) {
+            scenarioPlans.push({ scenario, testCases: runnableCases });
+            totalTestCases += runnableCases.length;
+        }
+    }
+
+    if (totalTestCases === 0) {
+        sendEvent('log', { level: 'WARN', message: '[Regression] No existing test cases found for the affected epic(s) — nothing to run.' });
+        return { success: true, scenarios: [] };
+    }
+
+    runSummary.scenarioCount = scenarioPlans.length;
+    runSummary.testCaseCount = totalTestCases;
+    runSummary.runningCount  = totalTestCases;
+
+    sendEvent('regression_summary', {
+        epicIds:         Array.from(epicIds),
+        scenarioCount:   scenarioPlans.length,
+        testCaseCount:   totalTestCases
+    });
+
+    // 4. Execute every test case against the PR's code, letting healing run but
+    //    stamping 'adapted' if the script had to change to pass.
+    let overallSuccess = false;
+    sendEvent('phase_update', { phase: 'Regression Execution', status: 'running' });
+
+    for (const { scenario, testCases } of scenarioPlans) {
+        sendEvent('scenario_execution_updated', {
+            scenarioId: scenario.scenarioId,
+            status: 'running',
+            totals: { passed: 0, failed: 0, running: testCases.length }
+        });
+        sendEvent('log', { level: 'INFO', message: `[Regression] Scenario ${scenario.scenarioId}: running ${testCases.length} existing test case(s)` });
+
+        let scenarioPassed = 0;
+        let scenarioFailed = 0;
+
+        for (const tc of testCases) {
+            // Stamp runId/prUrl for this run's bookkeeping without losing the original
+            // generation runId on the stored row (upsertTestCase only updates the
+            // columns explicitly listed in its ON CONFLICT clause, and runId isn't one).
+            const runnable = { ...tc, runId, prUrl };
+
+            const tcStatus = await executeTestCaseWithRetries({
+                testCase: runnable,
+                containerName,
+                sandboxDir,
+                runId,
+                prUrl,
+                codeContextSection,
+                linkedProject,
+                refinementCandidates: [],
+                sendEvent,
+                runSummary,
+                regressionMode: true
+            });
+
+            if (tcStatus === 'pass') {
+                scenarioPassed++;
+                overallSuccess = true;
+            } else {
+                scenarioFailed++;
+            }
+        }
+
+        const scenarioStatus = scenarioFailed === 0 ? 'pass'
+            : scenarioPassed === 0 ? 'fail'
+            : 'partial';
+
+        sendEvent('scenario_execution_updated', {
+            scenarioId: scenario.scenarioId,
+            status:     scenarioStatus,
+            totals:     { passed: scenarioPassed, failed: scenarioFailed, running: 0 }
+        });
+    }
+
+    sendEvent('phase_update', { phase: 'Regression Execution', status: 'completed' });
+    return { success: overallSuccess, scenarios: scenarioPlans.map((p) => p.scenario.scenarioId) };
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +546,31 @@ async function runPipeline(runId, prUrl, repoFullName) {
             return;
         }
 
+        // Phase 2.5: Bug-Fix Classification
+        // Decides whether the PR is "just a bug fix". When it is (and the feature
+        // is enabled), we skip new test generation and instead re-run every existing
+        // test case for every scenario under every epic the PR touches.
+        const regressionFeatureEnabled = String(process.env.REGRESSION_ENABLED || 'true').toLowerCase() !== 'false';
+        let classification = { isBugFix: false, confidence: 0, rationale: 'Classification skipped', source: 'disabled', jiraIssueKeys: [], jiraBugKeys: [] };
+
+        if (regressionFeatureEnabled) {
+            sendEvent('phase_update', { phase: 'Classification', status: 'running' });
+            try {
+                const prDetailsForClassifier = prMapping?._prDetails || await fetchPRDetails(prUrl);
+                classification = await classifyPrAsBugFix({ prDetails: prDetailsForClassifier });
+                sendEvent('pr_classification', classification);
+                sendEvent('log', {
+                    level: 'INFO',
+                    message: `[Classification] isBugFix=${classification.isBugFix} (source=${classification.source}, confidence=${Number(classification.confidence).toFixed(2)}): ${classification.rationale}`
+                });
+            } catch (err) {
+                sendEvent('log', { level: 'WARN', message: `[Classification] Failed: ${err.message} — falling back to standard flow.` });
+            }
+            sendEvent('phase_update', { phase: 'Classification', status: 'completed' });
+        } else {
+            sendEvent('log', { level: 'INFO', message: '[Classification] Disabled via REGRESSION_ENABLED=false — running standard flow.' });
+        }
+
         // Phase 3: Code Context
         sendEvent('phase_update', { phase: 'Code Context', status: 'running' });
         let codeContext = { fullFiles: [], testFiles: [], dependencies: '' };
@@ -391,14 +603,55 @@ async function runPipeline(runId, prUrl, repoFullName) {
             }
         }
 
-        // Phase 4: Test Generation
-        sendEvent('phase_update', { phase: 'Test Generation', status: 'running' });
-
         // Create sandbox once — returns a persistent container shared by all test cases
+        // (both standard generation and epic regression need it).
         const { sandboxDir, containerName } = await createSandbox(runId, prDetails);
         _sandboxContainerName = containerName;
 
         let overallSuccess = false;
+
+        // ------------------------------------------------------------------
+        // Regression path: PR classified as a bug fix — re-run existing test
+        // cases for every scenario in every epic the PR touches. Skip the
+        // normal generation loop.
+        // ------------------------------------------------------------------
+        if (regressionFeatureEnabled && classification.isBugFix) {
+            sendEvent('log', { level: 'INFO', message: '[Pipeline] Entering epic-wide regression path (bug fix PR).' });
+            sendEvent('phase_update', { phase: 'Test Generation', status: 'skipped' });
+
+            const regressionResult = await runEpicRegression({
+                runId,
+                prUrl,
+                mappedScenarios,
+                linkedProject,
+                prDetails,
+                codeContextSection,
+                containerName,
+                sandboxDir,
+                sendEvent,
+                runSummary
+            });
+
+            overallSuccess = regressionResult.success;
+
+            sendEvent('phase_update', {
+                phase: 'Test Healing',
+                status: 'completed',
+                skipped: runSummary.retryCount === 0
+            });
+            sendEvent('phase_update', { phase: 'Pass', status: overallSuccess ? 'completed' : 'failed' });
+
+            emitSummary();
+            cleanupSandbox(runId, containerName);
+            sendEvent('complete', { success: overallSuccess });
+            return;
+        }
+
+        // ------------------------------------------------------------------
+        // Standard path: non-bug-fix PR — generate new test cases per scenario.
+        // ------------------------------------------------------------------
+        // Phase 4: Test Generation
+        sendEvent('phase_update', { phase: 'Test Generation', status: 'running' });
 
         // Accumulates compact summaries of test cases already generated in this run.
         // Passed into each subsequent scenario's generation call so the LLM avoids
