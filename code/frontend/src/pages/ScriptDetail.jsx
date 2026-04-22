@@ -11,32 +11,39 @@ import {
 // Helpers
 // ---------------------------------------------------------------------------
 function statusColor(status) {
-  if (status === 'pass')       return 'text-[#00875A]';
-  if (status === 'fail' || status === 'final_fail') return 'text-[#C9372C]';
-  if (status === 'running')    return 'text-blue-400';
-  if (status === 'generating') return 'text-indigo-400';
-  if (status === 'partial')    return 'text-orange-400';
+  const s = String(status || '').toLowerCase();
+  if (s === 'pass') return 'text-[#00875A]';
+  if (s === 'fail' || s === 'final_fail') return 'text-[#C9372C]';
+  if (s === 'healing') return 'text-[#0C66E4]';
+  if (s === 'running') return 'text-[#B65C00]';
+  if (s === 'generating') return 'text-indigo-400';
+  if (s === 'partial') return 'text-orange-400';
   return 'text-[#5E6C84]';
 }
 
 function statusIcon(status, size = 'w-4 h-4') {
-  if (status === 'pass')                         return <CheckCircle2 className={`${size} text-[#00875A]`} />;
-  if (status === 'fail' || status === 'final_fail') return <XCircle className={`${size} text-[#C9372C]`} />;
-  if (status === 'running' || status === 'generating') return <Loader className={`${size} text-blue-400 animate-spin`} />;
-  if (status === 'partial')                      return <AlertTriangle className={`${size} text-orange-400`} />;
+  const s = String(status || '').toLowerCase();
+  if (s === 'pass') return <CheckCircle2 className={`${size} text-[#00875A]`} />;
+  if (s === 'fail' || s === 'final_fail') return <XCircle className={`${size} text-[#C9372C]`} />;
+  if (s === 'healing') return <RefreshCw className={`${size} text-[#0C66E4] animate-pulse`} />;
+  if (s === 'running') return <Loader className={`${size} text-[#B65C00] animate-spin`} />;
+  if (s === 'generating') return <Loader className={`${size} text-indigo-400 animate-spin`} />;
+  if (s === 'partial') return <AlertTriangle className={`${size} text-orange-400`} />;
   return <Clock className={`${size} text-[#8993A4]`} />;
 }
 
 function statusBadge(status) {
+  const s = String(status || '').toLowerCase();
   const map = {
     pass:       'bg-green-500/15 border-green-500/30 text-[#00875A]',
     fail:       'bg-red-500/15 border-red-500/30 text-[#C9372C]',
     final_fail: 'bg-red-500/15 border-red-500/30 text-[#C9372C]',
-    running:    'bg-blue-500/15 border-blue-500/30 text-blue-300',
+    running:    'bg-amber-500/15 border-amber-500/30 text-[#B65C00]',
+    healing:    'bg-blue-500/15 border-blue-500/30 text-[#0C66E4]',
     generating: 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300',
     partial:    'bg-orange-500/15 border-orange-500/30 text-orange-300',
   };
-  return map[status] || 'bg-[#DFE1E6]/30 border-[#C1C7D0]/30 text-[#5E6C84]';
+  return map[s] || 'bg-[#DFE1E6]/30 border-[#C1C7D0]/30 text-[#5E6C84]';
 }
 
 // ---------------------------------------------------------------------------

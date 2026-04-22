@@ -224,6 +224,9 @@ async function executeTestCaseWithRetries({
     for (let attempt = 1; attempt <= MAX_HEAL_ATTEMPTS; attempt++) {
         const attemptStartedAt = new Date().toISOString();
 
+        updateTestCaseStatus(testCase.testCaseId, 'running', attemptStartedAt);
+        testCase.status = 'running';
+
         sendEvent('test_case_attempt', {
             testCaseId: testCase.testCaseId,
             scenarioId: testCase.scenarioId,
@@ -248,9 +251,16 @@ async function executeTestCaseWithRetries({
         const attemptEndedAt = new Date().toISOString();
 
         if (sandboxResult.success) {
-            finalStatus = 'pass';
             runSummary.passedCount++;
             runSummary.runningCount = Math.max(0, runSummary.runningCount - 1);
+        }
+        const genLeft = runSummary.scenariosGeneratingLeft ?? 0;
+        const progressLine = `[Sandbox][${testCase.runId || runId}] ${testCase.testCaseId} attempt ${attempt}/${MAX_HEAL_ATTEMPTS}: ${sandboxResult.success ? 'PASS' : 'FAIL'}. Tests still without final verdict: ${runSummary.runningCount}; scenario(s) still generating: ${genLeft}`;
+        console.log(progressLine);
+        sendEvent('log', { level: 'INFO', message: progressLine });
+
+        if (sandboxResult.success) {
+            finalStatus = 'pass';
 
             // Regression stamping: clean_pass when the pristine script passed first try,
             // 'adapted' when healing had to change it to make it green.
@@ -331,6 +341,8 @@ async function executeTestCaseWithRetries({
                 ? `stateful (conversation=${conversationId})`
                 : (currentInteractionId ? `stateful (previous_response_id=${currentInteractionId})` : 'stateless (manual history)');
             sendEvent('log', { level: 'INFO', message: `[Healing] Requesting patch for ${testCase.testCaseId} (attempt ${attempt + 1}, ${healMode})...` });
+            updateTestCaseStatus(testCase.testCaseId, 'healing');
+            testCase.status = 'healing';
             try {
                 const healResult = await repairTestCaseScript({
                     testCase: { ...testCase, testScript: currentScript },
@@ -365,8 +377,10 @@ async function executeTestCaseWithRetries({
                     testScript: currentScript,
                     healAttempts,
                     conversationId,
-                    latestResponseId: currentInteractionId
+                    latestResponseId: currentInteractionId,
+                    status: 'running'
                 });
+                testCase.status = 'running';
             } catch (healErr) {
                 sendEvent('log', { level: 'ERROR', message: `[Healing] LLM repair failed: ${healErr.message}` });
                 break;
@@ -591,7 +605,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
         passedCount: 0,
         failedCount: 0,
         runningCount: 0,
-        retryCount: 0
+        retryCount: 0,
+        scenariosGeneratingLeft: 0
     };
 
     const emitSummary = () => sendEvent('run_summary_updated', { runId, ...runSummary });
@@ -720,6 +735,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
         if (regressionFeatureEnabled && classification.isBugFix) {
             sendEvent('log', { level: 'INFO', message: '[Pipeline] Entering epic-wide regression path (bug fix PR). Waiting for sandbox pool...' });
             sendEvent('phase_update', { phase: 'Test Generation', status: 'skipped' });
+            runSummary.scenariosGeneratingLeft = 0;
 
             const sandboxPool = await sandboxTask;
             _sandboxPool = sandboxPool;
@@ -757,6 +773,9 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // Phase 4 & 5: Pipelined Test Generation & Sandbox Execution
         sendEvent('phase_update', { phase: 'Test Generation', status: 'running' });
         sendEvent('phase_update', { phase: 'Sandbox Testing', status: 'running' });
+
+        runSummary.scenariosGeneratingLeft = mappedScenarios.length;
+        emitSummary();
 
         const executionQueue = [];
         let isGenerationFinished = false;
@@ -832,6 +851,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
         // Map over all scenarios and run LLM generation in parallel
         const generationPromises = mappedScenarios.map(async (scenarioMapping) => {
+            try {
             const scenarioId = scenarioMapping.id || scenarioMapping.scenarioId;
             // Merge RTM row (authoritative for description, type, priority,
             // title, AC refs) with mapping result (authoritative for confidence
@@ -940,6 +960,10 @@ async function runPipeline(runId, prUrl, repoFullName) {
             });
 
             return { scenarioId, persistedCases, scenarioDescription };
+            } finally {
+                runSummary.scenariosGeneratingLeft = Math.max(0, runSummary.scenariosGeneratingLeft - 1);
+                emitSummary();
+            }
         });
 
         // Wait for all scenarios to finish generating in parallel

@@ -410,8 +410,8 @@ app.get('/api/projects/:projectId/jira-rtm', (req, res) => {
             }));
 
             const bestStatus = testCases.length > 0
-                ? (testCases.every(tc => tc.status === 'pass') ? 'pass'
-                    : testCases.some(tc => tc.status === 'fail') ? 'fail'
+                ? (testCases.some(tc => tc.status === 'fail') ? 'fail'
+                    : testCases.every(tc => tc.status === 'pass') ? 'pass'
                     : 'pending')
                 : (s.status || 'pending');
 

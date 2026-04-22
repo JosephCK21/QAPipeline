@@ -5,6 +5,49 @@ import { useAppContext } from '../App';
 import { computeAllEpicMetrics } from '../lib/epicMetrics';
 import { JIRA_BASE_URL } from '../lib/env';
 
+function normTcStatus(s) {
+  return String(s || '').toLowerCase();
+}
+
+/** Per–test-case chip: border/background classes for RTM matrix */
+function testCaseChipClasses(tc, darkMode) {
+  const s = normTcStatus(tc.status);
+  if (s === 'pass') {
+    return darkMode
+      ? 'bg-[rgba(63,185,80,0.1)] border-[rgba(63,185,80,0.3)] text-[#3FB950] hover:bg-[rgba(63,185,80,0.15)]'
+      : 'bg-green-500/10 border-green-500/30 text-[#00875A] hover:bg-green-500/20';
+  }
+  if (s === 'fail') {
+    return darkMode
+      ? 'bg-[rgba(248,81,73,0.1)] border-[rgba(248,81,73,0.3)] text-[#F85149] hover:bg-[rgba(248,81,73,0.15)]'
+      : 'bg-red-500/10 border-red-500/30 text-[#C9372C] hover:bg-red-500/20';
+  }
+  if (s === 'running') {
+    return darkMode
+      ? 'bg-[rgba(210,153,34,0.12)] border-[rgba(210,153,34,0.45)] text-[#D29922] hover:bg-[rgba(210,153,34,0.18)]'
+      : 'bg-amber-500/10 border-amber-500/35 text-[#B65C00] hover:bg-amber-500/15';
+  }
+  if (s === 'healing') {
+    return darkMode
+      ? 'bg-[rgba(56,139,253,0.12)] border-[rgba(56,139,253,0.4)] text-[#58A6FF] hover:bg-[rgba(56,139,253,0.18)]'
+      : 'bg-blue-500/10 border-blue-500/35 text-[#0C66E4] hover:bg-blue-500/15';
+  }
+  return darkMode
+    ? 'bg-[#30363D]/50 border-[#484F58]/50 text-[#8B949E] hover:bg-[#30363D]'
+    : 'bg-[#DFE1E6]/30 border-[#C1C7D0]/30 text-[#5E6C84] hover:bg-[#DFE1E6]/50';
+}
+
+/** Scenario card dot: aggregate from test cases + execStatus */
+function scenarioHeaderDotMeta(tcs, execStatus, darkMode) {
+  const st = normTcStatus(execStatus);
+  if (st === 'fail') return { cls: 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]', label: 'fail' };
+  const statuses = (tcs || []).map((t) => normTcStatus(t.status));
+  if (statuses.some((x) => x === 'healing')) return { cls: 'bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.7)]', label: 'healing' };
+  if (statuses.some((x) => x === 'running')) return { cls: 'bg-yellow-500 shadow-[0_0_5px_rgba(234,179,8,0.5)]', label: 'running' };
+  if (st === 'pass') return { cls: 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]', label: 'pass' };
+  return { cls: darkMode ? 'bg-[#6E7681]' : 'bg-[#8993A4]', label: 'pending' };
+}
+
 function ProjectDashboard() {
   const { projectId } = useParams();
   const navigate = useNavigate();
@@ -514,6 +557,7 @@ function ProjectDashboard() {
                                   }[scen.type] || 'bg-gray-500/15 border-gray-500/30 text-[#5E6C84]';
 
                                   const tcs = scen.testCases || [];
+                                  const scenDot = scenarioHeaderDotMeta(tcs, scen.execStatus, darkMode);
 
                                   return (
                                     <tr key={scen.id} className="hover:bg-[#F1F2F4]/10 transition-colors group border-b border-[#DFE1E6]/50">
@@ -559,9 +603,7 @@ function ProjectDashboard() {
                                           <div className="flex justify-between items-start mb-1.5">
                                               <span className={`text-xs font-mono truncate pr-2 ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-600'}`} title={scen.id}>{scen.id}</span>
                                               <div className="flex items-center flex-shrink-0">
-                                                  {scen.execStatus === 'pass' && <div className="w-2 h-2 rounded-full bg-green-500 mr-1 shadow-[0_0_8px_rgba(34,197,94,0.8)]" />}
-                                                  {scen.execStatus === 'fail' && <div className="w-2 h-2 rounded-full bg-red-500 mr-1 shadow-[0_0_8px_rgba(239,68,68,0.8)]" />}
-                                                  {(!scen.execStatus || scen.execStatus === 'pending') && <div className="w-2 h-2 rounded-full bg-yellow-500 mr-1 shadow-[0_0_5px_rgba(234,179,8,0.5)]" />}
+                                                  <div className={`w-2 h-2 rounded-full mr-1 ${scenDot.cls}`} title={scenDot.label} />
                                               </div>
                                           </div>
                                           <span className={`self-start text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border mb-1.5 ${typeBadge}`}>
@@ -582,17 +624,14 @@ function ProjectDashboard() {
                                         {tcs.length > 0 ? (
                                           <div className="space-y-1">
                                             {tcs.map(tc => {
-                                              const tcStatusColor = tc.status === 'pass'
-                                                ? (darkMode ? 'bg-[rgba(63,185,80,0.1)] border-[rgba(63,185,80,0.3)] text-[#3FB950] hover:bg-[rgba(63,185,80,0.15)]' : 'bg-green-500/10 border-green-500/30 text-[#00875A] hover:bg-green-500/20')
-                                                : tc.status === 'fail'
-                                                ? (darkMode ? 'bg-[rgba(248,81,73,0.1)] border-[rgba(248,81,73,0.3)] text-[#F85149] hover:bg-[rgba(248,81,73,0.15)]' : 'bg-red-500/10 border-red-500/30 text-[#C9372C] hover:bg-red-500/20')
-                                                : (darkMode ? 'bg-[#30363D]/50 border-[#484F58]/50 text-[#8B949E] hover:bg-[#30363D]' : 'bg-[#DFE1E6]/30 border-[#C1C7D0]/30 text-[#5E6C84] hover:bg-[#DFE1E6]/50');
+                                              const s = normTcStatus(tc.status);
+                                              const tcChip = testCaseChipClasses(tc, darkMode);
 
                                               return (
                                                 <div
                                                   key={tc.testCaseId}
                                                   onClick={() => openTestCaseDetails(tc, scen)}
-                                                  className={`cursor-pointer p-1.5 rounded border transition-colors ${tcStatusColor}`}
+                                                  className={`cursor-pointer p-1.5 rounded border transition-colors ${tcChip}`}
                                                 >
                                                   <div className="flex items-center justify-between mb-0.5">
                                                     <span className="text-[10px] font-mono truncate pr-1">{tc.testCaseId}</span>
@@ -600,9 +639,11 @@ function ProjectDashboard() {
                                                       {tc.version > 1 && (
                                                         <span className={`text-[9px] px-1.5 rounded border ${darkMode ? 'bg-[rgba(56,139,253,0.1)] text-[#58A6FF] border-[#58A6FF]/30' : 'bg-blue-500/10 text-blue-600 border-blue-500/20'}`}>v{tc.version}</span>
                                                       )}
-                                                      {tc.status === 'pass' && <CheckCircle2 className={`w-3 h-3 ${darkMode ? 'text-[#3FB950]' : 'text-[#00875A]'}`} />}
-                                                      {tc.status === 'fail' && <XCircle className={`w-3 h-3 ${darkMode ? 'text-[#F85149]' : 'text-[#C9372C]'}`} />}
-                                                      {(!tc.status || tc.status === 'pending') && <Clock className="w-3 h-3 text-yellow-500" />}
+                                                      {s === 'pass' && <CheckCircle2 className={`w-3 h-3 ${darkMode ? 'text-[#3FB950]' : 'text-[#00875A]'}`} />}
+                                                      {s === 'fail' && <XCircle className={`w-3 h-3 ${darkMode ? 'text-[#F85149]' : 'text-[#C9372C]'}`} />}
+                                                      {s === 'running' && <Loader className={`w-3 h-3 animate-spin ${darkMode ? 'text-[#D29922]' : 'text-[#B65C00]'}`} />}
+                                                      {s === 'healing' && <RefreshCw className={`w-3 h-3 animate-pulse ${darkMode ? 'text-[#58A6FF]' : 'text-[#0C66E4]'}`} />}
+                                                      {(!s || s === 'pending') && <Clock className={`w-3 h-3 ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`} />}
                                                       <ChevronRight className="w-3 h-3 opacity-50" />
                                                     </div>
                                                   </div>
@@ -633,6 +674,14 @@ function ProjectDashboard() {
                     )}
                 </tbody>
             </table>
+          </div>
+          <div className={`px-4 py-3 border-t flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px] ${darkMode ? 'border-[#30363D] text-[#8B949E]' : 'border-[#DFE1E6] text-[#5E6C84]'}`}>
+            <span className="font-semibold uppercase tracking-wide">Test case status</span>
+            <span className="inline-flex items-center gap-1.5"><span className={`h-2 w-2 rounded-full ${darkMode ? 'bg-[#6E7681]' : 'bg-[#8993A4]'}`} /> Pending</span>
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-yellow-500" /> Running (sandbox)</span>
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-blue-500" /> Healing (LLM)</span>
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-green-500" /> Pass</span>
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-red-500" /> Fail</span>
           </div>
         </div>
       )}
@@ -811,9 +860,23 @@ function ProjectDashboard() {
                           <p className="text-sm font-medium text-indigo-400 font-mono mb-1">{selectedItem.id}</p>
                           <h2 className="text-xl font-bold text-[#172B4D] leading-tight">Scenario Detail</h2>
                           <div className="flex items-center mt-3 text-sm">
-                             {selectedItem.execStatus === 'pass' && <><ShieldCheck className="w-4 h-4 text-green-500 mr-2"/><span className="text-[#00875A] font-medium">Passed</span></>}
-                             {selectedItem.execStatus === 'fail' && <><AlertTriangle className="w-4 h-4 text-red-500 mr-2"/><span className="text-[#C9372C] font-medium">Failed</span></>}
-                             {(!selectedItem.execStatus || selectedItem.execStatus === 'pending') && <><Clock className="w-4 h-4 text-yellow-500 mr-2"/><span className="text-yellow-400 font-medium">Pending execution</span></>}
+                            {(() => {
+                              const tcs = selectedItem.testCases || [];
+                              const ex = normTcStatus(selectedItem.execStatus);
+                              if (ex === 'fail') {
+                                return <><AlertTriangle className="w-4 h-4 text-red-500 mr-2"/><span className="text-[#C9372C] font-medium">Failed</span></>;
+                              }
+                              if (tcs.some((t) => normTcStatus(t.status) === 'healing')) {
+                                return <><RefreshCw className="w-4 h-4 text-blue-500 mr-2 animate-pulse"/><span className="text-[#0C66E4] font-medium">Healing (LLM repair)</span></>;
+                              }
+                              if (tcs.some((t) => normTcStatus(t.status) === 'running')) {
+                                return <><Loader className="w-4 h-4 text-amber-500 mr-2 animate-spin"/><span className="text-[#B65C00] font-medium">Running in sandbox</span></>;
+                              }
+                              if (ex === 'pass') {
+                                return <><ShieldCheck className="w-4 h-4 text-green-500 mr-2"/><span className="text-[#00875A] font-medium">Passed</span></>;
+                              }
+                              return <><Clock className="w-4 h-4 text-[#8993A4] mr-2"/><span className="text-[#5E6C84] font-medium">Pending execution</span></>;
+                            })()}
                           </div>
                       </div>
                       <button onClick={closePanel} className="text-[#5E6C84] hover:text-[#172B4D] bg-[#F1F2F4] hover:bg-[#DFE1E6] p-2 rounded-full transition-colors flex-shrink-0 mt-1">
@@ -845,9 +908,11 @@ function ProjectDashboard() {
                                               <p className="text-xs text-[#5E6C84] mt-0.5">{tc.title}</p>
                                           </div>
                                           <div className="flex items-center gap-2 flex-shrink-0">
-                                              {tc.status === 'pass' && <CheckCircle2 className="w-4 h-4 text-[#00875A]"/>}
-                                              {tc.status === 'fail' && <XCircle className="w-4 h-4 text-[#C9372C]"/>}
-                                              {(!tc.status || tc.status === 'pending') && <Clock className="w-4 h-4 text-yellow-400"/>}
+                                              {normTcStatus(tc.status) === 'pass' && <CheckCircle2 className="w-4 h-4 text-[#00875A]"/>}
+                                              {normTcStatus(tc.status) === 'fail' && <XCircle className="w-4 h-4 text-[#C9372C]"/>}
+                                              {normTcStatus(tc.status) === 'running' && <Loader className="w-4 h-4 text-amber-500 animate-spin"/>}
+                                              {normTcStatus(tc.status) === 'healing' && <RefreshCw className="w-4 h-4 text-[#0C66E4] animate-pulse"/>}
+                                              {(!normTcStatus(tc.status) || normTcStatus(tc.status) === 'pending') && <Clock className="w-4 h-4 text-[#8993A4]"/>}
                                               <ChevronRight className="w-4 h-4 text-[#8993A4]"/>
                                           </div>
                                       </div>
@@ -877,9 +942,11 @@ function ProjectDashboard() {
                           </p>
                           <h2 className="text-lg font-bold text-[#172B4D] leading-tight">{selectedTestCase.title}</h2>
                           <div className="flex items-center mt-2 text-xs gap-3">
-                              {selectedTestCase.status === 'pass' && <span className="flex items-center gap-1 text-[#00875A]"><CheckCircle2 className="w-3.5 h-3.5"/>Passed</span>}
-                              {selectedTestCase.status === 'fail' && <span className="flex items-center gap-1 text-[#C9372C]"><XCircle className="w-3.5 h-3.5"/>Failed</span>}
-                              {(!selectedTestCase.status || selectedTestCase.status === 'pending') && <span className="flex items-center gap-1 text-yellow-400"><Clock className="w-3.5 h-3.5"/>Pending</span>}
+                              {normTcStatus(selectedTestCase.status) === 'pass' && <span className="flex items-center gap-1 text-[#00875A]"><CheckCircle2 className="w-3.5 h-3.5"/>Passed</span>}
+                              {normTcStatus(selectedTestCase.status) === 'fail' && <span className="flex items-center gap-1 text-[#C9372C]"><XCircle className="w-3.5 h-3.5"/>Failed</span>}
+                              {normTcStatus(selectedTestCase.status) === 'running' && <span className="flex items-center gap-1 text-[#B65C00]"><Loader className="w-3.5 h-3.5 animate-spin"/>Running</span>}
+                              {normTcStatus(selectedTestCase.status) === 'healing' && <span className="flex items-center gap-1 text-[#0C66E4]"><RefreshCw className="w-3.5 h-3.5 animate-pulse"/>Healing</span>}
+                              {(!normTcStatus(selectedTestCase.status) || normTcStatus(selectedTestCase.status) === 'pending') && <span className="flex items-center gap-1 text-[#5E6C84]"><Clock className="w-3.5 h-3.5"/>Pending</span>}
                               {selectedTestCase.language && <span className="flex items-center gap-1 text-[#5E6C84]"><Code2 className="w-3.5 h-3.5"/>{selectedTestCase.language}</span>}
                           </div>
                       </div>
