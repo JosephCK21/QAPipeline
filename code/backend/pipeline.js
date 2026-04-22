@@ -708,19 +708,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // Phase 4: Test Generation
         sendEvent('phase_update', { phase: 'Test Generation', status: 'running' });
 
-        // Accumulates compact summaries of test cases already generated in this run.
-        // Passed into each subsequent scenario's generation call so the LLM avoids
-        // duplicating coverage already handled by an earlier scenario.
-        const alreadyGeneratedSummary = [];
-
-        for (const scenarioMapping of mappedScenarios) {
-            // Brief pause between successive scenario generations to let the
-            // OpenAI Conversations API finalize the prior response and release
-            // its lock. Without this, back-to-back calls can hit the
-            // "Another process is currently operating" 400 error.
-            if (alreadyGeneratedSummary.length > 0) {
-                await new Promise(r => setTimeout(r, 1500));
-            }
+        // Map over all scenarios and run LLM generation in parallel
+        const generationPromises = mappedScenarios.map(async (scenarioMapping) => {
             const scenarioId = scenarioMapping.id || scenarioMapping.scenarioId;
             // Merge RTM row (authoritative for description, type, priority,
             // title, AC refs) with mapping result (authoritative for confidence
@@ -768,7 +757,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
                     prDiffSection,
                     dependenciesSection: codeContext.dependencies || '',
                     refinementContext,
-                    alreadyGeneratedSummary,
+                    alreadyGeneratedSummary: [], // Context tracking removed to allow parallel execution
                     conversationId: priorConversationId,
                     previousInteractionId: priorResponseId
                 });
@@ -779,7 +768,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
             } catch (genErr) {
                 sendEvent('log', { level: 'ERROR', message: `Test case generation failed for ${scenarioId}: ${genErr.message}` });
                 sendEvent('scenario_execution_updated', { scenarioId, status: 'error', totals: { passed: 0, failed: 0, running: 0 } });
-                continue;
+                return null;
             }
 
             sendEvent('log', { level: 'INFO', message: `Generated ${generatedTestCases.length} test case(s) for ${scenarioId}` });
@@ -825,19 +814,18 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 isRefinement: !!refinementContext
             });
 
-            // Update the cross-scenario awareness summary so subsequent scenarios
-            // in this loop can avoid duplicating coverage already generated above.
-            for (const tc of persistedCases) {
-                alreadyGeneratedSummary.push({
-                    scenarioId,
-                    title: tc.title,
-                    type: scenarioType,
-                    coveredInputs: Object.keys(tc.testData || {})
-                });
-            }
+            return { scenarioId, persistedCases, scenarioDescription };
+        });
 
-            // Phase 5: Sandbox execution with stateful retry per test case
-            sendEvent('phase_update', { phase: 'Sandbox Testing', status: 'running' });
+        // Wait for all scenarios to finish generating in parallel
+        const generatedResults = (await Promise.all(generationPromises)).filter(Boolean);
+
+        // Phase 5: Sandbox execution with stateful retry per test case
+        sendEvent('phase_update', { phase: 'Sandbox Testing', status: 'running' });
+
+        // Run sandbox execution sequentially to avoid file I/O race conditions in the container
+        for (const result of generatedResults) {
+            const { scenarioId, persistedCases, scenarioDescription } = result;
 
             let scenarioPassed = 0;
             let scenarioFailed = 0;
