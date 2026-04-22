@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Activity, ShieldCheck, Bug, Clock, GitCommit, Search, ChevronRight, ChevronDown, X, AlertTriangle, Settings, CheckCircle2, XCircle, Loader, PlayCircle, FileText, Upload, Trash2, Code2, Database, ListChecks, RefreshCw, GitBranch } from 'lucide-react';
+import { Activity, ShieldCheck, Bug, Clock, GitCommit, Search, ChevronRight, ChevronDown, X, AlertTriangle, Settings, CheckCircle2, XCircle, Loader, PlayCircle, FileText, Upload, Trash2, Code2, Database, ListChecks, RefreshCw, GitBranch, ExternalLink } from 'lucide-react';
 import { useAppContext } from '../App';
 import { computeAllEpicMetrics } from '../lib/epicMetrics';
+import { JIRA_BASE_URL } from '../lib/env';
 
 function ProjectDashboard() {
   const { projectId } = useParams();
   const navigate = useNavigate();
-  const { showToast, refreshKey } = useAppContext();
+  const { showToast, refreshKey, darkMode } = useAppContext();
   
   const [project, setProject] = useState(null);
   const [rtm, setRtm] = useState({ requirements: [], scenarios: [] });
@@ -239,12 +240,12 @@ function ProjectDashboard() {
   return (
     <div className="space-y-6 relative overflow-hidden h-full">
       {/* Header Info */}
-      <div className="flex justify-between items-start bg-[#F4F5F7] border border-[#DFE1E6] p-6 rounded-lg">
+      <div className={`flex justify-between items-start ${darkMode ? 'bg-[#161B22] border-[#30363D]' : 'bg-[#F4F5F7] border-[#DFE1E6]'} border p-6 rounded-lg transition-colors`}>
         <div>
-          <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-400 mb-2">
+          <h1 className={`text-2xl font-bold mb-2 ${darkMode ? 'text-[#E6EDF3]' : 'bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-400'}`}>
             {project?.name || 'Project Dashboard'}
           </h1>
-          <div className="flex space-x-4 text-sm text-[#5E6C84]">
+          <div className={`flex space-x-4 text-sm ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>
             {project?.jiraProjectKey && (
               <span className="flex items-center"><Activity className="w-4 h-4 mr-1 text-blue-500" /> Jira: {project.jiraProjectKey}</span>
             )}
@@ -264,7 +265,11 @@ function ProjectDashboard() {
             </button>
             <button 
               onClick={() => navigate(`/projects/${projectId}/settings`)}
-              className="flex items-center px-4 py-2 bg-[#F1F2F4] hover:bg-[#DFE1E6] text-[#172B4D] rounded-md border border-[#C1C7D0] transition-colors text-sm font-medium"
+              className={`flex items-center px-4 py-2 rounded-md border transition-colors text-sm font-medium ${
+                darkMode
+                  ? 'bg-[#1C2333] hover:bg-[#242C3D] text-[#E6EDF3] border-[#484F58]'
+                  : 'bg-[#F1F2F4] hover:bg-[#DFE1E6] text-[#172B4D] border-[#C1C7D0]'
+              }`}
             >
               <Settings className="w-4 h-4 mr-2" />
               Project Settings
@@ -274,56 +279,57 @@ function ProjectDashboard() {
 
       {/* KPI Cards */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <div className="bg-[#F4F5F7] border border-[#DFE1E6] p-4 rounded-lg flex items-center justify-between">
-          <div>
-            <p className="text-[#5E6C84] text-sm">Feature Coverage</p>
-            <p className="text-2xl font-bold text-[#172B4D]">{rtmStats.coverage}%</p>
-          </div>
-          <div className="p-3 bg-blue-500/10 rounded-full"><ShieldCheck className="text-blue-400 w-6 h-6" /></div>
-        </div>
-        <div className="bg-[#F4F5F7] border border-[#DFE1E6] p-4 rounded-lg flex items-center justify-between">
-          <div>
-            <p className="text-[#5E6C84] text-sm">Active Requirements</p>
-            <p className="text-2xl font-bold text-[#172B4D]">{rtmStats.totalReqs}</p>
-          </div>
-          <div className="p-3 bg-indigo-500/10 rounded-full"><Activity className="text-indigo-400 w-6 h-6" /></div>
-        </div>
-        <div className="bg-[#F4F5F7] border border-[#DFE1E6] p-4 rounded-lg flex items-center justify-between">
-          <div>
-            <p className="text-[#5E6C84] text-sm">Tested Scenarios</p>
-            <p className="text-2xl font-bold text-[#172B4D]">{rtmStats.testedScenarios} / {rtmStats.totalScenarios}</p>
-          </div>
-          <div className="p-3 bg-green-500/10 rounded-full"><Bug className="text-[#00875A] w-6 h-6" /></div>
-        </div>
-        <div className="bg-[#F4F5F7] border border-[#DFE1E6] p-4 rounded-lg flex items-center justify-between">
-          <div>
-            <p className="text-[#5E6C84] text-sm">Pending Execution</p>
-            <p className="text-2xl font-bold text-[#172B4D]">{Math.max(0, rtmStats.totalScenarios - rtmStats.testedScenarios)}</p>
-          </div>
-          <div className="p-3 bg-yellow-500/10 rounded-full"><Clock className="text-yellow-400 w-6 h-6" /></div>
-        </div>
+        {[
+          { label: 'Feature Coverage', value: `${rtmStats.coverage}%`, icon: ShieldCheck, iconColor: 'text-blue-400', iconBg: 'bg-blue-500/10' },
+          { label: 'Active Requirements', value: rtmStats.totalReqs, icon: Activity, iconColor: 'text-indigo-400', iconBg: 'bg-indigo-500/10' },
+          { label: 'Tested Scenarios', value: `${rtmStats.testedScenarios} / ${rtmStats.totalScenarios}`, icon: Bug, iconColor: 'text-[#00875A]', iconBg: 'bg-green-500/10' },
+          { label: 'Pending Execution', value: Math.max(0, rtmStats.totalScenarios - rtmStats.testedScenarios), icon: Clock, iconColor: 'text-yellow-400', iconBg: 'bg-yellow-500/10' },
+        ].map((card, i) => {
+          const Icon = card.icon;
+          return (
+            <div key={i} className={`${darkMode ? 'bg-[#161B22] border-[#30363D]' : 'bg-[#F4F5F7] border-[#DFE1E6]'} border p-4 rounded-lg flex items-center justify-between transition-colors`}>
+              <div>
+                <p className={`text-sm ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>{card.label}</p>
+                <p className={`text-2xl font-bold ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>{card.value}</p>
+              </div>
+              <div className={`p-3 ${card.iconBg} rounded-full`}><Icon className={`${card.iconColor} w-6 h-6`} /></div>
+            </div>
+          );
+        })}
       </div>
 
-      <div className="border-b border-[#DFE1E6]">
+      <div className={`border-b ${darkMode ? 'border-[#30363D]' : 'border-[#DFE1E6]'}`}>
         <nav className="-mb-px flex space-x-8">
-          <button onClick={() => setActiveTab('rtm')} className={`${activeTab === 'rtm' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]'} whitespace-nowrap pb-4 px-1 border-b-2 font-medium`}>Traceability Matrix</button>
-          <button onClick={() => setActiveTab('runs')} className={`${activeTab === 'runs' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]'} whitespace-nowrap pb-4 px-1 border-b-2 font-medium`}>Pipeline Runs</button>
-          <button onClick={() => setActiveTab('docs')} className={`${activeTab === 'docs' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]'} whitespace-nowrap pb-4 px-1 border-b-2 font-medium`}>Context Documents</button>
+          {[
+            { key: 'rtm', label: 'Traceability Matrix' },
+            { key: 'runs', label: 'Pipeline Runs' },
+            { key: 'docs', label: 'Context Documents' },
+          ].map(tab => (
+            <button key={tab.key} onClick={() => setActiveTab(tab.key)} className={`${
+              activeTab === tab.key
+                ? (darkMode ? 'border-[#58A6FF] text-[#58A6FF]' : 'border-indigo-500 text-indigo-400')
+                : (darkMode ? 'border-transparent text-[#6E7681] hover:text-[#8B949E]' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]')
+            } whitespace-nowrap pb-4 px-1 border-b-2 font-medium`}>{tab.label}</button>
+          ))}
         </nav>
       </div>
 
       {/* RTM View */}
       {activeTab === 'rtm' && (
-        <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg overflow-hidden">
-          <div className="p-4 border-b border-[#DFE1E6] flex justify-between items-center">
+        <div className={`${darkMode ? 'bg-[#161B22] border-[#30363D]' : 'bg-[#F4F5F7] border-[#DFE1E6]'} border rounded-lg overflow-hidden transition-colors`}>
+          <div className={`p-4 border-b ${darkMode ? 'border-[#30363D]' : 'border-[#DFE1E6]'} flex justify-between items-center`}>
              <div className="relative w-64">
                 <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                  <Search className="h-4 w-4 text-[#8993A4]" />
+                  <Search className={`h-4 w-4 ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`} />
                 </div>
                 <input
                   type="text"
                   placeholder="Search requirements..."
-                  className="block w-full pl-10 pr-3 py-2 border border-[#C1C7D0] rounded-md leading-5 bg-[#F1F2F4] text-[#5E6C84] placeholder-gray-500 focus:outline-none focus:bg-[#F1F2F4] focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
+                  className={`block w-full pl-10 pr-3 py-2 border rounded-md leading-5 sm:text-sm focus:outline-none focus:ring-1 ${
+                    darkMode
+                      ? 'border-[#484F58] bg-[#1C2333] text-[#E6EDF3] placeholder-[#6E7681] focus:border-[#58A6FF] focus:ring-[#58A6FF]'
+                      : 'border-[#C1C7D0] bg-[#F1F2F4] text-[#5E6C84] placeholder-gray-500 focus:border-indigo-500 focus:ring-indigo-500'
+                  }`}
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                 />
@@ -331,100 +337,138 @@ function ProjectDashboard() {
           </div>
           
           <div className="overflow-x-auto">
-            <table className="min-w-full divide-y border-collapse divide-gray-800">
-                <thead className="bg-[#F4F5F7]">
+            <table className={`min-w-full divide-y border-collapse ${darkMode ? 'divide-[#30363D]' : 'divide-gray-800'}`}>
+                <thead className={darkMode ? 'bg-[#1C2333]' : 'bg-[#F4F5F7]'}>
                   <tr>
-                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-[#5E6C84] uppercase tracking-wider w-1/4">Requirement</th>
-                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-[#5E6C84] uppercase tracking-wider">Test Scenarios</th>
-                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-[#5E6C84] uppercase tracking-wider w-[140px]">Test Cases</th>
+                    <th scope="col" className={`px-6 py-3 text-left text-xs font-medium uppercase tracking-wider w-1/4 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>Requirement</th>
+                    <th scope="col" className={`px-6 py-3 text-left text-xs font-medium uppercase tracking-wider ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>Test Scenarios</th>
+                    <th scope="col" className={`px-6 py-3 text-left text-xs font-medium uppercase tracking-wider w-[140px] ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>Test Cases</th>
                   </tr>
                 </thead>
-                <tbody className="bg-[#F4F5F7] divide-y divide-gray-800">
+                <tbody className={`${darkMode ? 'bg-[#161B22]' : 'bg-[#F4F5F7]'} divide-y ${darkMode ? 'divide-[#30363D]' : 'divide-gray-800'}`}>
                     {Object.keys(groupedRequirements).length > 0 ? (
                       Object.entries(groupedRequirements).map(([epicKey, reqs]) => {
                         const em = epicMetrics[epicKey] || {
                           total: 0, done: 0, notDone: 0, passed: 0, failed: 0, donePct: 0,
                           totalScenarios: 0, passedScenariosStrict: 0, failedScenarios: 0, pendingScenarios: 0, scenarioPassPct: 0,
                         };
+                        const epicUrl = JIRA_BASE_URL ? `${JIRA_BASE_URL}/browse/${epicKey}` : null;
                         return (
                         <React.Fragment key={epicKey}>
-                          <tr className="bg-[#F4F5F7]">
-                            <td colSpan="3" className="px-6 py-3 border-b border-indigo-500/20">
-                              <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                                {/* Epic label */}
-                                <span className="text-xs font-bold text-indigo-400 uppercase tracking-wider">
-                                  Epic: {epicKey}
-                                </span>
+                          {/* ═══════ REDESIGNED EPIC HEADER ═══════ */}
+                          <tr className={darkMode ? 'bg-[#1C2333]' : 'bg-[#F1F2F4]'}>
+                            <td colSpan="3" className={`px-6 py-4 border-b ${darkMode ? 'border-[#30363D]' : 'border-indigo-500/20'}`}>
+                              <div className="space-y-3">
+                                {/* Row 1: Identity — Epic key, story count, pass % */}
+                                <div className="flex items-center justify-between">
+                                  <div className="flex items-center gap-3">
+                                    {epicUrl ? (
+                                      <a
+                                        href={epicUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className={`inline-flex items-center gap-1.5 text-sm font-bold tracking-wide hover:underline ${darkMode ? 'text-[#58A6FF]' : 'text-[#0C66E4]'}`}
+                                      >
+                                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-widest ${darkMode ? 'bg-[rgba(56,139,253,0.15)] text-[#58A6FF]' : 'bg-[#E9F2FF] text-[#0747A6]'}`}>Epic</span>
+                                        {epicKey}
+                                        <ExternalLink className="w-3 h-3 opacity-60" />
+                                      </a>
+                                    ) : (
+                                      <span className={`text-sm font-bold tracking-wide ${darkMode ? 'text-[#58A6FF]' : 'text-[#0C66E4]'}`}>
+                                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-widest mr-2 ${darkMode ? 'bg-[rgba(56,139,253,0.15)] text-[#58A6FF]' : 'bg-[#E9F2FF] text-[#0747A6]'}`}>Epic</span>
+                                        {epicKey}
+                                      </span>
+                                    )}
+                                    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium ${darkMode ? 'bg-[#30363D] text-[#8B949E]' : 'bg-[#DFE1E6] text-[#5E6C84]'}`}>
+                                      {reqs.length} {reqs.length === 1 ? 'story' : 'stories'}
+                                    </span>
+                                  </div>
+                                  {em.totalScenarios > 0 && (
+                                    <span className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold ${
+                                      em.scenarioPassPct === 100
+                                        ? (darkMode ? 'bg-[rgba(63,185,80,0.15)] text-[#3FB950]' : 'bg-[#E3FCEF] text-[#00875A]')
+                                        : em.scenarioPassPct >= 50
+                                          ? (darkMode ? 'bg-[rgba(210,153,34,0.15)] text-[#D29922]' : 'bg-[#FFF7D6] text-[#B65C00]')
+                                          : (darkMode ? 'bg-[rgba(248,81,73,0.15)] text-[#F85149]' : 'bg-[#FFEBE6] text-[#C9372C]')
+                                    }`}>
+                                      {em.scenarioPassPct}% passing
+                                    </span>
+                                  )}
+                                </div>
 
+                                {/* Row 2: Metrics — Progress bar + stats */}
                                 {em.totalScenarios > 0 ? (
-                                  <>
-                                    {/* Scenario pass progress bar */}
-                                    <div className="flex-1 min-w-[120px] max-w-[180px] h-1.5 bg-[#DFE1E6] rounded-full overflow-hidden">
+                                  <div className="space-y-2">
+                                    {/* Full-width progress bar */}
+                                    <div className={`w-full h-2 rounded-full overflow-hidden ${darkMode ? 'bg-[#30363D]' : 'bg-[#DFE1E6]'}`}>
                                       <div
-                                        className="h-full rounded-full bg-gradient-to-r from-green-500 to-emerald-400 transition-all"
+                                        className="h-full rounded-full bg-gradient-to-r from-green-500 to-emerald-400 transition-all duration-500"
                                         style={{ width: `${em.scenarioPassPct}%` }}
                                       />
                                     </div>
 
-                                    {/* Scenario chips */}
-                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-500/10 border border-indigo-500/20 rounded text-[10px] text-indigo-300">
-                                      <Activity className="w-3 h-3" />
-                                      {em.totalScenarios} scenario{em.totalScenarios !== 1 ? 's' : ''}
-                                    </span>
-                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-500/10 border border-green-500/20 rounded text-[10px] text-[#00875A]">
-                                      <ShieldCheck className="w-3 h-3" />
-                                      {em.passedScenariosStrict} passing
-                                    </span>
-                                    {em.failedScenarios > 0 && (
-                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-red-500/10 border border-red-500/20 rounded text-[10px] text-[#C9372C]">
-                                        <XCircle className="w-3 h-3" />
-                                        {em.failedScenarios} failing
-                                      </span>
-                                    )}
-                                    {em.pendingScenarios > 0 && (
-                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-yellow-500/10 border border-yellow-500/20 rounded text-[10px] text-yellow-300">
-                                        <Clock className="w-3 h-3" />
-                                        {em.pendingScenarios} pending
-                                      </span>
-                                    )}
-
-                                    {/* Divider */}
-                                    <span className="text-gray-700 text-[10px]">|</span>
-
-                                    {/* Test-case chips */}
-                                    {em.total > 0 ? (
-                                      <>
-                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-500/10 border border-indigo-500/20 rounded text-[10px] text-indigo-300">
-                                          <ListChecks className="w-3 h-3" />
-                                          {em.total} test case{em.total !== 1 ? 's' : ''}
+                                    {/* Stats row */}
+                                    <div className="flex flex-wrap items-center gap-3">
+                                      {/* Scenario stats */}
+                                      <div className="flex items-center gap-2">
+                                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium border ${darkMode ? 'bg-[rgba(56,139,253,0.1)] border-[rgba(56,139,253,0.3)] text-[#58A6FF]' : 'bg-indigo-500/10 border-indigo-500/20 text-[#0C66E4]'}`}>
+                                          <Activity className="w-3 h-3" />
+                                          {em.totalScenarios} scenario{em.totalScenarios !== 1 ? 's' : ''}
                                         </span>
-                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-500/10 border border-green-500/20 rounded text-[10px] text-[#00875A]">
-                                          <CheckCircle2 className="w-3 h-3" />
-                                          {em.passed} passed
+                                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium border ${darkMode ? 'bg-[rgba(63,185,80,0.1)] border-[rgba(63,185,80,0.3)] text-[#3FB950]' : 'bg-green-500/10 border-green-500/20 text-[#00875A]'}`}>
+                                          <ShieldCheck className="w-3 h-3" />
+                                          {em.passedScenariosStrict} passing
                                         </span>
-                                        {em.failed > 0 && (
-                                          <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-red-500/10 border border-red-500/20 rounded text-[10px] text-[#C9372C]">
+                                        {em.failedScenarios > 0 && (
+                                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium border ${darkMode ? 'bg-[rgba(248,81,73,0.1)] border-[rgba(248,81,73,0.3)] text-[#F85149]' : 'bg-red-500/10 border-red-500/20 text-[#C9372C]'}`}>
                                             <XCircle className="w-3 h-3" />
-                                            {em.failed} failed
+                                            {em.failedScenarios} failing
                                           </span>
                                         )}
-                                        {em.notDone > 0 && (
-                                          <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-yellow-500/10 border border-yellow-500/20 rounded text-[10px] text-yellow-300">
+                                        {em.pendingScenarios > 0 && (
+                                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium border ${darkMode ? 'bg-[rgba(210,153,34,0.1)] border-[rgba(210,153,34,0.3)] text-[#D29922]' : 'bg-yellow-500/10 border-yellow-500/20 text-[#B65C00]'}`}>
                                             <Clock className="w-3 h-3" />
-                                            {em.notDone} not done
+                                            {em.pendingScenarios} pending
                                           </span>
                                         )}
-                                      </>
-                                    ) : (
-                                      <span className="text-[10px] text-[#8993A4] italic">No test cases yet</span>
-                                    )}
+                                      </div>
 
-                                    <span className="text-[10px] text-[#8993A4] ml-auto">
-                                      {em.scenarioPassPct}% scenarios passing
-                                    </span>
-                                  </>
+                                      {/* Divider */}
+                                      <span className={`text-[10px] ${darkMode ? 'text-[#484F58]' : 'text-[#C1C7D0]'}`}>│</span>
+
+                                      {/* Test case stats */}
+                                      <div className="flex items-center gap-2">
+                                        {em.total > 0 ? (
+                                          <>
+                                            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium border ${darkMode ? 'bg-[rgba(56,139,253,0.1)] border-[rgba(56,139,253,0.3)] text-[#58A6FF]' : 'bg-indigo-500/10 border-indigo-500/20 text-[#0C66E4]'}`}>
+                                              <ListChecks className="w-3 h-3" />
+                                              {em.total} test case{em.total !== 1 ? 's' : ''}
+                                            </span>
+                                            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium border ${darkMode ? 'bg-[rgba(63,185,80,0.1)] border-[rgba(63,185,80,0.3)] text-[#3FB950]' : 'bg-green-500/10 border-green-500/20 text-[#00875A]'}`}>
+                                              <CheckCircle2 className="w-3 h-3" />
+                                              {em.passed} passed
+                                            </span>
+                                            {em.failed > 0 && (
+                                              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium border ${darkMode ? 'bg-[rgba(248,81,73,0.1)] border-[rgba(248,81,73,0.3)] text-[#F85149]' : 'bg-red-500/10 border-red-500/20 text-[#C9372C]'}`}>
+                                                <XCircle className="w-3 h-3" />
+                                                {em.failed} failed
+                                              </span>
+                                            )}
+                                            {em.notDone > 0 && (
+                                              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium border ${darkMode ? 'bg-[rgba(210,153,34,0.1)] border-[rgba(210,153,34,0.3)] text-[#D29922]' : 'bg-yellow-500/10 border-yellow-500/20 text-[#B65C00]'}`}>
+                                                <Clock className="w-3 h-3" />
+                                                {em.notDone} not done
+                                              </span>
+                                            )}
+                                          </>
+                                        ) : (
+                                          <span className={`text-[10px] italic ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>No test cases yet</span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
                                 ) : (
-                                  <span className="text-[10px] text-[#8993A4] italic">No scenarios generated yet</span>
+                                  <span className={`text-[10px] italic ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>No scenarios generated yet</span>
                                 )}
                               </div>
                             </td>

@@ -714,6 +714,13 @@ async function runPipeline(runId, prUrl, repoFullName) {
         const alreadyGeneratedSummary = [];
 
         for (const scenarioMapping of mappedScenarios) {
+            // Brief pause between successive scenario generations to let the
+            // OpenAI Conversations API finalize the prior response and release
+            // its lock. Without this, back-to-back calls can hit the
+            // "Another process is currently operating" 400 error.
+            if (alreadyGeneratedSummary.length > 0) {
+                await new Promise(r => setTimeout(r, 1500));
+            }
             const scenarioId = scenarioMapping.id || scenarioMapping.scenarioId;
             // Merge RTM row (authoritative for description, type, priority,
             // title, AC refs) with mapping result (authoritative for confidence

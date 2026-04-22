@@ -2,6 +2,53 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ------------------------------------------------------------------ */
+/* Theme tokens — light (default) and dark (.dark on <html>)          */
+/* ------------------------------------------------------------------ */
+:root {
+  --color-bg:           #F4F5F7;
+  --color-surface:      #FFFFFF;
+  --color-surface-soft: #F1F2F4;
+  --color-surface-sunken: #FAFBFC;
+  --color-border:       #DFE1E6;
+  --color-border-strong:#C1C7D0;
+  --color-text:         #172B4D;
+  --color-text-secondary: #5E6C84;
+  --color-text-muted:   #8993A4;
+  --color-brand:        #0C66E4;
+  --color-brand-hover:  #0747A6;
+  --color-brand-soft:   #E9F2FF;
+  --color-success:      #00875A;
+  --color-success-soft: #E3FCEF;
+  --color-danger:       #C9372C;
+  --color-danger-soft:  #FFEBE6;
+  --color-warning:      #B65C00;
+  --color-warning-soft: #FFF7D6;
+  --color-shadow:       rgba(9, 30, 66, 0.08);
+}
+
+.dark {
+  --color-bg:           #0D1117;
+  --color-surface:      #161B22;
+  --color-surface-soft: #1C2333;
+  --color-surface-sunken: #0D1117;
+  --color-border:       #30363D;
+  --color-border-strong:#484F58;
+  --color-text:         #E6EDF3;
+  --color-text-secondary: #8B949E;
+  --color-text-muted:   #6E7681;
+  --color-brand:        #58A6FF;
+  --color-brand-hover:  #79C0FF;
+  --color-brand-soft:   rgba(56, 139, 253, 0.15);
+  --color-success:      #3FB950;
+  --color-success-soft: rgba(63, 185, 80, 0.15);
+  --color-danger:       #F85149;
+  --color-danger-soft:  rgba(248, 81, 73, 0.15);
+  --color-warning:      #D29922;
+  --color-warning-soft: rgba(210, 153, 34, 0.15);
+  --color-shadow:       rgba(0, 0, 0, 0.3);
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -11,36 +58,37 @@
 html,
 body {
   font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  background-color: #F4F5F7;
-  color: #172B4D;
+  background-color: var(--color-bg);
+  color: var(--color-text);
   min-height: 100vh;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
-/* Light-theme scrollbar — slim, unobtrusive */
+/* Scrollbar — adapts to theme */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #F4F5F7;
+  background: var(--color-bg);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #C1C7D0;
-  border: 2px solid #F4F5F7;
+  background: var(--color-border-strong);
+  border: 2px solid var(--color-bg);
   border-radius: 6px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #8993A4;
+  background: var(--color-text-muted);
 }
 
 /* Firefox */
 * {
-  scrollbar-color: #C1C7D0 #F4F5F7;
+  scrollbar-color: var(--color-border-strong) var(--color-bg);
   scrollbar-width: thin;
 }
 
@@ -75,33 +123,33 @@ body {
   font-family: 'JetBrains Mono', 'Fira Code', 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
   font-size: 13px;
   line-height: 1.6;
-  background: #FAFBFC;
-  color: #172B4D;
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
   border-radius: 6px;
 }
 
-.log-info  { color: #0C66E4; }
-.log-warn  { color: #B65C00; }
-.log-error { color: #C9372C; }
+.log-info  { color: var(--color-brand); }
+.log-warn  { color: var(--color-warning); }
+.log-error { color: var(--color-danger); }
 
-/* Soft glass card — now a subtle white panel with a low-elevation shadow */
+/* Soft glass card */
 .glass {
-  background: #FFFFFF;
+  background: var(--color-surface);
   backdrop-filter: none;
-  border: 1px solid #DFE1E6;
-  box-shadow: 0 1px 2px rgba(9, 30, 66, 0.08), 0 0 1px rgba(9, 30, 66, 0.12);
+  border: 1px solid var(--color-border);
+  box-shadow: 0 1px 2px var(--color-shadow), 0 0 1px var(--color-shadow);
 }
 
-/* Status colors — used by existing status badge code paths */
-.status-completed { color: #00875A; }
-.status-running   { color: #0C66E4; }
-.status-pending   { color: #5E6C84; }
-.status-failed    { color: #C9372C; }
-.status-blocked   { color: #B65C00; }
+/* Status colors */
+.status-completed { color: var(--color-success); }
+.status-running   { color: var(--color-brand); }
+.status-pending   { color: var(--color-text-secondary); }
+.status-failed    { color: var(--color-danger); }
+.status-blocked   { color: var(--color-warning); }
 
-/* Focus ring — modern, subtle */
+/* Focus ring */
 *:focus-visible {
-  outline: 2px solid #0C66E4;
+  outline: 2px solid var(--color-brand);
   outline-offset: 2px;
   border-radius: 4px;
 }
@@ -112,4 +160,9 @@ input:focus,
 select:focus,
 textarea:focus {
   outline: none;
+}
+
+/* Dark mode transition helper for components that use inline bg */
+.dark-transition {
+  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
 }

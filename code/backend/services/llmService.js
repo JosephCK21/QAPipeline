@@ -261,6 +261,19 @@ function isStaleChainError(err) {
     return (status === 404 || status === 400) && hasChainKeyword && hasNotFound;
 }
 
+/**
+ * Recognise the transient concurrency error from the Conversations API:
+ * "Another process is currently operating on this conversation."
+ * Unlike stale-chain errors, these should be retried with a short backoff
+ * rather than falling back to stateless mode.
+ */
+function isConversationBusyError(err) {
+    if (!err) return false;
+    const msg = String(err.message || '').toLowerCase();
+    return (err.status === 400 || err.statusCode === 400) &&
+           msg.includes('another process is currently operating');
+}
+
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
@@ -764,23 +777,41 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
         conversationId: activeConversationId
     });
 
-    const response = await client.responses.create({
-        model: DEFAULT_MODEL,
-        instructions: TESTCASE_GENERATION_INSTRUCTIONS,
-        input: finalInput,
-        text: {
-            format: {
-                type: 'json_schema',
-                name: 'TestCases',
-                schema: TESTCASE_RESPONSE_SCHEMA,
-                strict: false
-            },
-            verbosity: OUTPUT_VERBOSITY
-        },
-        reasoning: { effort: TESTCASE_EFFORT, summary: REASONING_SUMMARY },
-        ...buildCacheParams(CACHE_KEYS.TESTCASE_GEN),
-        ...stripInternalParams(stateful)
-    });
+    // Retry loop for transient "conversation busy" errors from the Conversations API.
+    // These occur when the prior scenario's response hasn't fully finalized before
+    // the next call arrives. Exponential backoff: 2s → 4s → 8s.
+    const MAX_BUSY_RETRIES = 3;
+    let response;
+    for (let busyAttempt = 0; ; busyAttempt++) {
+        try {
+            response = await client.responses.create({
+                model: DEFAULT_MODEL,
+                instructions: TESTCASE_GENERATION_INSTRUCTIONS,
+                input: finalInput,
+                text: {
+                    format: {
+                        type: 'json_schema',
+                        name: 'TestCases',
+                        schema: TESTCASE_RESPONSE_SCHEMA,
+                        strict: false
+                    },
+                    verbosity: OUTPUT_VERBOSITY
+                },
+                reasoning: { effort: TESTCASE_EFFORT, summary: REASONING_SUMMARY },
+                ...buildCacheParams(CACHE_KEYS.TESTCASE_GEN),
+                ...stripInternalParams(stateful)
+            });
+            break; // success — exit retry loop
+        } catch (busyErr) {
+            if (isConversationBusyError(busyErr) && busyAttempt < MAX_BUSY_RETRIES) {
+                const delayMs = 2000 * Math.pow(2, busyAttempt); // 2s, 4s, 8s
+                console.log(`[LLM] Conversation busy — retrying in ${delayMs}ms (attempt ${busyAttempt + 1}/${MAX_BUSY_RETRIES})`);
+                await new Promise(r => setTimeout(r, delayMs));
+                continue;
+            }
+            throw busyErr; // non-retryable or exhausted retries
+        }
+    }
 
     const text = extractResponseText(response);
     const reasoningSummary = extractReasoningSummary(response);
