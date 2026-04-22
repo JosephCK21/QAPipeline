@@ -7,7 +7,11 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "jira:check": "node scripts/checkJiraApi.js",
     "jira:simulate-webhook": "node scripts/simulateJiraWebhook.js",
-    "jira:delete-story-comments": "node scripts/deleteJiraStoryComments.js"
+    "jira:delete-story-comments": "node scripts/deleteJiraStoryComments.js",
+    "jira:seed-sayarat": "node scripts/seedSayaratJiraIssues.js",
+    "jira:delete-sayarat": "node scripts/deleteSayaratJiraIssues.js",
+    "jira:seed-todo": "node scripts/seedTodoJiraIssues.js",
+    "jira:delete-todo": "node scripts/deleteTodoJiraIssues.js"
   },
   "keywords": [],
   "author": "",

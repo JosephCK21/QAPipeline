@@ -1,12 +1,19 @@
 const {
     client,
     DEFAULT_MODEL,
-    SCENARIO_EFFORT,
+    CLASSIFIER_EFFORT,
     REASONING_SUMMARY,
+    OUTPUT_VERBOSITY,
+    CACHE_KEYS,
+    buildCacheParams,
     emitLlmTrace,
     extractResponseText,
     extractReasoningSummary,
-    safeParseJSON
+    extractUsage,
+    safeParseJSON,
+    assertTokenLimit,
+    ensureWithinBudget,
+    PROMPT_TOKEN_BUDGET
 } = require('./llmService');
 
 const { fetchIssue } = require('./jiraService');
@@ -133,11 +140,28 @@ async function classifyPrAsBugFix({ prDetails }) {
         }
     }
 
-    // 2. LLM classification — we always run it so we get a rationale even when
-    // Jira already says Bug. The Jira verdict just guarantees the final answer.
+    // 2. LLM classification
+    //
+    // Short-circuit: if Jira already said "Bug", we trust that verdict and skip
+    // the LLM call entirely to save tokens + latency. Set
+    // REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG=true to always ask the LLM for
+    // a rationale regardless (useful during debugging / observability work).
+    const alwaysRunLLM = String(process.env.REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG || '').toLowerCase() === 'true';
+    if (jiraBugKeys.length > 0 && !alwaysRunLLM) {
+        console.log(`[prClassificationService] Jira Bug short-circuit (${jiraBugKeys.join(', ')}) — skipping LLM classifier.`);
+        return {
+            isBugFix:      true,
+            confidence:    1,
+            rationale:     `Linked Jira Bug issue(s) ${jiraBugKeys.join(', ')} — LLM classifier skipped (short-circuit).`,
+            source:        'jira',
+            jiraIssueKeys: jiraKeys,
+            jiraBugKeys
+        };
+    }
+
     const { slim, truncatedFileNote, totalFiles } = buildDiffDigest(prDetails);
 
-    const prompt = `PR TITLE: ${prDetails?.title || '(none)'}
+    const rawPrompt = `PR TITLE: ${prDetails?.title || '(none)'}
 PR BRANCH: ${prDetails?.branch || '(none)'}
 PR BODY:
 ${prDetails?.body || '(empty)'}
@@ -148,6 +172,9 @@ CHANGED FILES (${totalFiles} total):
 ${JSON.stringify(slim, null, 2)}${truncatedFileNote}
 
 Classify this PR per the instructions. Return JSON only.`;
+
+    const prompt = ensureWithinBudget(rawPrompt, PROMPT_TOKEN_BUDGET, 'classifyPrAsBugFix');
+    await assertTokenLimit(prompt, DEFAULT_MODEL);
 
     let llmVerdict = null;
     try {
@@ -163,14 +190,17 @@ Classify this PR per the instructions. Return JSON only.`;
                     name: 'PrBugFixClassification',
                     schema: CLASSIFIER_RESPONSE_SCHEMA,
                     strict: true
-                }
+                },
+                verbosity: OUTPUT_VERBOSITY
             },
-            reasoning: { effort: SCENARIO_EFFORT, summary: REASONING_SUMMARY },
+            reasoning: { effort: CLASSIFIER_EFFORT, summary: REASONING_SUMMARY },
+            ...buildCacheParams(CACHE_KEYS.PR_CLASSIFICATION),
             store: true
         });
 
         const rawText = extractResponseText(response);
         const reasoningSummary = extractReasoningSummary(response);
+        const usage = extractUsage(response);
         emitLlmTrace({
             caller: 'classifyPrAsBugFix',
             model: DEFAULT_MODEL,
@@ -178,7 +208,8 @@ Classify this PR per the instructions. Return JSON only.`;
             response: rawText,
             reasoningSummary,
             durationMs: Date.now() - _start,
-            responseId: response.id
+            responseId: response.id,
+            usage
         });
 
         const parsed = safeParseJSON(rawText);

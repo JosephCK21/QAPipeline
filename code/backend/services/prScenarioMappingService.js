@@ -3,10 +3,17 @@ const {
     DEFAULT_MODEL,
     TESTCASE_EFFORT,
     REASONING_SUMMARY,
+    OUTPUT_VERBOSITY,
+    CACHE_KEYS,
+    buildCacheParams,
     emitLlmTrace,
     extractResponseText,
     extractReasoningSummary,
-    safeParseJSON
+    extractUsage,
+    safeParseJSON,
+    assertTokenLimit,
+    ensureWithinBudget,
+    PROMPT_TOKEN_BUDGET
 } = require('./llmService');
 
 const MAPPING_RESPONSE_SCHEMA = {
@@ -61,8 +68,10 @@ Return a JSON object with "mappings" and "unresolvedChanges" arrays matching the
 function normalizeScenarioItem(item) {
     return {
         id: String(item?.scenarioId || item?.id || '').trim(),
+        title: String(item?.title || '').trim(),
         description: String(item?.description || '').trim(),
         type: String(item?.type || '').trim(),
+        storyId: String(item?.storyId || '').trim(),
         relatedReq: String(item?.relatedReq || item?.parentReq || '').trim(),
         obsolete: Boolean(item?.obsolete)
     };
@@ -161,7 +170,7 @@ async function mapPrChangesToScenarios({ prDetails, jiraRtmEntry, documentTexts 
     }));
 
     // Variable-only payload — the static mapping rules live in PR_MAPPING_INSTRUCTIONS.
-    const prompt = `SCENARIO CATALOG (these are the only valid scenarioId values):
+    const rawPrompt = `SCENARIO CATALOG (these are the only valid scenarioId values):
 ${JSON.stringify(scenarios, null, 2)}
 
 PULL REQUEST CONTEXT:
@@ -173,6 +182,12 @@ ${JSON.stringify(enrichedFiles, null, 2)}
 
 PROJECT DOCUMENTS:
 ${JSON.stringify(documentTexts.slice(0, 5), null, 2)}`;
+
+    // Even with the per-file 6k char cap above, mass file changes can blow
+    // past the budget — soft-trim from the middle (scenario catalog is at the
+    // top; instructions are the priority for caching).
+    const prompt = ensureWithinBudget(rawPrompt, PROMPT_TOKEN_BUDGET, 'mapPrChangesToScenarios');
+    await assertTokenLimit(prompt, model);
 
     console.log(`[prScenarioMappingService] Calling LLM (${model}) with ${enrichedFiles.length} file(s) and ${scenarios.length} scenario(s)`);
 
@@ -189,14 +204,17 @@ ${JSON.stringify(documentTexts.slice(0, 5), null, 2)}`;
                     name: 'PrScenarioMapping',
                     schema: MAPPING_RESPONSE_SCHEMA,
                     strict: true
-                }
+                },
+                verbosity: OUTPUT_VERBOSITY
             },
             reasoning: { effort: TESTCASE_EFFORT, summary: REASONING_SUMMARY },
+            ...buildCacheParams(CACHE_KEYS.PR_MAPPING),
             store: true
         });
 
         const rawText = extractResponseText(response);
         const reasoningSummary = extractReasoningSummary(response);
+        const usage = extractUsage(response);
         emitLlmTrace({
             caller: 'mapPrChangesToScenarios',
             model,
@@ -204,7 +222,8 @@ ${JSON.stringify(documentTexts.slice(0, 5), null, 2)}`;
             response: rawText,
             reasoningSummary,
             durationMs: Date.now() - _prStartMs,
-            responseId: response.id
+            responseId: response.id,
+            usage
         });
         console.log(`[prScenarioMappingService] Raw LLM response (first 500 chars): ${rawText.slice(0, 500)}`);
         const parsed = safeParseJSON(rawText);

@@ -3,9 +3,13 @@ const {
     DEFAULT_MODEL,
     SCENARIO_EFFORT,
     REASONING_SUMMARY,
+    OUTPUT_VERBOSITY,
+    CACHE_KEYS,
+    buildCacheParams,
     emitLlmTrace,
     extractResponseText,
     extractReasoningSummary,
+    extractUsage,
     safeParseJSON
 } = require('./llmService');
 
@@ -150,14 +154,17 @@ async function generateScenariosFromJiraContext({ epic, story, docTexts }) {
                     name: 'JiraScenarios',
                     schema: JIRA_SCENARIO_SCHEMA,
                     strict: true
-                }
+                },
+                verbosity: OUTPUT_VERBOSITY
             },
             reasoning: { effort: SCENARIO_EFFORT, summary: REASONING_SUMMARY },
+            ...buildCacheParams(CACHE_KEYS.JIRA_SCENARIO),
             store: true
         });
 
         const rawText = extractResponseText(response);
         const reasoningSummary = extractReasoningSummary(response);
+        const usage = extractUsage(response);
         emitLlmTrace({
             caller: 'generateScenariosFromJiraContext',
             model,
@@ -165,7 +172,8 @@ async function generateScenariosFromJiraContext({ epic, story, docTexts }) {
             response: rawText,
             reasoningSummary,
             durationMs: Date.now() - _jiraStartMs,
-            responseId: response.id
+            responseId: response.id,
+            usage
         });
         const parsed = safeParseJSON(rawText);
         return normalizeResult(parsed, story, epic);

@@ -80,12 +80,13 @@ async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent) {
             return null;
         }
 
-        const prDetails = await fetchPRDetails(prUrl);
+        const docs = getDocsForProject(linkedProject.id);
+        const [prDetails, documentTexts] = await Promise.all([
+            fetchPRDetails(prUrl),
+            extractTextFromFiles(docs)
+        ]);
         sendEvent('log', { level: 'INFO', message: `PR mapping: fetched PR with ${prDetails?.files?.length || 0} changed file(s): ${(prDetails?.files || []).map(f => f.filename).join(', ')}` });
         sendEvent('pr_details', prDetails);
-
-        const docs = getDocsForProject(linkedProject.id);
-        const documentTexts = await extractTextFromFiles(docs);
         sendEvent('log', { level: 'INFO', message: `PR mapping: ${documentTexts?.length || 0} project document(s) loaded` });
 
         const jiraRtmEntry = { scenarios: projectScenarios };
@@ -128,7 +129,7 @@ async function buildCodeContext(prDetails) {
 
     const [fullFiles, testFiles, dependencies] = await Promise.all([
         fetchFullFileContents(owner, repo, ref, changedPaths),
-        fetchFullFileContents(owner, repo, ref, inferTestFilePaths(changedPaths))
+        fetchFullFileContents(owner, repo, ref, inferTestFilePaths(changedPaths), { quiet: true })
             .then(r => r.filter(f => !f.content.startsWith('// Could not fetch'))),
         fetchPRDependencies(`https://github.com/${owner}/${repo}/pull/${(prDetails._prUrl || '').split('/').pop() || '1'}`)
             .catch(() => 'Not available')
@@ -159,7 +160,8 @@ async function executeTestCaseWithRetries({
     testCase, containerName, sandboxDir, runId, prUrl, codeContextSection,
     linkedProject, refinementCandidates, sendEvent,
     runSummary,
-    regressionMode = false
+    regressionMode = false,
+    scenarioDescription = ''
 }) {
     let currentScript = testCase.testScript;
     let finalStatus = 'fail';
@@ -174,11 +176,16 @@ async function executeTestCaseWithRetries({
     //   - conversationId: shared Conversations API id for this test case (preferred chain mechanism)
     //   - currentInteractionId: latest response.id, used as fallback/zdr-mode chain
     // Both are populated from the initial test-case generation call and mutated after every heal.
-    const conversationId = testCase.conversationId || null;
+    let conversationId = testCase.conversationId || null;
     let currentInteractionId = testCase.latestResponseId || testCase.generationInteractionId || null;
 
     // Manual history — used only as a fallback when neither conversation nor previous_response_id is available.
     const attemptHistory = [];
+
+    // Encrypted reasoning items (ZDR mode only). Passed back in each subsequent
+    // heal call so the model retains its chain-of-thought across attempts even
+    // when the Conversations API / previous_response_id path is unavailable.
+    let currentReasoningItems = null;
 
     for (let attempt = 1; attempt <= MAX_HEAL_ATTEMPTS; attempt++) {
         const attemptStartedAt = new Date().toISOString();
@@ -252,10 +259,13 @@ async function executeTestCaseWithRetries({
 
         // Record this failure in the history before healing
         const failureOutput = sandboxResult.output || sandboxResult.error || 'No output';
+        // Keep the TAIL of the failure output, not the head — stack traces and
+        // "expected X got Y" lines are almost always at the end. Older code
+        // kept the first 1500 chars which usually showed only boot/log noise.
         attemptHistory.push({
             attemptNumber: attempt,
             scriptUsed: currentScript,
-            failureOutput: failureOutput.slice(0, 1500) // keep history compact
+            failureOutput: failureOutput.slice(-3500)
         });
 
         // Regression mode: remember the very first failure so we can retain it
@@ -295,10 +305,25 @@ async function executeTestCaseWithRetries({
                     attemptNumber: attempt + 1,
                     conversationId,
                     previousInteractionId: currentInteractionId,
-                    attemptHistory
+                    attemptHistory,
+                    priorReasoningItems: currentReasoningItems,
+                    scenarioDescription
                 });
                 currentScript = healResult.repairedScript;
                 currentInteractionId = healResult.interactionId || currentInteractionId;
+                // Refresh encrypted reasoning items for the next heal (ZDR mode).
+                // Non-ZDR modes return [] here, which harmlessly overrides nothing.
+                if (Array.isArray(healResult.reasoningItems) && healResult.reasoningItems.length > 0) {
+                    currentReasoningItems = healResult.reasoningItems;
+                }
+                // Stale-chain signal from llmService — the stored conversationId
+                // is invalid (expired/deleted). Drop it so we don't keep trying
+                // the same dead anchor on every subsequent heal.
+                if (healResult.chainWasStale) {
+                    sendEvent('log', { level: 'WARN', message: `[Healing] Stored conversation/response anchor was stale — continuing stateless.` });
+                    conversationId = null;
+                    currentInteractionId = healResult.interactionId || null;
+                }
 
                 // Persist the latest response id so a server restart can resume the chain.
                 upsertTestCase({
@@ -475,7 +500,8 @@ async function runEpicRegression({
                 refinementCandidates: [],
                 sendEvent,
                 runSummary,
-                regressionMode: true
+                regressionMode: true,
+                scenarioDescription: scenario.description || ''
             });
 
             if (tcStatus === 'pass') {
@@ -546,42 +572,76 @@ async function runPipeline(runId, prUrl, repoFullName) {
             return;
         }
 
-        // Phase 2.5: Bug-Fix Classification
-        // Decides whether the PR is "just a bug fix". When it is (and the feature
-        // is enabled), we skip new test generation and instead re-run every existing
-        // test case for every scenario under every epic the PR touches.
-        const regressionFeatureEnabled = String(process.env.REGRESSION_ENABLED || 'true').toLowerCase() !== 'false';
-        let classification = { isBugFix: false, confidence: 0, rationale: 'Classification skipped', source: 'disabled', jiraIssueKeys: [], jiraBugKeys: [] };
+        // Enrichment: build a lookup of RTM scenarios (title, description, type,
+        // priority, acceptanceCriteriaRef, storyId, epicId) so we can pass the
+        // full context into generation. The PR-mapping LLM only returns minimal
+        // fields; without this merge the test-case generator would see a bare
+        // scenarioId with no acceptance criteria and have to guess.
+        const rtmProjectKey = linkedProject?.jiraProjectKey || linkedProject?.id;
+        const rtmRows = rtmProjectKey ? (getScenariosByProject(rtmProjectKey) || []) : [];
+        const rtmById = new Map(rtmRows.map(r => [r.scenarioId, r]));
+        const enrichedCount = mappedScenarios.reduce((acc, m) => acc + (rtmById.has(m.scenarioId || m.id) ? 1 : 0), 0);
+        sendEvent('log', { level: 'INFO', message: `[Enrichment] Resolved ${enrichedCount}/${mappedScenarios.length} mapped scenarios against RTM rows (project "${rtmProjectKey || 'n/a'}").` });
 
-        if (regressionFeatureEnabled) {
+        // Phase 2.5 + 3 + Sandbox — run in parallel.
+        // Classification, code context fetch, and sandbox creation are all
+        // independent and only need prDetails. Running them concurrently
+        // saves 15-30 seconds per run (Docker clone + npm install overlaps
+        // with LLM classification + GitHub file fetches).
+        const prDetails = prMapping?._prDetails || await fetchPRDetails(prUrl);
+        const regressionFeatureEnabled = String(process.env.REGRESSION_ENABLED || 'true').toLowerCase() !== 'false';
+
+        // --- Classification task (async) ---
+        const classifyTask = (async () => {
+            if (!regressionFeatureEnabled) {
+                sendEvent('log', { level: 'INFO', message: '[Classification] Disabled via REGRESSION_ENABLED=false — running standard flow.' });
+                return { isBugFix: false, confidence: 0, rationale: 'Classification skipped', source: 'disabled', jiraIssueKeys: [], jiraBugKeys: [] };
+            }
             sendEvent('phase_update', { phase: 'Classification', status: 'running' });
             try {
-                const prDetailsForClassifier = prMapping?._prDetails || await fetchPRDetails(prUrl);
-                classification = await classifyPrAsBugFix({ prDetails: prDetailsForClassifier });
-                sendEvent('pr_classification', classification);
+                const result = await classifyPrAsBugFix({ prDetails });
+                sendEvent('pr_classification', result);
                 sendEvent('log', {
                     level: 'INFO',
-                    message: `[Classification] isBugFix=${classification.isBugFix} (source=${classification.source}, confidence=${Number(classification.confidence).toFixed(2)}): ${classification.rationale}`
+                    message: `[Classification] isBugFix=${result.isBugFix} (source=${result.source}, confidence=${Number(result.confidence).toFixed(2)}): ${result.rationale}`
                 });
+                return result;
             } catch (err) {
                 sendEvent('log', { level: 'WARN', message: `[Classification] Failed: ${err.message} — falling back to standard flow.` });
+                return { isBugFix: false, confidence: 0, rationale: `Classifier failed: ${err.message}`, source: 'error', jiraIssueKeys: [], jiraBugKeys: [] };
+            } finally {
+                sendEvent('phase_update', { phase: 'Classification', status: 'completed' });
             }
-            sendEvent('phase_update', { phase: 'Classification', status: 'completed' });
-        } else {
-            sendEvent('log', { level: 'INFO', message: '[Classification] Disabled via REGRESSION_ENABLED=false — running standard flow.' });
-        }
+        })();
 
-        // Phase 3: Code Context
-        sendEvent('phase_update', { phase: 'Code Context', status: 'running' });
-        let codeContext = { fullFiles: [], testFiles: [], dependencies: '' };
-        const prDetails = prMapping?._prDetails || await fetchPRDetails(prUrl);
-        try {
-            codeContext = await buildCodeContext(prDetails);
-            sendEvent('log', { level: 'INFO', message: `Code context: ${codeContext.fullFiles.length} source file(s), ${codeContext.testFiles.length} existing test file(s).` });
-        } catch (ctxErr) {
-            sendEvent('log', { level: 'WARN', message: `Code context partial: ${ctxErr.message}` });
-        }
-        sendEvent('phase_update', { phase: 'Code Context', status: 'completed' });
+        // --- Code Context task (async) ---
+        const codeContextTask = (async () => {
+            sendEvent('phase_update', { phase: 'Code Context', status: 'running' });
+            let ctx = { fullFiles: [], testFiles: [], dependencies: '' };
+            try {
+                ctx = await buildCodeContext(prDetails);
+                sendEvent('log', { level: 'INFO', message: `Code context: ${ctx.fullFiles.length} source file(s), ${ctx.testFiles.length} existing test file(s).` });
+            } catch (ctxErr) {
+                sendEvent('log', { level: 'WARN', message: `Code context partial: ${ctxErr.message}` });
+            }
+            sendEvent('phase_update', { phase: 'Code Context', status: 'completed' });
+            return ctx;
+        })();
+
+        // --- Sandbox task (async) ---
+        const sandboxTask = (async () => {
+            sendEvent('phase_update', { phase: 'Sandbox Setup', status: 'running' });
+            const sb = await createSandbox(runId, prDetails);
+            sendEvent('log', { level: 'INFO', message: `[Sandbox] Container ready: ${sb.containerName}` });
+            sendEvent('phase_update', { phase: 'Sandbox Setup', status: 'completed' });
+            return sb;
+        })();
+
+        // Wait for all three to finish.
+        const [classification, codeContext, { sandboxDir, containerName }] = await Promise.all([
+            classifyTask, codeContextTask, sandboxTask
+        ]);
+        _sandboxContainerName = containerName;
 
         // Build single concatenated context string for LLM prompts
         const codeContextSection = [
@@ -602,11 +662,6 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 markTestCaseSuperseded(testCase.testCaseId);
             }
         }
-
-        // Create sandbox once — returns a persistent container shared by all test cases
-        // (both standard generation and epic regression need it).
-        const { sandboxDir, containerName } = await createSandbox(runId, prDetails);
-        _sandboxContainerName = containerName;
 
         let overallSuccess = false;
 
@@ -660,9 +715,16 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
         for (const scenarioMapping of mappedScenarios) {
             const scenarioId = scenarioMapping.id || scenarioMapping.scenarioId;
-            const scenarioDescription = scenarioMapping.description || '';
-            const scenarioType = scenarioMapping.type || '';
-            const scenarioPriority = scenarioMapping.priority || 'Medium';
+            // Merge RTM row (authoritative for description, type, priority,
+            // title, AC refs) with mapping result (authoritative for confidence
+            // / rationale / impactedFiles). Mapping fields win when present
+            // because the mapper may have refined the description for this PR.
+            const rtmRow = rtmById.get(scenarioId) || {};
+            const scenarioDescription = scenarioMapping.description || rtmRow.description || '';
+            const scenarioType = scenarioMapping.type || rtmRow.type || '';
+            const scenarioPriority = scenarioMapping.priority || rtmRow.priority || 'Medium';
+            const scenarioTitle = rtmRow.title || '';
+            const scenarioAcRef = Array.isArray(rtmRow.acceptanceCriteriaRef) ? rtmRow.acceptanceCriteriaRef : [];
 
             sendEvent('scenario_execution_updated', {
                 scenarioId,
@@ -687,7 +749,14 @@ async function runPipeline(runId, prUrl, repoFullName) {
             let scenarioConversationId = priorConversationId;
             try {
                 const genResult = await generateTestCasesForScenario({
-                    scenario: { id: scenarioId, description: scenarioDescription, type: scenarioType, priority: scenarioPriority },
+                    scenario: {
+                        id: scenarioId,
+                        title: scenarioTitle,
+                        description: scenarioDescription,
+                        type: scenarioType,
+                        priority: scenarioPriority,
+                        acceptanceCriteriaRef: scenarioAcRef
+                    },
                     codeContextSection,
                     prDiffSection,
                     dependenciesSection: codeContext.dependencies || '',
@@ -777,7 +846,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
                     linkedProject,
                     refinementCandidates,
                     sendEvent,
-                    runSummary
+                    runSummary,
+                    scenarioDescription
                 });
 
                 if (tcStatus === 'pass') {
@@ -823,6 +893,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('phase_update', { phase: 'Test Generation', status: 'error' });
         sendEvent('log', { level: 'ERROR', message: `Fatal Error: ${error.message}` });
         sendEvent('error', { message: error.message });
+        sendEvent('complete', { success: false });
         cleanupSandbox(runId, _sandboxContainerName);
     }
 }

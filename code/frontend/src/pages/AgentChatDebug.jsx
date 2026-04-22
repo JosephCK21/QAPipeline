@@ -151,6 +151,19 @@ function ResponseBubble({ trace, pending }) {
                             {trace.responseId && (
                                 <span>response: <span className="text-[#00875A]">{trace.responseId}</span></span>
                             )}
+                            {trace.usage && typeof trace.usage.inputTokens === 'number' && (
+                                <span>
+                                    tokens: <span className="text-[#172B4D]">{trace.usage.inputTokens} in / {trace.usage.outputTokens} out</span>
+                                    {trace.usage.cachedTokens > 0 && trace.usage.inputTokens > 0 && (
+                                        <span className="ml-1 text-[#00875A]">
+                                            (cached {trace.usage.cachedTokens}, {Math.round((trace.usage.cachedTokens / trace.usage.inputTokens) * 100)}%)
+                                        </span>
+                                    )}
+                                    {trace.usage.reasoningTokens > 0 && (
+                                        <span className="ml-1 text-[#5E4DB2]">· reasoning {trace.usage.reasoningTokens}</span>
+                                    )}
+                                </span>
+                            )}
                             {trace.error && (
                                 <span className="text-[#C9372C]">error: {trace.error}</span>
                             )}

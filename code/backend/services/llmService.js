@@ -28,6 +28,46 @@ const STATEFUL_MODE = (process.env.OPENAI_STATEFUL_MODE || 'conversation').toLow
 
 const REASONING_SUMMARY = process.env.OPENAI_REASONING_SUMMARY || 'auto';
 
+// Extended prompt cache retention. "24h" keeps cached prefixes alive for up
+// to 24 hours on supported models (gpt-5.x / gpt-5.x-mini); "in_memory" falls
+// back to the 5-10 min default. Supported values: 'in_memory' | '24h'.
+const PROMPT_CACHE_RETENTION = process.env.OPENAI_PROMPT_CACHE_RETENTION || '24h';
+
+// Output verbosity hint for GPT-5 series. "low" keeps ambient prose terse,
+// which is ideal for our structured-output / classification callers.
+const OUTPUT_VERBOSITY = process.env.OPENAI_OUTPUT_VERBOSITY || 'low';
+
+// Reasoning effort for the PR bug-fix classifier. "low" is the fastest
+// deterministic setting universally supported across gpt-5.x models (including
+// gpt-5.4-mini which does NOT support "minimal"). Override via env if needed.
+const CLASSIFIER_EFFORT = process.env.OPENAI_CLASSIFIER_EFFORT || 'low';
+
+// Stable identifiers combined with the prompt-prefix hash to route requests
+// that share an `instructions` prefix to the same cache machine. Essential
+// for hit rate when many parallel calls share the same static instructions.
+const CACHE_KEYS = {
+    SCENARIO_STORY:    'qa:scenarios:story',
+    SCENARIO_EPIC:     'qa:scenarios:epic',
+    JIRA_SCENARIO:     'qa:scenarios:jira',
+    TESTCASE_GEN:      'qa:testcases:generate',
+    TESTCASE_HEAL:     'qa:testcases:heal',
+    PR_MAPPING:        'qa:pr:mapping',
+    PR_CLASSIFICATION: 'qa:pr:classification'
+};
+
+/**
+ * Build the prompt-cache params to spread into a responses.create() call.
+ * Always attaches a prompt_cache_key; includes prompt_cache_retention when a
+ * non-default policy is configured.
+ */
+function buildCacheParams(cacheKey) {
+    const params = { prompt_cache_key: cacheKey };
+    if (PROMPT_CACHE_RETENTION && PROMPT_CACHE_RETENTION !== 'in_memory') {
+        params.prompt_cache_retention = PROMPT_CACHE_RETENTION;
+    }
+    return params;
+}
+
 // ---------------------------------------------------------------------------
 // Telemetry
 // ---------------------------------------------------------------------------
@@ -36,7 +76,11 @@ const REASONING_SUMMARY = process.env.OPENAI_REASONING_SUMMARY || 'auto';
  * Emits a single LLM call trace to all connected Socket.IO clients.
  * Called before (phase='request') and after (phase='response') every LLM call.
  */
-function emitLlmTrace({ caller, model, phase, prompt, response, reasoningSummary, durationMs, error, conversationId, responseId }) {
+function emitLlmTrace({
+    caller, model, phase, prompt, response, reasoningSummary,
+    durationMs, error, conversationId, responseId,
+    usage
+}) {
     if (global.io) {
         global.io.emit('llm_trace', {
             id: crypto.randomUUID(),
@@ -49,9 +93,19 @@ function emitLlmTrace({ caller, model, phase, prompt, response, reasoningSummary
             durationMs:         phase === 'response' ? durationMs : undefined,
             conversationId:     conversationId || undefined,
             responseId:         responseId || undefined,
+            usage:              phase === 'response' ? (usage || undefined) : undefined,
             error,
             timestamp: new Date().toISOString()
         });
+    }
+
+    // Console log cache-hit telemetry so operators can verify that caching is
+    // actually working without needing the UI open.
+    if (phase === 'response' && usage && typeof usage.inputTokens === 'number') {
+        const pct = usage.inputTokens > 0
+            ? Math.round((usage.cachedTokens / usage.inputTokens) * 100)
+            : 0;
+        console.log(`[LLM usage] ${caller}: in=${usage.inputTokens} cached=${usage.cachedTokens} (${pct}%) out=${usage.outputTokens} reasoning=${usage.reasoningTokens}`);
     }
 }
 
@@ -118,6 +172,95 @@ async function assertTokenLimit(promptOrContents, modelName) {
     }
 }
 
+/**
+ * Soft-trim a prompt to fit within a token budget. Cuts from the MIDDLE (keeping
+ * the start — usually structured rules + scenario — and the end — usually the
+ * most recent context/diff) and inserts a clear marker so the model knows bytes
+ * were dropped. When the encoder is unavailable, falls back to a char-length
+ * heuristic (~4 chars per token for English/code).
+ *
+ * @param {string} text
+ * @param {number} budgetTokens  hard upper bound
+ * @param {string} caller        label for logs
+ * @returns {string} possibly-truncated text
+ */
+function ensureWithinBudget(text, budgetTokens, caller = 'unknown') {
+    if (typeof text !== 'string' || text.length === 0) return text || '';
+    const enc = getEncoder();
+
+    const measure = enc
+        ? (s) => enc.encode(s).length
+        : (s) => Math.ceil(s.length / 4);
+
+    const initialTokens = measure(text);
+    if (initialTokens <= budgetTokens) return text;
+
+    // Drop from the middle. Keep the first 45% and last 45% of the budget.
+    const headBudget = Math.floor(budgetTokens * 0.45);
+    const tailBudget = Math.floor(budgetTokens * 0.45);
+
+    const sliceByTokens = (s, tokenCount, fromEnd = false) => {
+        if (!enc) {
+            const charCount = tokenCount * 4;
+            return fromEnd ? s.slice(-charCount) : s.slice(0, charCount);
+        }
+        const tokens = enc.encode(s);
+        if (fromEnd) {
+            const picked = tokens.slice(Math.max(0, tokens.length - tokenCount));
+            return new TextDecoder().decode(enc.decode(picked));
+        }
+        const picked = tokens.slice(0, tokenCount);
+        return new TextDecoder().decode(enc.decode(picked));
+    };
+
+    let head, tail;
+    try {
+        head = sliceByTokens(text, headBudget, false);
+        tail = sliceByTokens(text, tailBudget, true);
+    } catch (err) {
+        // Fallback to naive char slice on tokenizer decode errors.
+        const charBudget = budgetTokens * 4;
+        head = text.slice(0, Math.floor(charBudget * 0.45));
+        tail = text.slice(-Math.floor(charBudget * 0.45));
+    }
+
+    const droppedTokens = initialTokens - measure(head) - measure(tail);
+    const marker = `\n\n[... ${droppedTokens} tokens truncated by prompt-budget guard — ${caller} ...]\n\n`;
+    const result = head + marker + tail;
+    console.warn(`[Token Guard] ${caller}: trimmed prompt from ${initialTokens} -> ${measure(result)} tokens (budget ${budgetTokens}).`);
+    return result;
+}
+
+/**
+ * Default soft budget per-call — leaves headroom under MAX_TOKENS_ALLOWED for
+ * reasoning output. Configurable via OPENAI_PROMPT_BUDGET env.
+ */
+const PROMPT_TOKEN_BUDGET = (() => {
+    const raw = Number(process.env.OPENAI_PROMPT_BUDGET);
+    if (Number.isFinite(raw) && raw > 0) return raw;
+    return Math.floor(MAX_TOKENS_ALLOWED * 0.9);
+})();
+
+/**
+ * Recognise errors from the Responses API that indicate our stored
+ * conversation id or previous_response_id is no longer valid (expired,
+ * deleted, or from a different org). Returns true when the caller should
+ * retry the request in stateless mode.
+ */
+function isStaleChainError(err) {
+    if (!err) return false;
+    const msg = String(err.message || '').toLowerCase();
+    const status = err.status || err.statusCode;
+    const hasChainKeyword =
+        msg.includes('previous_response_id') ||
+        msg.includes('previous response') ||
+        msg.includes('conversation') ||
+        msg.includes('response_') ||   // e.g. response_xxxxx not found
+        msg.includes('conv_');          // e.g. conv_xxxxx not found
+    const hasNotFound = msg.includes('not found') || msg.includes("doesn't exist") || msg.includes('does not exist') || msg.includes('invalid');
+    return (status === 404 || status === 400) && hasChainKeyword && hasNotFound;
+}
+
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
@@ -167,6 +310,25 @@ function extractReasoningItems(response) {
     return output.filter((item) => item.type === 'reasoning');
 }
 
+/**
+ * Normalise token-usage stats from a Responses API response, including
+ * cache-hit telemetry. prompt_tokens_details.cached_tokens tells us how
+ * many input tokens were served from cache at 40-80% discount — the key
+ * signal that our static `instructions` + prompt_cache_key are working.
+ */
+function extractUsage(response) {
+    const usage = response?.usage || {};
+    const inputTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+    const outputTokens = usage.output_tokens ?? usage.completion_tokens ?? 0;
+    const cachedTokens = usage.input_tokens_details?.cached_tokens
+        ?? usage.prompt_tokens_details?.cached_tokens
+        ?? 0;
+    const reasoningTokens = usage.output_tokens_details?.reasoning_tokens
+        ?? usage.completion_tokens_details?.reasoning_tokens
+        ?? 0;
+    return { inputTokens, outputTokens, cachedTokens, reasoningTokens };
+}
+
 // ---------------------------------------------------------------------------
 // Conversations API helpers
 // ---------------------------------------------------------------------------
@@ -195,16 +357,18 @@ async function createConversation(metadata = {}) {
  * include, prior reasoning items) for a `responses.create` call based on the
  * active stateful mode and what we have available from prior turns.
  *
- * Returns: { store, conversation?, previous_response_id?, include?, priorReasoningItems? }
- * The caller merges these into their `responses.create(...)` params, and when
- * `priorReasoningItems` is present they should prepend them to the input array.
+ * Returns: { store, conversation?, previous_response_id?, include?, _priorReasoningItems? }
+ *
+ * `_priorReasoningItems` is a non-API bookkeeping field — callers pass the
+ * result through `applyStatefulInput()` which prepends those items to the
+ * actual `input` param. Do NOT spread this straight into responses.create().
  */
 function buildStatefulParams({ conversationId = null, previousResponseId = null, priorReasoningItems = [] } = {}) {
     if (STATEFUL_MODE === 'zdr') {
         return {
             store: false,
             include: ['reasoning.encrypted_content'],
-            priorReasoningItems
+            _priorReasoningItems: Array.isArray(priorReasoningItems) ? priorReasoningItems : []
         };
     }
 
@@ -220,6 +384,33 @@ function buildStatefulParams({ conversationId = null, previousResponseId = null,
 
     // First turn, nothing to chain from. Still store so future turns can.
     return { store: true };
+}
+
+/**
+ * Strip the bookkeeping `_priorReasoningItems` key out of the stateful params
+ * before they're spread into `responses.create(...)`. Use together with
+ * `applyStatefulInput` below.
+ */
+function stripInternalParams(stateful) {
+    const { _priorReasoningItems, ...rest } = stateful || {};
+    return rest;
+}
+
+/**
+ * Build the final `input` param for `responses.create`. In ZDR mode we have
+ * to prepend reasoning items (with encrypted_content) from the prior turn so
+ * the model retains its chain-of-thought — in every other mode the input is
+ * returned untouched.
+ */
+function applyStatefulInput(baseInput, stateful) {
+    const priorItems = stateful?._priorReasoningItems;
+    if (!Array.isArray(priorItems) || priorItems.length === 0) {
+        return baseInput;
+    }
+    const baseItems = typeof baseInput === 'string'
+        ? [{ role: 'user', content: baseInput }]
+        : (Array.isArray(baseInput) ? baseInput : [baseInput]);
+    return [...priorItems, ...baseItems];
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +550,34 @@ const SCENARIO_RESPONSE_SCHEMA = {
     additionalProperties: false
 };
 
+// Structural schema for test-case generation. testData is intentionally a
+// free-form object (keys are arbitrary fixture group names), so this schema
+// is used in non-strict mode — it enforces the SHAPE of every other field
+// while leaving testData flexible. enforceTestData() remains the safety net.
+const TESTCASE_RESPONSE_SCHEMA = {
+    type: 'object',
+    properties: {
+        testCases: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    testCaseId:   { type: 'string' },
+                    title:        { type: 'string' },
+                    steps:        { type: 'array', items: { type: 'string' } },
+                    testData:     { type: 'object', additionalProperties: true },
+                    testScript:   { type: 'string' },
+                    language:     { type: 'string', enum: ['javascript', 'python'] },
+                    codeFiles:    { type: 'array', items: { type: 'string' } },
+                    isRefinement: { type: 'boolean' }
+                },
+                required: ['testCaseId', 'title', 'steps', 'testData', 'testScript', 'language', 'codeFiles', 'isRefinement']
+            }
+        }
+    },
+    required: ['testCases']
+};
+
 // ---------------------------------------------------------------------------
 // Static instruction blocks — held OUTSIDE the variable prompt so the same
 // prefix hashes identically on every call and benefits from OpenAI's automatic
@@ -394,12 +613,30 @@ SEPARATION OF DATA AND LOGIC (mandatory — strictly enforced):
 RULES FOR THE testScript:
 - The script runs inside an isolated Docker container where the full app source code is already present.
 - The app's dependencies (express, etc.) are pre-installed but the server is NOT already running.
-- For Node.js Express apps: use "supertest" — require the server module, pass it directly to supertest, and do NOT call app.listen() yourself.
+- AVAILABLE TEST PACKAGES (already installed): jest, supertest, jest-environment-node, fs, path, vm, crypto, and Node.js built-ins.
+- DO NOT require or import packages that are not listed above (e.g. jsdom, puppeteer, playwright, cheerio, enzyme, testing-library). If you need DOM testing, use Node.js built-in "vm" module with a manual DOM stub, or test the API layer directly with supertest instead.
+- For Node.js Express (and other HTTP frameworks exposed as an app or server): you MUST use "supertest" only — require the server module, pass it to supertest, and do NOT call app.listen() yourself.
   Example: const request = require('supertest'); const app = require('./todoServer'); const res = await request(app).post('/todos').send(testData.todo);
+- FORBIDDEN for Express HTTP APIs: reaching into Express internals (e.g. app._router, layer.route, walking middleware stacks, invokeRoute helpers, or hand-rolled req/res mocks). Supertest is the only allowed way to hit HTTP routes unless the app is genuinely non-HTTP.
+- Jest structure: wrap tests in describe() and it() (or test()). When using supertest, use async it('...', async () => { ... }) and await every request(...) chain so promises are never dropped. Use expect() for assertions.
+- Naming hygiene: never use the same identifier for a helper function and a const/let (e.g. do NOT declare function createRes() and later const createRes = ... — that is a SyntaxError). Use distinct names: loginRes, createTodoRes, listRes, etc.
+- Authorization: match the real app from codeContext (e.g. if the server reads the raw token from the Authorization header, send .set('Authorization', token) and do NOT add a "Bearer " prefix unless the server explicitly strips it).
 - Never make raw HTTP calls to localhost URLs or assume a server is running externally.
 - Use CommonJS require() style (not ES modules import).
-- The test framework is Jest — use describe/it/expect blocks.
 - Never re-declare testData — it is already available as a variable.
+
+SERVER CLEANUP (mandatory — prevents Jest from hanging on open handles):
+- Tests run with --forceExit and --runInBand, but you MUST still ensure clean teardown.
+- If you store a reference to a server or HTTP agent, close it in afterAll: afterAll(() => { if (server) server.close(); });
+- For supertest against an app (not a running server), supertest manages connections automatically, but add afterAll as a safety net.
+- NEVER leave setInterval, setTimeout, or open socket/database connections running after tests complete.
+
+FILE-BASED STORAGE APPS (important for apps using JSON file storage):
+- If the app under test uses file-based storage (e.g. JSON files like todos.json, users.json), the sandbox resets these files to empty state ([] or {}) before each test execution.
+- Each test script starts with a CLEAN, EMPTY data store. Do NOT assume any pre-existing data.
+- Your test must create all the data it needs (e.g. signup a user, then login, then create todos) — never assume users or records already exist.
+- If tests share state within a single describe block, use beforeAll/beforeEach to set up required data.
+- Use unique test data values per test case to reduce collision risk if tests run in any order.
 
 OUTPUT FORMAT:
 Return a JSON object with a single top-level key "testCases" whose value is an array of 2-4 test case objects.
@@ -408,6 +645,10 @@ Each test case object must have: testCaseId, title, steps, testData, testScript,
 const HEAL_INSTRUCTIONS = `You are an expert test engineer fixing a failing test script for an isolated Docker sandbox.
 The testData variable is already injected as the first line at runtime — do NOT redeclare it.
 Do not hardcode any values that exist in testData — always reference them as testData.<group>.<key>.
+Fix any SyntaxError or duplicate identifier (e.g. a helper function name reused as const) — rename variables so every binding is unique.
+If the script uses app._router, manual middleware walking, or fake req/res mocks for an Express app, rewrite it to use supertest against the exported app with async/await and describe/it.
+If the app uses file-based storage (JSON files), the data files are reset to empty ([] or {}) before each test run. The test must create all data it needs (signup, login, create records) — never assume pre-existing data.
+Ensure no open handles (servers, intervals, sockets) remain after tests — add afterAll cleanup if needed.
 If you already tried a similar approach in a previous turn and it failed, use a completely different strategy.
 Return ONLY the corrected script body. No explanation, no markdown fences, no comments about what changed. Just the raw executable code.`;
 
@@ -445,19 +686,24 @@ async function generateTestCasesForScenario({
     refinementContext,
     alreadyGeneratedSummary = [],
     conversationId = null,
-    previousInteractionId = null
+    previousInteractionId = null,
+    priorReasoningItems = []
 }) {
+    if (!scenario?.id) {
+        throw new Error('generateTestCasesForScenario: scenario.id is required');
+    }
+
     // Lazily create a conversation for this scenario if we don't already have one.
     let activeConversationId = conversationId;
     if (!activeConversationId && STATEFUL_MODE === 'conversation') {
         activeConversationId = await createConversation({
             caller: 'generateTestCasesForScenario',
-            scenarioId: String(scenario.id || '')
+            scenarioId: String(scenario.id)
         });
     }
 
     const refinementHint = refinementContext
-        ? `\n[REFINEMENT] This replaces an existing test case (v${refinementContext.version}). Previous script:\n${refinementContext.testScript}\n`
+        ? `\n[REFINEMENT] This replaces an existing test case (v${refinementContext.version || 1}). Previous script:\n${refinementContext.testScript || '(not available)'}\n`
         : '';
 
     const alreadyCoveredSection = alreadyGeneratedSummary.length > 0
@@ -469,11 +715,16 @@ async function generateTestCasesForScenario({
 
     // Variable-only portion (scenario-specific); the static rules live in
     // TESTCASE_GENERATION_INSTRUCTIONS for prompt caching.
-    const prompt = `Scenario to cover:
-  ID: ${scenario.id}
-  Description: ${scenario.description}
-  Type: ${scenario.type}
-  Priority: ${scenario.priority || 'Medium'}
+    const acRef = Array.isArray(scenario.acceptanceCriteriaRef) && scenario.acceptanceCriteriaRef.length > 0
+        ? `\n  Acceptance Criteria (refs): ${scenario.acceptanceCriteriaRef.join(', ')}`
+        : '';
+    const scenarioTitleLine = scenario.title ? `\n  Title: ${scenario.title}` : '';
+
+    const rawPrompt = `Scenario to cover:
+  ID: ${scenario.id}${scenarioTitleLine}
+  Description: ${scenario.description || '(no description provided)'}
+  Type: ${scenario.type || '(unspecified)'}
+  Priority: ${scenario.priority || 'Medium'}${acRef}
 
 ${refinementHint}${alreadyCoveredSection}
 [CHANGED CODE DIFF]:
@@ -493,10 +744,16 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
 - List the codeFiles array with paths of PR files this test case exercises
 - Set isRefinement: ${refinementContext ? 'true' : 'false'}`;
 
+    // Soft-trim oversized PRs before token guard so we never hard-fail the pipeline.
+    const prompt = ensureWithinBudget(rawPrompt, PROMPT_TOKEN_BUDGET, 'generateTestCasesForScenario');
+    await assertTokenLimit(prompt, DEFAULT_MODEL);
+
     const stateful = buildStatefulParams({
         conversationId: activeConversationId,
-        previousResponseId: previousInteractionId
+        previousResponseId: previousInteractionId,
+        priorReasoningItems
     });
+    const finalInput = applyStatefulInput(prompt, stateful);
 
     const _tcStartMs = Date.now();
     emitLlmTrace({
@@ -510,14 +767,25 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
     const response = await client.responses.create({
         model: DEFAULT_MODEL,
         instructions: TESTCASE_GENERATION_INSTRUCTIONS,
-        input: prompt,
-        text: { format: { type: 'json_object' } },
+        input: finalInput,
+        text: {
+            format: {
+                type: 'json_schema',
+                name: 'TestCases',
+                schema: TESTCASE_RESPONSE_SCHEMA,
+                strict: false
+            },
+            verbosity: OUTPUT_VERBOSITY
+        },
         reasoning: { effort: TESTCASE_EFFORT, summary: REASONING_SUMMARY },
-        ...stateful
+        ...buildCacheParams(CACHE_KEYS.TESTCASE_GEN),
+        ...stripInternalParams(stateful)
     });
 
     const text = extractResponseText(response);
     const reasoningSummary = extractReasoningSummary(response);
+    const usage = extractUsage(response);
+    const reasoningItems = extractReasoningItems(response);
     emitLlmTrace({
         caller: 'generateTestCasesForScenario',
         model: DEFAULT_MODEL,
@@ -526,7 +794,8 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
         reasoningSummary,
         durationMs: Date.now() - _tcStartMs,
         conversationId: activeConversationId,
-        responseId: response.id
+        responseId: response.id,
+        usage
     });
 
     const parsed = safeParseJSON(text);
@@ -541,7 +810,9 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
         testCases,
         interactionId: response.id || null,
         conversationId: activeConversationId,
-        reasoningSummary
+        reasoningSummary,
+        reasoningItems,
+        usage
     };
 }
 
@@ -571,8 +842,14 @@ async function repairTestCaseScript({
     attemptNumber,
     conversationId = null,
     previousInteractionId = null,
-    attemptHistory = []
+    priorReasoningItems = [],
+    attemptHistory = [],
+    scenarioDescription = ''
 }) {
+    if (!testCase?.testCaseId) {
+        throw new Error('repairTestCaseScript: testCase.testCaseId is required');
+    }
+
     let input;
     const hasState = Boolean(conversationId) || Boolean(previousInteractionId);
 
@@ -597,7 +874,78 @@ Fix the script.`;
               ).join('\n\n')
             : '';
 
+        const intentSection = scenarioDescription
+            ? `\n[WHAT THIS TEST VERIFIES]:\n${scenarioDescription}\n`
+            : '';
+
         input = `A test script failed during execution. Fix it.
+
+Test Case: ${testCase.testCaseId}
+Title: ${testCase.title}
+Language: ${testCase.language}
+Attempt number: ${attemptNumber} of 3
+${intentSection}${historySection}
+[CURRENT FAILED SCRIPT]:
+${testCase.testScript}
+
+[CURRENT SANDBOX FAILURE OUTPUT]:
+${failureOutput}
+
+[RELEVANT SOURCE CODE CONTEXT]:
+${codeContextSection || 'Not available.'}
+
+[TEST DATA]:
+${JSON.stringify(testCase.testData, null, 2)}
+
+If you already tried an approach in a previous attempt and it failed, use a different strategy this time.`;
+    }
+
+    // Soft-trim before token guard — heal prompts can be large when the
+    // stateless fallback path is taken (full code context + attempt history).
+    input = ensureWithinBudget(input, PROMPT_TOKEN_BUDGET, 'repairTestCaseScript');
+    await assertTokenLimit(input, DEFAULT_MODEL);
+
+    const stateful = buildStatefulParams({
+        conversationId,
+        previousResponseId: previousInteractionId,
+        priorReasoningItems
+    });
+    const finalInput = applyStatefulInput(input, stateful);
+
+    const _healStartMs = Date.now();
+    emitLlmTrace({
+        caller: 'repairTestCaseScript',
+        model: DEFAULT_MODEL,
+        phase: 'request',
+        prompt: input,
+        conversationId
+    });
+
+    const callOpenAI = (statefulParams, inputPayload) => client.responses.create({
+        model: DEFAULT_MODEL,
+        instructions: HEAL_INSTRUCTIONS,
+        input: inputPayload,
+        reasoning: { effort: HEAL_EFFORT, summary: REASONING_SUMMARY },
+        ...buildCacheParams(CACHE_KEYS.TESTCASE_HEAL),
+        ...stripInternalParams(statefulParams)
+    });
+
+    let response;
+    let chainWasStale = false;
+    try {
+        response = await callOpenAI(stateful, finalInput);
+    } catch (err) {
+        if (hasState && isStaleChainError(err)) {
+            chainWasStale = true;
+            console.warn(`[repairTestCaseScript] Stored chain anchor is stale (${err.status || '?'}): ${err.message}. Retrying stateless.`);
+            // Re-plan: stateless fallback. Rebuild the long self-contained prompt.
+            const historySection = attemptHistory.length > 0
+                ? `\n[PREVIOUS ATTEMPT HISTORY — do NOT repeat these approaches]:\n` +
+                  attemptHistory.map(h =>
+                      `--- Attempt ${h.attemptNumber} script ---\n${h.scriptUsed}\n--- Attempt ${h.attemptNumber} failure ---\n${h.failureOutput}`
+                  ).join('\n\n')
+                : '';
+            let fallbackInput = `A test script failed during execution. Fix it.
 
 Test Case: ${testCase.testCaseId}
 Title: ${testCase.title}
@@ -617,32 +965,19 @@ ${codeContextSection || 'Not available.'}
 ${JSON.stringify(testCase.testData, null, 2)}
 
 If you already tried an approach in a previous attempt and it failed, use a different strategy this time.`;
+            fallbackInput = ensureWithinBudget(fallbackInput, PROMPT_TOKEN_BUDGET, 'repairTestCaseScript:fallback');
+            await assertTokenLimit(fallbackInput, DEFAULT_MODEL);
+            const statelessParams = buildStatefulParams({}); // no conversation, no previous_response_id
+            response = await callOpenAI(statelessParams, fallbackInput);
+        } else {
+            throw err;
+        }
     }
-
-    const stateful = buildStatefulParams({
-        conversationId,
-        previousResponseId: previousInteractionId
-    });
-
-    const _healStartMs = Date.now();
-    emitLlmTrace({
-        caller: 'repairTestCaseScript',
-        model: DEFAULT_MODEL,
-        phase: 'request',
-        prompt: input,
-        conversationId
-    });
-
-    const response = await client.responses.create({
-        model: DEFAULT_MODEL,
-        instructions: HEAL_INSTRUCTIONS,
-        input,
-        reasoning: { effort: HEAL_EFFORT, summary: REASONING_SUMMARY },
-        ...stateful
-    });
 
     const text = extractResponseText(response);
     const reasoningSummary = extractReasoningSummary(response);
+    const usage = extractUsage(response);
+    const reasoningItems = extractReasoningItems(response);
     emitLlmTrace({
         caller: 'repairTestCaseScript',
         model: DEFAULT_MODEL,
@@ -651,15 +986,22 @@ If you already tried an approach in a previous attempt and it failed, use a diff
         reasoningSummary,
         durationMs: Date.now() - _healStartMs,
         conversationId,
-        responseId: response.id
+        responseId: response.id,
+        usage
     });
 
     const repairedScript = text.replace(/^```(?:\w+)?\n?/gm, '').replace(/^```$/gm, '').trim();
     return {
         repairedScript,
         interactionId: response.id || null,
-        conversationId,
-        reasoningSummary
+        // When the chain was stale, the previous conversationId is meaningless —
+        // signal that to the caller by returning null so it stops retrying the
+        // same dead anchor on subsequent attempts.
+        conversationId: chainWasStale ? null : conversationId,
+        chainWasStale,
+        reasoningSummary,
+        reasoningItems,
+        usage
     };
 }
 
@@ -700,14 +1042,17 @@ Return a JSON object with a "scenarios" array. Each scenario object has: scenari
                     name: 'Scenarios',
                     schema: SCENARIO_RESPONSE_SCHEMA,
                     strict: true
-                }
+                },
+                verbosity: OUTPUT_VERBOSITY
             },
             reasoning: { effort: SCENARIO_EFFORT, summary: REASONING_SUMMARY },
+            ...buildCacheParams(CACHE_KEYS.SCENARIO_STORY),
             store: true
         });
 
         const text = extractResponseText(response);
         const reasoningSummary = extractReasoningSummary(response);
+        const usage = extractUsage(response);
         emitLlmTrace({
             caller: 'generateTestScenarios',
             model: currentModel,
@@ -715,7 +1060,8 @@ Return a JSON object with a "scenarios" array. Each scenario object has: scenari
             response: text,
             reasoningSummary,
             durationMs: Date.now() - _scStartMs,
-            responseId: response.id
+            responseId: response.id,
+            usage
         });
         const parsed = safeParseJSON(text);
         if (Array.isArray(parsed?.scenarios)) return parsed.scenarios;
@@ -763,14 +1109,17 @@ Cover all four types (happy_path, edge_case, negative, boundary) per acceptance 
                     name: 'EpicScenarios',
                     schema: SCENARIO_RESPONSE_SCHEMA,
                     strict: true
-                }
+                },
+                verbosity: OUTPUT_VERBOSITY
             },
             reasoning: { effort: SCENARIO_EFFORT, summary: REASONING_SUMMARY },
+            ...buildCacheParams(CACHE_KEYS.SCENARIO_EPIC),
             store: true
         });
 
         const text = extractResponseText(response);
         const reasoningSummary = extractReasoningSummary(response);
+        const usage = extractUsage(response);
         emitLlmTrace({
             caller: 'generateTestScenariosForEpic',
             model: currentModel,
@@ -778,7 +1127,8 @@ Cover all four types (happy_path, edge_case, negative, boundary) per acceptance 
             response: text,
             reasoningSummary,
             durationMs: Date.now() - _epicStartMs,
-            responseId: response.id
+            responseId: response.id,
+            usage
         });
         const parsed = safeParseJSON(text);
         const scenarios = Array.isArray(parsed?.scenarios)
@@ -812,16 +1162,27 @@ module.exports = {
     SCENARIO_EFFORT,
     TESTCASE_EFFORT,
     HEAL_EFFORT,
+    CLASSIFIER_EFFORT,
     STATEFUL_MODE,
     REASONING_SUMMARY,
+    OUTPUT_VERBOSITY,
+    PROMPT_CACHE_RETENTION,
+    CACHE_KEYS,
+    buildCacheParams,
     emitLlmTrace,
     safeParseJSON,
     extractResponseText,
     extractReasoningSummary,
     extractReasoningItems,
+    extractUsage,
     assertTokenLimit,
+    ensureWithinBudget,
+    PROMPT_TOKEN_BUDGET,
+    isStaleChainError,
     createConversation,
     buildStatefulParams,
+    stripInternalParams,
+    applyStatefulInput,
     generateTestScenarios,
     generateTestScenariosForEpic,
     generateTestCasesForScenario,

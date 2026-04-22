@@ -183,6 +183,11 @@ async function createSandbox(runId, prDetails) {
     // Volume path: Docker on Windows accepts C:/... forward-slash form.
     const volumeDir = sandboxDir.replace(/\\/g, '/');
     const runTimeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
+    if (runTimeoutMs < 60000) {
+        console.warn(
+            `[Sandbox] SANDBOX_TIMEOUT_MS=${runTimeoutMs} is low; Jest/npm steps inside Docker often exceed 30s. Consider 120000 or higher.`
+        );
+    }
     // Pre-install steps download many packages — give them 5 minutes regardless
     // of the per-test timeout setting, since this only runs once per pipeline run.
     const installTimeoutMs = Math.max(runTimeoutMs, 300000);
@@ -249,6 +254,17 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
         scriptToRun = `import json as _json\ntest_data = _json.loads(${JSON.stringify(JSON.stringify(testData))})\n\n${testContent}`;
     }
 
+    // Reset JSON data files before each test to prevent cross-test state pollution.
+    // The container is persistent across all test cases in a run, so prior test
+    // executions may have mutated these files, leaving stale/corrupt state.
+    const dataResets = { 'todos.json': '[]', 'users.json': '[]', 'sessions.json': '{}' };
+    for (const [file, content] of Object.entries(dataResets)) {
+        const filePath = path.join(sandboxDir, file);
+        if (fssync.existsSync(filePath)) {
+            await fs.writeFile(filePath, content, 'utf8');
+        }
+    }
+
     const testPath = path.join(sandboxDir, testFilename);
     await fs.writeFile(testPath, scriptToRun, 'utf8');
 
@@ -271,7 +287,7 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
             // Use spawnCapture — reliably captures stdout+stderr on Windows even
             // when the process exits non-zero (unlike execFilePromise which drops them).
             // Merge stderr into stdout via sh -c "... 2>&1" so all output is in one stream.
-            const jestCmd = `npx jest ${testFilename} --no-coverage --forceExit --testEnvironment=node 2>&1`;
+            const jestCmd = `npx jest ${testFilename} --no-coverage --forceExit --runInBand --detectOpenHandles --testEnvironment=node --testTimeout=30000 2>&1`;
             const { stdout, stderr } = await spawnCapture(
                 'docker', ['exec', containerName, 'sh', '-c', jestCmd],
                 { timeout: testTimeout }

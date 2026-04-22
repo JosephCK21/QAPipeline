@@ -2,6 +2,7 @@ require('dotenv').config();
 require('dns').setDefaultResultOrder('ipv4first');
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const fs = require('fs');
@@ -606,8 +607,29 @@ function getRunHistory() {
     }
 }
 
+// In-memory lock to prevent duplicate pipeline runs for the same PR URL.
+// When a PR event arrives while a run for that URL is already in flight,
+// we skip the duplicate to avoid wasting Docker/LLM resources.
+const _activePipelineRuns = new Map();
+
+function verifyGitHubSignature(req) {
+    const secret = process.env.GITHUB_WEBHOOK_SECRET;
+    if (!secret) return true; // no secret configured — skip verification
+    const sig = req.headers['x-hub-signature-256'];
+    if (!sig) return false;
+    const expected = 'sha256=' + crypto.createHmac('sha256', secret)
+        .update(JSON.stringify(req.body))
+        .digest('hex');
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+
 // Webhook endpoint to receive GitHub push/PR events
 app.post('/api/webhooks/github', validateBody(githubWebhookSchema), (req, res) => {
+    if (!verifyGitHubSignature(req)) {
+        console.warn('[Webhook] GitHub signature verification failed — rejecting request.');
+        return res.status(401).json({ error: 'Invalid signature' });
+    }
+
     // Respond immediately with 202 Accepted
     res.status(202).send('Accepted');
 
@@ -647,7 +669,15 @@ app.post('/api/webhooks/github', validateBody(githubWebhookSchema), (req, res) =
                 return;
             }
 
+            // Deduplication: skip if a pipeline is already running for this PR.
+            if (_activePipelineRuns.has(prUrl)) {
+                const existingRunId = _activePipelineRuns.get(prUrl);
+                console.log(`[Webhook] Skipping duplicate PR event for ${prUrl} — run ${existingRunId} is already in flight.`);
+                return;
+            }
+
             const runId = uuidv4();
+            _activePipelineRuns.set(prUrl, runId);
             
             console.log(`[Webhook] PR ${action}: ${prUrl} in ${repoFullName}. Starting run ${runId}`);
             
@@ -666,16 +696,18 @@ app.post('/api/webhooks/github', validateBody(githubWebhookSchema), (req, res) =
             
             // Kick off the pipeline asynchronously
             const { runPipeline } = require('./pipeline');
-            runPipeline(runId, prUrl, repoFullName).catch(err => {
-                console.error(`[Pipeline Error] Run ${runId}:`, err);
-                const { publishToDLQ } = require('./db');
-                publishToDLQ('github_webhook', { runId, prUrl, repoFullName }, err.message);
-            });
+            runPipeline(runId, prUrl, repoFullName)
+                .catch(err => {
+                    console.error(`[Pipeline Error] Run ${runId}:`, err);
+                    const { publishToDLQ } = require('./db');
+                    publishToDLQ('github_webhook', { runId, prUrl, repoFullName }, err.message);
+                })
+                .finally(() => {
+                    _activePipelineRuns.delete(prUrl);
+                });
         }
     }
 });
-
-const crypto = require('crypto');
 
 function verifyJiraWebhookSignature(req, res, next) {
     const secret = process.env.JIRA_WEBHOOK_SECRET;

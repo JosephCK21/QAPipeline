@@ -3,6 +3,11 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
+function safeJsonParse(text, fallback) {
+    if (!text) return fallback;
+    try { return JSON.parse(text); } catch { return fallback; }
+}
+
 const dbPath = path.join(__dirname, 'data', 'autoqa.db');
 
 let db;
@@ -164,6 +169,15 @@ function initDb() {
     } catch (e) {
         console.warn('[DB Migration] story_sync_log migration failed:', e.message);
     }
+
+    // Indexes for common query patterns — prevents full table scans at scale.
+    db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_rtm_projectKey ON rtm_scenarios(projectKey);
+        CREATE INDEX IF NOT EXISTS idx_tc_scenarioId  ON test_cases(scenarioId);
+        CREATE INDEX IF NOT EXISTS idx_tc_projectKey  ON test_cases(projectKey);
+        CREATE INDEX IF NOT EXISTS idx_runs_repo      ON run_history(repoFullName);
+        CREATE INDEX IF NOT EXISTS idx_runs_project   ON run_history(localProjectId);
+    `);
 }
 
 function publishToDLQ(source, payload, errorMsg) {
@@ -183,7 +197,7 @@ function getDLQEvents(status = 'pending') {
     const stmt = db.prepare('SELECT * FROM dead_letter_queue WHERE status = ? ORDER BY createdAt DESC');
     return stmt.all(status).map(res => ({
         ...res,
-        payload: res.payload ? JSON.parse(res.payload) : {}
+        payload: safeJsonParse(res.payload, {})
     }));
 }
 
@@ -221,7 +235,7 @@ function getScenariosByProject(projectKey) {
     const rows = stmt.all(projectKey);
     return rows.map(r => ({
         ...r,
-        acceptanceCriteriaRef: JSON.parse(r.acceptanceCriteriaRef || '[]')
+        acceptanceCriteriaRef: safeJsonParse(r.acceptanceCriteriaRef, [])
     }));
 }
 
@@ -303,10 +317,10 @@ function getRun(runId) {
     
     return {
         ...row,
-        events: JSON.parse(row.events || '[]'),
-        logs: JSON.parse(row.logs || '[]'),
-        llm_traces: JSON.parse(row.llm_traces || '[]'),
-        scenario_statuses: JSON.parse(row.scenario_statuses || '{}')
+        events: safeJsonParse(row.events, []),
+        logs: safeJsonParse(row.logs, []),
+        llm_traces: safeJsonParse(row.llm_traces, []),
+        scenario_statuses: safeJsonParse(row.scenario_statuses, {})
     };
 }
 
@@ -323,10 +337,10 @@ function listRuns(repoFullName) {
     
     return rows.map(row => ({
         ...row,
-        events: JSON.parse(row.events || '[]'),
-        logs: JSON.parse(row.logs || '[]'),
-        llm_traces: JSON.parse(row.llm_traces || '[]'),
-        scenario_statuses: JSON.parse(row.scenario_statuses || '{}')
+        events: safeJsonParse(row.events, []),
+        logs: safeJsonParse(row.logs, []),
+        llm_traces: safeJsonParse(row.llm_traces, []),
+        scenario_statuses: safeJsonParse(row.scenario_statuses, {})
     }));
 }
 
@@ -449,9 +463,9 @@ function getTestCasesByScenario(scenarioId) {
     const rows = db.prepare("SELECT * FROM test_cases WHERE scenarioId = ? AND status != 'superseded' ORDER BY version DESC, createdAt DESC").all(scenarioId);
     return rows.map(r => ({
         ...r,
-        steps:     JSON.parse(r.steps     || '[]'),
-        testData:  JSON.parse(r.testData  || '{}'),
-        codeFiles: JSON.parse(r.codeFiles || '[]')
+        steps:     safeJsonParse(r.steps, []),
+        testData:  safeJsonParse(r.testData, {}),
+        codeFiles: safeJsonParse(r.codeFiles, [])
     }));
 }
 
@@ -459,9 +473,9 @@ function getTestCasesByProject(projectKey) {
     const rows = db.prepare("SELECT * FROM test_cases WHERE projectKey = ? AND status != 'superseded' ORDER BY createdAt DESC").all(projectKey);
     return rows.map(r => ({
         ...r,
-        steps:     JSON.parse(r.steps     || '[]'),
-        testData:  JSON.parse(r.testData  || '{}'),
-        codeFiles: JSON.parse(r.codeFiles || '[]')
+        steps:     safeJsonParse(r.steps, []),
+        testData:  safeJsonParse(r.testData, {}),
+        codeFiles: safeJsonParse(r.codeFiles, [])
     }));
 }
 
@@ -469,9 +483,9 @@ function getTestCasesByRun(runId) {
     const rows = db.prepare('SELECT * FROM test_cases WHERE runId = ? ORDER BY createdAt ASC').all(runId);
     return rows.map(r => ({
         ...r,
-        steps:     JSON.parse(r.steps     || '[]'),
-        testData:  JSON.parse(r.testData  || '{}'),
-        codeFiles: JSON.parse(r.codeFiles || '[]')
+        steps:     safeJsonParse(r.steps, []),
+        testData:  safeJsonParse(r.testData, {}),
+        codeFiles: safeJsonParse(r.codeFiles, [])
     }));
 }
 
@@ -529,6 +543,25 @@ function deleteRunData(runId) {
     })();
 }
 
+/**
+ * Remove all generated test cases and pipeline runs so you can simulate a fresh PR.
+ * Keeps rtm_scenarios (definitions) and story_sync_log. Resets per-scenario run fields.
+ */
+function clearAllPipelineExecutionData() {
+    db.transaction(() => {
+        db.prepare('DELETE FROM test_cases').run();
+        db.prepare('DELETE FROM run_history').run();
+        db.prepare('DELETE FROM dead_letter_queue').run();
+        db.prepare(`
+            UPDATE rtm_scenarios SET
+                lastPRTested = NULL,
+                testScriptRef = NULL,
+                healAttempts = 0,
+                lastRunDate = NULL
+        `).run();
+    })();
+}
+
 module.exports = {
     deleteProjectData,
     initDb,
@@ -551,5 +584,6 @@ module.exports = {
     getTestCasesByScenario,
     getTestCasesByProject,
     getTestCasesByRun,
-    deleteRunData
+    deleteRunData,
+    clearAllPipelineExecutionData
 };
