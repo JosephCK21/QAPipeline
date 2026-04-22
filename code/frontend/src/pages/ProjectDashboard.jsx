@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Activity, ShieldCheck, Bug, Clock, GitCommit, Search, ChevronRight, ChevronDown, X, AlertTriangle, Settings, CheckCircle2, XCircle, Loader, PlayCircle, FileText, Upload, Trash2, Code2, Database, ListChecks, RefreshCw, GitBranch, ExternalLink } from 'lucide-react';
+import { Activity, ShieldCheck, Bug, Clock, GitCommit, Search, ChevronRight, ChevronDown, X, AlertTriangle, Settings, CheckCircle2, XCircle, Loader, PlayCircle, FileText, Upload, Trash2, Code2, Database, ListChecks, RefreshCw, GitBranch, ExternalLink, TrendingUp, Zap, BarChart2 } from 'lucide-react';
 import { useAppContext } from '../App';
 import { computeAllEpicMetrics } from '../lib/epicMetrics';
 import { JIRA_BASE_URL } from '../lib/env';
+import EpicStackedChart from '../components/EpicStackedChart';
 
 function normTcStatus(s) {
   return String(s || '').toLowerCase();
@@ -58,7 +59,7 @@ function ProjectDashboard() {
   const [rtmStats, setRtmStats] = useState({ totalReqs: 0, testedScenarios: 0, coverage: 0, totalScenarios: 0 });
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
-  const [activeTab, setActiveTab] = useState('rtm');
+  const [activeTab, setActiveTab] = useState('overview');
   const [searchQuery, setSearchQuery] = useState('');
   const [projectRuns, setProjectRuns] = useState([]);
   const [documents, setDocuments] = useState([]);
@@ -320,30 +321,11 @@ function ProjectDashboard() {
           </div>
       </div>
 
-      {/* KPI Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        {[
-          { label: 'Feature Coverage', value: `${rtmStats.coverage}%`, icon: ShieldCheck, iconColor: 'text-blue-400', iconBg: 'bg-blue-500/10' },
-          { label: 'Active Requirements', value: rtmStats.totalReqs, icon: Activity, iconColor: 'text-indigo-400', iconBg: 'bg-indigo-500/10' },
-          { label: 'Tested Scenarios', value: `${rtmStats.testedScenarios} / ${rtmStats.totalScenarios}`, icon: Bug, iconColor: 'text-[#00875A]', iconBg: 'bg-green-500/10' },
-          { label: 'Pending Execution', value: Math.max(0, rtmStats.totalScenarios - rtmStats.testedScenarios), icon: Clock, iconColor: 'text-yellow-400', iconBg: 'bg-yellow-500/10' },
-        ].map((card, i) => {
-          const Icon = card.icon;
-          return (
-            <div key={i} className={`${darkMode ? 'bg-[#161B22] border-[#30363D]' : 'bg-[#F4F5F7] border-[#DFE1E6]'} border p-4 rounded-lg flex items-center justify-between transition-colors`}>
-              <div>
-                <p className={`text-sm ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>{card.label}</p>
-                <p className={`text-2xl font-bold ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>{card.value}</p>
-              </div>
-              <div className={`p-3 ${card.iconBg} rounded-full`}><Icon className={`${card.iconColor} w-6 h-6`} /></div>
-            </div>
-          );
-        })}
-      </div>
 
       <div className={`border-b ${darkMode ? 'border-[#30363D]' : 'border-[#DFE1E6]'}`}>
         <nav className="-mb-px flex space-x-8">
           {[
+            { key: 'overview', label: 'Overview' },
             { key: 'rtm', label: 'Traceability Matrix' },
             { key: 'runs', label: 'Pipeline Runs' },
             { key: 'docs', label: 'Context Documents' },
@@ -356,6 +338,216 @@ function ProjectDashboard() {
           ))}
         </nav>
       </div>
+
+      {/* ═══════════════════════════════════════════════════════════
+          OVERVIEW TAB
+      ═══════════════════════════════════════════════════════════ */}
+      {activeTab === 'overview' && (() => {
+        // Derived insight values
+        const totalEpics = Object.keys(epicMetrics).length;
+        const epicValues = Object.values(epicMetrics);
+        const unhealthyEpics = epicValues.filter(em => em.failedScenarios > 0).length;
+
+        // Pass Rate: passed / tested (only scenarios that have actually run)
+        const totalPassedScenarios = epicValues.reduce((s, e) => s + e.passedScenariosStrict, 0);
+        const totalFailedScenarios = epicValues.reduce((s, e) => s + e.failedScenarios, 0);
+        const totalTestedScenarios = totalPassedScenarios + totalFailedScenarios;
+        const passRate = totalTestedScenarios > 0
+          ? Math.round((totalPassedScenarios / totalTestedScenarios) * 100)
+          : 0;
+
+        // Pipeline Runs: unique PRs that triggered a run
+        const totalRuns = projectRuns.length;
+        const prRuns = projectRuns.filter(r => r.prUrl);
+        const uniquePRs = new Set(prRuns.map(r => r.prUrl)).size;
+        const lastRun = projectRuns[0];
+        const lastRunStatus = lastRun?.status;
+
+        const insightCards = [
+          {
+            label: 'Pass Rate',
+            value: `${passRate}%`,
+            sub: totalTestedScenarios > 0
+              ? `${totalPassedScenarios} of ${totalTestedScenarios} tested scenarios`
+              : 'No scenarios tested yet',
+            icon: TrendingUp,
+            iconColor: passRate >= 80 ? 'text-emerald-400' : passRate >= 50 ? 'text-amber-400' : 'text-red-400',
+            iconBg: passRate >= 80 ? 'bg-emerald-500/10' : passRate >= 50 ? 'bg-amber-500/10' : 'bg-red-500/10',
+          },
+          {
+            label: 'Epic Health',
+            value: unhealthyEpics === 0 ? 'All Clear' : `${unhealthyEpics} / ${totalEpics}`,
+            sub: unhealthyEpics === 0 ? 'No failing epics' : `epic${unhealthyEpics !== 1 ? 's' : ''} with failures`,
+            icon: ShieldCheck,
+            iconColor: unhealthyEpics === 0 ? 'text-emerald-400' : 'text-red-400',
+            iconBg: unhealthyEpics === 0 ? 'bg-emerald-500/10' : 'bg-red-500/10',
+          },
+          {
+            label: 'Pipeline Runs',
+            value: uniquePRs,
+            sub: totalRuns > 0
+              ? `${totalRuns} total run${totalRuns !== 1 ? 's' : ''}`
+              : 'No runs yet',
+            icon: Zap,
+            iconColor: 'text-indigo-400',
+            iconBg: 'bg-indigo-500/10',
+          },
+          {
+            label: 'Epics Tracked',
+            value: totalEpics,
+            sub: `${rtmStats.totalReqs} user ${rtmStats.totalReqs === 1 ? 'story' : 'stories'}`,
+            icon: BarChart2,
+            iconColor: 'text-blue-400',
+            iconBg: 'bg-blue-500/10',
+          },
+        ];
+
+        return (
+          <div className="space-y-6 animate-fade-in">
+
+            {/* ── Insight KPI Cards ─────────────────────────────── */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              {insightCards.map((card, i) => {
+                const Icon = card.icon;
+                return (
+                  <div
+                    key={i}
+                    className={`flex items-center justify-between p-4 rounded-xl border transition-colors ${
+                      darkMode
+                        ? 'bg-[#161B22] border-[#30363D] hover:border-[#484F58]'
+                        : 'bg-white border-[#DFE1E6] hover:border-[#C1C7D0] shadow-sm'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <p className={`text-xs font-medium mb-0.5 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>
+                        {card.label}
+                      </p>
+                      <p className={`text-2xl font-bold leading-none mb-1 ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>
+                        {card.value}
+                      </p>
+                      <p className={`text-[10px] truncate ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>
+                        {card.sub}
+                      </p>
+                    </div>
+                    <div className={`flex-shrink-0 p-3 rounded-full ${card.iconBg}`}>
+                      <Icon className={`w-5 h-5 ${card.iconColor}`} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* ── Main 2-column layout ─────────────────────────── */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+              {/* Left: Epic Stacked Bar Chart — spans 2 cols */}
+              <div className={`lg:col-span-2 rounded-xl border p-6 transition-colors ${
+                darkMode ? 'bg-[#161B22] border-[#30363D]' : 'bg-white border-[#DFE1E6] shadow-sm'
+              }`}>
+                <div className="flex items-center justify-between mb-6">
+                  <div>
+                    <h3 className={`text-base font-bold flex items-center gap-2 ${
+                      darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'
+                    }`}>
+                      <BarChart2 className="w-4 h-4 text-indigo-400" />
+                      Scenario Coverage by Epic
+                    </h3>
+                    <p className={`text-xs mt-0.5 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>
+                      Live · updates on every PR run
+                    </p>
+                  </div>
+                  <div className={`flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full ${
+                    darkMode ? 'bg-[#1C2333] text-[#3FB950]' : 'bg-[#E3FCEF] text-[#00875A]'
+                  }`}>
+                    <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${
+                      darkMode ? 'bg-[#3FB950]' : 'bg-[#00875A]'
+                    }`} />
+                    Live
+                  </div>
+                </div>
+                <EpicStackedChart
+                  epicMetrics={epicMetrics}
+                  darkMode={darkMode}
+                  onEpicClick={() => setActiveTab('rtm')}
+                />
+              </div>
+
+              {/* Right column: Last Run + Coverage */}
+              <div className="space-y-4">
+
+
+                {/* Last run summary card */}
+                {lastRun && (
+                  <div className={`rounded-xl border p-5 transition-colors ${
+                    darkMode ? 'bg-[#161B22] border-[#30363D]' : 'bg-white border-[#DFE1E6] shadow-sm'
+                  }`}>
+                    <h3 className={`text-sm font-bold mb-3 ${
+                      darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'
+                    }`}>Last Pipeline Run</h3>
+                    <div className="flex items-center gap-2 mb-3">
+                      {lastRunStatus === 'completed'
+                        ? <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                        : lastRunStatus === 'failed' || lastRunStatus === 'error'
+                          ? <XCircle className="w-4 h-4 text-red-400" />
+                          : <Loader className="w-4 h-4 text-blue-400 animate-spin" />}
+                      <span className={`text-xs font-semibold ${
+                        lastRunStatus === 'completed' ? (darkMode ? 'text-[#3FB950]' : 'text-[#00875A]') :
+                        lastRunStatus === 'failed' || lastRunStatus === 'error' ? (darkMode ? 'text-[#F85149]' : 'text-[#C9372C]') :
+                        (darkMode ? 'text-[#58A6FF]' : 'text-[#0C66E4]')
+                      }`}>
+                        {lastRunStatus === 'completed' ? 'Passed' : lastRunStatus === 'failed' || lastRunStatus === 'error' ? 'Failed' : 'Running'}
+                      </span>
+                      <span className={`text-[10px] font-mono ml-auto ${
+                        darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'
+                      }`}>#{lastRun.runId.substring(0, 8)}</span>
+                    </div>
+                    <p className={`text-[10px] mb-3 ${
+                      darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'
+                    }`}>
+                      {new Date(lastRun.createdAt || Date.now()).toLocaleString()}
+                    </p>
+                    <button
+                      onClick={() => navigate(`/projects/${projectId}/run/${lastRun.runId}/scripts`)}
+                      className="w-full text-center text-xs font-medium px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white transition-colors"
+                    >
+                      View Run Details
+                    </button>
+                  </div>
+                )}
+
+                {/* Coverage ring summary card */}
+                <div className={`rounded-xl border p-5 transition-colors ${
+                  darkMode ? 'bg-gradient-to-br from-[#161B22] to-[#1C2333] border-[#30363D]' : 'bg-gradient-to-br from-[#0C66E4] to-[#0747A6] border-transparent shadow-lg'
+                }`}>
+                  <p className={`text-xs font-semibold uppercase tracking-wider mb-1 ${
+                    darkMode ? 'text-[#8B949E]' : 'text-white/70'
+                  }`}>Feature Coverage</p>
+                  <p className={`text-4xl font-extrabold mb-1 ${
+                    darkMode ? 'text-[#E6EDF3]' : 'text-white'
+                  }`}>{rtmStats.coverage}%</p>
+                  <p className={`text-xs ${
+                    darkMode ? 'text-[#6E7681]' : 'text-white/80'
+                  }`}>
+                    {rtmStats.testedScenarios} of {rtmStats.totalScenarios} scenarios tested
+                  </p>
+                  {/* Mini progress bar */}
+                  <div className={`mt-3 h-1.5 rounded-full overflow-hidden ${
+                    darkMode ? 'bg-[#30363D]' : 'bg-white/25'
+                  }`}>
+                    <div
+                      className={`h-full rounded-full transition-all duration-700 ${
+                        darkMode ? 'bg-gradient-to-r from-emerald-500 to-green-400' : 'bg-white'
+                      }`}
+                      style={{ width: `${rtmStats.coverage}%` }}
+                    />
+                  </div>
+                </div>
+
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* RTM View */}
       {activeTab === 'rtm' && (
