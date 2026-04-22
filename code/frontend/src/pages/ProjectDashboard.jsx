@@ -478,139 +478,147 @@ function ProjectDashboard() {
                             const totalTestCases = reqScenarios.reduce((n, s) => n + (s.testCases?.length || 0), 0);
                             const passedTestCases = reqScenarios.reduce((n, s) => n + (s.testCases?.filter(tc => tc.status === 'pass').length || 0), 0);
                             const failedTestCases = reqScenarios.reduce((n, s) => n + (s.testCases?.filter(tc => tc.status === 'fail').length || 0), 0);
-                            return (
-                              <tr key={req.reqId} className="hover:bg-[#F1F2F4]/10 transition-colors group">
-                                <td className="px-6 py-4 align-top w-1/4 border-r border-[#DFE1E6]">
-                                    <div className="font-semibold text-[#172B4D] mb-1">{req.reqId}</div>
-                                    <div className="text-sm text-[#5E6C84] line-clamp-3">{req.description}</div>
-                                    {req.lastSyncedAt && (
-                                      <span className="inline-flex mt-2 px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 text-[10px] font-medium rounded text-indigo-300" title={`Last synced: ${new Date(req.lastSyncedAt).toLocaleString()}`}>
-                                        Synced {new Date(req.lastSyncedAt).toLocaleDateString()}
-                                      </span>
-                                    )}
-                                </td>
-                                <td className="px-6 py-4">
-                                    {reqScenarios.length > 0 ? (
-                                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                                            {reqScenarios.map(scen => {
-                                                const typeBadge = {
-                                                  'Happy Path': 'bg-green-500/15 border-green-500/30 text-[#00875A]',
-                                                  'Negative':   'bg-red-500/15 border-red-500/30 text-[#C9372C]',
-                                                  'Edge Case':  'bg-amber-500/15 border-amber-500/30 text-[#B65C00]',
-                                                  'Boundary':   'bg-orange-500/15 border-orange-500/30 text-orange-300',
-                                                }[scen.type] || 'bg-gray-500/15 border-gray-500/30 text-[#5E6C84]';
 
-                                                const isExpanded = !!expandedScenarios[scen.id];
-                                                const tcs = scen.testCases || [];
-                                                const tcPass = tcs.filter(tc => tc.status === 'pass').length;
-                                                const tcFail = tcs.filter(tc => tc.status === 'fail').length;
-
-                                                return (
-                                                  <div key={scen.id} className="flex flex-col">
-                                                    {/* Scenario Card */}
-                                                    <div 
-                                                      onClick={() => openScenarioDetails(scen)}
-                                                      className="bg-[#FFFFFF] hover:bg-[#F1F2F4] cursor-pointer transition p-3 rounded border border-[#DFE1E6] flex flex-col group/card"
-                                                    >
-                                                      <div className="flex justify-between items-start mb-2">
-                                                          <span className="text-xs font-mono text-indigo-400 truncate pr-2" title={scen.id}>{scen.id}</span>
-                                                          <div className="flex items-center flex-shrink-0">
-                                                              {scen.execStatus === 'pass' && <div className="w-2 h-2 rounded-full bg-green-500 mr-1 shadow-[0_0_8px_rgba(34,197,94,0.8)]" />}
-                                                              {scen.execStatus === 'fail' && <div className="w-2 h-2 rounded-full bg-red-500 mr-1 shadow-[0_0_8px_rgba(239,68,68,0.8)]" />}
-                                                              {(!scen.execStatus || scen.execStatus === 'pending') && <div className="w-2 h-2 rounded-full bg-yellow-500 mr-1 shadow-[0_0_5px_rgba(234,179,8,0.5)]" />}
-                                                          </div>
-                                                      </div>
-                                                      <span className={`self-start text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border mb-2 ${typeBadge}`}>
-                                                        {scen.type || 'Scenario'}
-                                                      </span>
-                                                      <p className="text-xs text-[#5E6C84] line-clamp-3 mb-2">{scen.description}</p>
-                                                      <div className="mt-auto flex justify-between items-center">
-                                                          <div className="flex items-center gap-2">
-                                                              {tcs.length > 0 && (
-                                                                <button
-                                                                  onClick={(e) => toggleScenarioExpand(scen.id, e)}
-                                                                  className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-indigo-500/10 border border-indigo-500/30 rounded text-indigo-300 hover:bg-indigo-500/20 transition-colors"
-                                                                  title={isExpanded ? 'Collapse test cases' : 'Expand test cases'}
-                                                                >
-                                                                  <ListChecks className="w-3 h-3" />
-                                                                  {tcs.length} case{tcs.length !== 1 ? 's' : ''}
-                                                                  {isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-                                                                </button>
-                                                              )}
-                                                              {tcs.length === 0 && (
-                                                                <span className="text-[10px] text-[#8993A4] italic">No test cases</span>
-                                                              )}
-                                                          </div>
-                                                          <ChevronRight className="w-4 h-4 text-[#8993A4] group-hover/card:text-indigo-400 transition-colors" />
-                                                      </div>
-                                                    </div>
-
-                                                    {/* Expandable Test Cases */}
-                                                    {isExpanded && tcs.length > 0 && (
-                                                      <div className="mt-1 ml-2 border-l-2 border-indigo-500/30 pl-2 space-y-1">
-                                                        {tcs.map(tc => {
-                                                          const tcStatusColor = tc.status === 'pass'
-                                                            ? 'bg-green-500/10 border-green-500/30 text-[#00875A] hover:bg-green-500/20'
-                                                            : tc.status === 'fail'
-                                                            ? 'bg-red-500/10 border-red-500/30 text-[#C9372C] hover:bg-red-500/20'
-                                                            : 'bg-[#DFE1E6]/30 border-[#C1C7D0]/30 text-[#5E6C84] hover:bg-[#DFE1E6]/50';
-
-                                                          return (
-                                                            <div
-                                                              key={tc.testCaseId}
-                                                              onClick={() => openTestCaseDetails(tc, scen)}
-                                                              className={`cursor-pointer p-2 rounded border transition-colors ${tcStatusColor}`}
-                                                            >
-                                                              <div className="flex items-center justify-between">
-                                                                <span className="text-[10px] font-mono truncate pr-1">{tc.testCaseId}</span>
-                                                                <div className="flex items-center gap-1 flex-shrink-0">
-                                                                  {tc.version > 1 && (
-                                                                    <span className="text-[9px] px-1 bg-blue-500/20 text-blue-300 rounded border border-blue-500/30">v{tc.version}</span>
-                                                                  )}
-                                                                  {tc.status === 'pass' && <CheckCircle2 className="w-3 h-3 text-[#00875A]" />}
-                                                                  {tc.status === 'fail' && <XCircle className="w-3 h-3 text-[#C9372C]" />}
-                                                                  {(!tc.status || tc.status === 'pending') && <Clock className="w-3 h-3 text-yellow-400" />}
-                                                                  <ChevronRight className="w-3 h-3 opacity-60" />
-                                                                </div>
-                                                              </div>
-                                                              <p className="text-[10px] mt-0.5 opacity-80 line-clamp-1">{tc.title}</p>
-                                                            </div>
-                                                          );
-                                                        })}
-                                                      </div>
-                                                    )}
-                                                  </div>
-                                                );
-                                            })}
-                                        </div>
-                                    ) : (
-                                        <div className="text-sm text-[#8993A4] italic py-6 text-center bg-[#F1F2F4]/30 rounded border border-dashed border-[#C1C7D0]">No scenarios generated yet.</div>
-                                    )}
-                                </td>
-                                <td className="px-6 py-4 align-top w-[160px] border-l border-[#DFE1E6]">
-                                    {totalTestCases > 0 ? (
-                                      <div className="space-y-1.5">
-                                        <span className="inline-flex items-center gap-1 px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 text-xs font-medium rounded text-indigo-300 w-full justify-center">
-                                          <ListChecks className="w-3 h-3" /> {totalTestCases} test case{totalTestCases !== 1 ? 's' : ''}
+                            if (reqScenarios.length === 0) {
+                              return (
+                                <tr key={req.reqId} className="hover:bg-[#F1F2F4]/10 transition-colors group">
+                                  <td className="px-3 py-2 align-top w-1/4 border-r border-[#DFE1E6]">
+                                      <div className="font-semibold text-[#172B4D] mb-1">{req.reqId}</div>
+                                      <div className="text-sm text-[#5E6C84] line-clamp-3">{req.description}</div>
+                                      {req.lastSyncedAt && (
+                                        <span className="inline-flex mt-2 px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 text-[10px] font-medium rounded text-indigo-300" title={`Last synced: ${new Date(req.lastSyncedAt).toLocaleString()}`}>
+                                          Synced {new Date(req.lastSyncedAt).toLocaleDateString()}
                                         </span>
-                                        {passedTestCases > 0 && (
-                                          <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-500/10 border border-green-500/20 text-[10px] font-medium rounded text-[#00875A] w-full justify-center">
-                                            <CheckCircle2 className="w-3 h-3" /> {passedTestCases}/{totalTestCases} passed
-                                          </span>
-                                        )}
-                                        {failedTestCases > 0 && (
-                                          <span className="inline-flex items-center gap-1 px-2 py-1 bg-red-500/10 border border-red-500/20 text-[10px] font-medium rounded text-[#C9372C] w-full justify-center">
-                                            <XCircle className="w-3 h-3" /> {failedTestCases} failed
-                                          </span>
-                                        )}
+                                      )}
+                                      <div className="mt-2">
+                                        <span className="inline-flex items-center gap-1 px-2 py-1 bg-[#DFE1E6]/30 border border-[#DFE1E6] text-xs font-medium rounded text-[#8993A4]">
+                                          <Clock className="w-3 h-3" /> Awaiting PR
+                                        </span>
                                       </div>
-                                    ) : (
-                                      <span className="inline-flex items-center gap-1 px-2 py-1 bg-[#DFE1E6]/30 border border-[#DFE1E6] text-xs font-medium rounded text-[#8993A4]">
-                                        <Clock className="w-3 h-3" /> Awaiting PR
-                                      </span>
-                                    )}
-                                </td>
-                              </tr>
+                                  </td>
+                                  <td colSpan={2} className="px-3 py-2">
+                                      <div className="text-sm text-[#8993A4] italic py-3 text-center bg-[#F1F2F4]/30 rounded border border-dashed border-[#C1C7D0]">No scenarios generated yet.</div>
+                                  </td>
+                                </tr>
+                              );
+                            }
+
+                            return (
+                              <React.Fragment key={req.reqId}>
+                                {reqScenarios.map((scen, index) => {
+                                  const typeBadge = {
+                                    'Happy Path': 'bg-green-500/15 border-green-500/30 text-[#00875A]',
+                                    'Negative':   'bg-red-500/15 border-red-500/30 text-[#C9372C]',
+                                    'Edge Case':  'bg-amber-500/15 border-amber-500/30 text-[#B65C00]',
+                                    'Boundary':   'bg-orange-500/15 border-orange-500/30 text-orange-300',
+                                  }[scen.type] || 'bg-gray-500/15 border-gray-500/30 text-[#5E6C84]';
+
+                                  const tcs = scen.testCases || [];
+
+                                  return (
+                                    <tr key={scen.id} className="hover:bg-[#F1F2F4]/10 transition-colors group border-b border-[#DFE1E6]/50">
+                                      {index === 0 && (
+                                        <td rowSpan={reqScenarios.length} className={`px-3 py-2 align-top w-1/4 border-r ${darkMode ? 'border-[#30363D]' : 'border-[#DFE1E6]'}`}>
+                                          <div className={`font-semibold mb-1 ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>{req.reqId}</div>
+                                          <div className={`text-sm line-clamp-3 mb-2 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>{req.description}</div>
+                                          
+                                          {/* Trace Metrics moved to the Req column */}
+                                          <div className="space-y-1 mb-1.5">
+                                            <span className="inline-flex items-center gap-1 px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 text-xs font-medium rounded text-indigo-300 w-full justify-center">
+                                              <ListChecks className="w-3 h-3" /> {totalTestCases} test case{totalTestCases !== 1 ? 's' : ''}
+                                            </span>
+                                            {passedTestCases > 0 && (
+                                              <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-500/10 border border-green-500/20 text-[10px] font-medium rounded text-[#00875A] w-full justify-center">
+                                                <CheckCircle2 className="w-3 h-3" /> {passedTestCases}/{totalTestCases} passed
+                                              </span>
+                                            )}
+                                            {failedTestCases > 0 && (
+                                              <span className="inline-flex items-center gap-1 px-2 py-1 bg-red-500/10 border border-red-500/20 text-[10px] font-medium rounded text-[#C9372C] w-full justify-center">
+                                                <XCircle className="w-3 h-3" /> {failedTestCases} failed
+                                              </span>
+                                            )}
+                                          </div>
+                                          
+                                          {req.lastSyncedAt && (
+                                            <span className={`inline-flex px-2 py-1 text-[10px] font-medium rounded border ${darkMode ? 'bg-[rgba(56,139,253,0.1)] border-[rgba(56,139,253,0.3)] text-[#58A6FF]' : 'bg-indigo-500/10 border-indigo-500/20 text-indigo-300'}`} title={`Last synced: ${new Date(req.lastSyncedAt).toLocaleString()}`}>
+                                              Synced {new Date(req.lastSyncedAt).toLocaleDateString()}
+                                            </span>
+                                          )}
+                                        </td>
+                                      )}
+                                      
+                                      <td className={`px-3 py-2 align-top w-[35%] border-r ${darkMode ? 'border-[#30363D]' : 'border-[#DFE1E6]'}`}>
+                                        <div 
+                                          onClick={() => openScenarioDetails(scen)}
+                                          className={`p-2 rounded border transition cursor-pointer flex flex-col group/card h-full ${
+                                            darkMode 
+                                              ? 'bg-[#1C2333] border-[#30363D] hover:bg-[#242C3D]' 
+                                              : 'bg-[#FFFFFF] hover:bg-[#F1F2F4] border-[#DFE1E6]'
+                                          }`}
+                                        >
+                                          <div className="flex justify-between items-start mb-1.5">
+                                              <span className={`text-xs font-mono truncate pr-2 ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-600'}`} title={scen.id}>{scen.id}</span>
+                                              <div className="flex items-center flex-shrink-0">
+                                                  {scen.execStatus === 'pass' && <div className="w-2 h-2 rounded-full bg-green-500 mr-1 shadow-[0_0_8px_rgba(34,197,94,0.8)]" />}
+                                                  {scen.execStatus === 'fail' && <div className="w-2 h-2 rounded-full bg-red-500 mr-1 shadow-[0_0_8px_rgba(239,68,68,0.8)]" />}
+                                                  {(!scen.execStatus || scen.execStatus === 'pending') && <div className="w-2 h-2 rounded-full bg-yellow-500 mr-1 shadow-[0_0_5px_rgba(234,179,8,0.5)]" />}
+                                              </div>
+                                          </div>
+                                          <span className={`self-start text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border mb-1.5 ${typeBadge}`}>
+                                            {scen.type || 'Scenario'}
+                                          </span>
+                                          <p className={`text-xs mb-1.5 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>{scen.description}</p>
+                                          
+                                          <div className="mt-auto flex justify-between items-center pt-1">
+                                              <span className={`text-[10px] font-medium ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>
+                                                  {tcs.length} cases
+                                              </span>
+                                              <ChevronRight className={`w-4 h-4 transition-colors ${darkMode ? 'text-[#484F58] group-hover/card:text-[#58A6FF]' : 'text-[#8993A4] group-hover/card:text-indigo-500'}`} />
+                                          </div>
+                                        </div>
+                                      </td>
+                                      
+                                      <td className="px-3 py-2 align-top w-[40%]">
+                                        {tcs.length > 0 ? (
+                                          <div className="space-y-1">
+                                            {tcs.map(tc => {
+                                              const tcStatusColor = tc.status === 'pass'
+                                                ? (darkMode ? 'bg-[rgba(63,185,80,0.1)] border-[rgba(63,185,80,0.3)] text-[#3FB950] hover:bg-[rgba(63,185,80,0.15)]' : 'bg-green-500/10 border-green-500/30 text-[#00875A] hover:bg-green-500/20')
+                                                : tc.status === 'fail'
+                                                ? (darkMode ? 'bg-[rgba(248,81,73,0.1)] border-[rgba(248,81,73,0.3)] text-[#F85149] hover:bg-[rgba(248,81,73,0.15)]' : 'bg-red-500/10 border-red-500/30 text-[#C9372C] hover:bg-red-500/20')
+                                                : (darkMode ? 'bg-[#30363D]/50 border-[#484F58]/50 text-[#8B949E] hover:bg-[#30363D]' : 'bg-[#DFE1E6]/30 border-[#C1C7D0]/30 text-[#5E6C84] hover:bg-[#DFE1E6]/50');
+
+                                              return (
+                                                <div
+                                                  key={tc.testCaseId}
+                                                  onClick={() => openTestCaseDetails(tc, scen)}
+                                                  className={`cursor-pointer p-1.5 rounded border transition-colors ${tcStatusColor}`}
+                                                >
+                                                  <div className="flex items-center justify-between mb-0.5">
+                                                    <span className="text-[10px] font-mono truncate pr-1">{tc.testCaseId}</span>
+                                                    <div className="flex items-center gap-1 flex-shrink-0">
+                                                      {tc.version > 1 && (
+                                                        <span className={`text-[9px] px-1.5 rounded border ${darkMode ? 'bg-[rgba(56,139,253,0.1)] text-[#58A6FF] border-[#58A6FF]/30' : 'bg-blue-500/10 text-blue-600 border-blue-500/20'}`}>v{tc.version}</span>
+                                                      )}
+                                                      {tc.status === 'pass' && <CheckCircle2 className={`w-3 h-3 ${darkMode ? 'text-[#3FB950]' : 'text-[#00875A]'}`} />}
+                                                      {tc.status === 'fail' && <XCircle className={`w-3 h-3 ${darkMode ? 'text-[#F85149]' : 'text-[#C9372C]'}`} />}
+                                                      {(!tc.status || tc.status === 'pending') && <Clock className="w-3 h-3 text-yellow-500" />}
+                                                      <ChevronRight className="w-3 h-3 opacity-50" />
+                                                    </div>
+                                                  </div>
+                                                  <p className="text-xs opacity-90 line-clamp-2">{tc.title}</p>
+                                                </div>
+                                              );
+                                            })}
+                                          </div>
+                                        ) : (
+                                          <span className={`text-xs italic ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>No test cases generated</span>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </React.Fragment>
                             );
                           })}
                         </React.Fragment>

@@ -1,5 +1,5 @@
 const { fetchPRDetails, fetchFullFileContents, inferTestFilePaths, fetchPRDependencies } = require('./services/githubService');
-const { cleanupSandbox, createSandbox, executeTest } = require('./services/sandboxService');
+const { cleanupSandboxPool, createSandboxPool, executeTest } = require('./services/sandboxService');
 const { findProjectByGithubRepo } = require('./services/projectStore');
 const { getDocsForProject } = require('./services/documentAssociationStore');
 const { extractTextFromFiles } = require('./services/documentParserService');
@@ -151,6 +151,40 @@ function detectRefinementCandidates(repoFullName, prChangedFilenames) {
     return existingTestCases
         .filter(tc => (Array.isArray(tc.codeFiles) ? tc.codeFiles : []).some(f => prFileSet.has(f)))
         .map(tc => ({ testCase: tc, scenarioId: tc.scenarioId }));
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent Sandbox Pool Execution Queue
+// ---------------------------------------------------------------------------
+async function executeWithPool(tasks, pool, executeFn) {
+    if (!pool || pool.length === 0) throw new Error('No containers in pool');
+    const availableContainers = [...pool];
+    const executing = [];
+
+    for (const task of tasks) {
+        const processTask = async (taskItem) => {
+            while (availableContainers.length === 0) {
+                await new Promise(r => setTimeout(r, 50));
+            }
+            const container = availableContainers.pop();
+            try {
+                await executeFn(taskItem, container);
+            } finally {
+                availableContainers.push(container);
+            }
+        };
+
+        const p = processTask(task).then(() => {
+            executing.splice(executing.indexOf(p), 1);
+        });
+        executing.push(p);
+
+        if (executing.length >= pool.length) {
+            await Promise.race(executing);
+        }
+    }
+
+    await Promise.all(executing);
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +429,7 @@ async function executeTestCaseWithRetries({
 // ---------------------------------------------------------------------------
 async function runEpicRegression({
     runId, prUrl, mappedScenarios, linkedProject, prDetails,
-    codeContextSection, containerName, sandboxDir, sendEvent, runSummary
+    codeContextSection, sandboxPool, sendEvent, runSummary
 }) {
     // 1. Resolve which epic(s) the PR touches via the mapped scenarios.
     const projectKey = linkedProject?.jiraProjectKey || linkedProject?.id;
@@ -467,12 +501,15 @@ async function runEpicRegression({
         testCaseCount:   totalTestCases
     });
 
-    // 4. Execute every test case against the PR's code, letting healing run but
-    //    stamping 'adapted' if the script had to change to pass.
+    // 4. Execute every test case against the PR's code concurrently in pool
     let overallSuccess = false;
     sendEvent('phase_update', { phase: 'Regression Execution', status: 'running' });
 
+    const scenarioResults = {};
+    const allTasks = [];
+
     for (const { scenario, testCases } of scenarioPlans) {
+        scenarioResults[scenario.scenarioId] = { passed: 0, failed: 0 };
         sendEvent('scenario_execution_updated', {
             scenarioId: scenario.scenarioId,
             status: 'running',
@@ -480,46 +517,56 @@ async function runEpicRegression({
         });
         sendEvent('log', { level: 'INFO', message: `[Regression] Scenario ${scenario.scenarioId}: running ${testCases.length} existing test case(s)` });
 
-        let scenarioPassed = 0;
-        let scenarioFailed = 0;
-
         for (const tc of testCases) {
-            // Stamp runId/prUrl for this run's bookkeeping without losing the original
-            // generation runId on the stored row (upsertTestCase only updates the
-            // columns explicitly listed in its ON CONFLICT clause, and runId isn't one).
-            const runnable = { ...tc, runId, prUrl };
+            allTasks.push({ scenario, tc });
+        }
+    }
 
-            const tcStatus = await executeTestCaseWithRetries({
-                testCase: runnable,
-                containerName,
-                sandboxDir,
-                runId,
-                prUrl,
-                codeContextSection,
-                linkedProject,
-                refinementCandidates: [],
-                sendEvent,
-                runSummary,
-                regressionMode: true,
-                scenarioDescription: scenario.description || ''
-            });
+    await executeWithPool(allTasks, sandboxPool, async (task, container) => {
+        const { scenario, tc } = task;
+        const runnable = { ...tc, runId, prUrl };
 
-            if (tcStatus === 'pass') {
-                scenarioPassed++;
-                overallSuccess = true;
-            } else {
-                scenarioFailed++;
-            }
+        const tcStatus = await executeTestCaseWithRetries({
+            testCase: runnable,
+            containerName: container.containerName,
+            sandboxDir: container.sandboxDir,
+            runId,
+            prUrl,
+            codeContextSection,
+            linkedProject,
+            refinementCandidates: [],
+            sendEvent,
+            runSummary,
+            regressionMode: true,
+            scenarioDescription: scenario.description || ''
+        });
+
+        if (tcStatus === 'pass') {
+            scenarioResults[scenario.scenarioId].passed++;
+            overallSuccess = true;
+        } else {
+            scenarioResults[scenario.scenarioId].failed++;
         }
 
-        const scenarioStatus = scenarioFailed === 0 ? 'pass'
-            : scenarioPassed === 0 ? 'fail'
+        const { passed, failed } = scenarioResults[scenario.scenarioId];
+        sendEvent('scenario_execution_updated', {
+            scenarioId: scenario.scenarioId,
+            status: failed === 0 ? 'running' : 'partial', // Interim status
+            totals: { passed, failed, running: 0 }
+        });
+    });
+
+    // Finalize statuses
+    for (const { scenario } of scenarioPlans) {
+        const { passed, failed } = scenarioResults[scenario.scenarioId];
+        const scenarioStatus = failed === 0 ? 'pass'
+            : passed === 0 ? 'fail'
             : 'partial';
 
         sendEvent('scenario_execution_updated', {
             scenarioId: scenario.scenarioId,
-            status:     scenarioStatus,
-            totals:     { passed: scenarioPassed, failed: scenarioFailed, running: 0 }
+            status: scenarioStatus,
+            totals: { passed, failed, running: 0 }
         });
     }
 
@@ -549,8 +596,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
     const emitSummary = () => sendEvent('run_summary_updated', { runId, ...runSummary });
 
-    // Declared here so the catch block can always clean up the container.
-    let _sandboxContainerName = null;
+    // Declared here so the catch block can always clean up the pool.
+    let _sandboxPool = null;
 
     try {
         // Phase 1: Initializing
@@ -631,17 +678,17 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // --- Sandbox task (async) ---
         const sandboxTask = (async () => {
             sendEvent('phase_update', { phase: 'Sandbox Setup', status: 'running' });
-            const sb = await createSandbox(runId, prDetails);
-            sendEvent('log', { level: 'INFO', message: `[Sandbox] Container ready: ${sb.containerName}` });
+            // Spin up a pool of 2 Docker containers for parallel testing
+            const pool = await createSandboxPool(runId, prDetails, 2);
+            sendEvent('log', { level: 'INFO', message: `[Sandbox] Created pool of ${pool.length} containers` });
             sendEvent('phase_update', { phase: 'Sandbox Setup', status: 'completed' });
-            return sb;
+            return pool;
         })();
 
-        // Wait for all three to finish.
-        const [classification, codeContext, { sandboxDir, containerName }] = await Promise.all([
-            classifyTask, codeContextTask, sandboxTask
+        // Wait for classification and context. Do NOT wait for sandbox setup here!
+        const [classification, codeContext] = await Promise.all([
+            classifyTask, codeContextTask
         ]);
-        _sandboxContainerName = containerName;
 
         // Build single concatenated context string for LLM prompts
         const codeContextSection = [
@@ -671,8 +718,11 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // normal generation loop.
         // ------------------------------------------------------------------
         if (regressionFeatureEnabled && classification.isBugFix) {
-            sendEvent('log', { level: 'INFO', message: '[Pipeline] Entering epic-wide regression path (bug fix PR).' });
+            sendEvent('log', { level: 'INFO', message: '[Pipeline] Entering epic-wide regression path (bug fix PR). Waiting for sandbox pool...' });
             sendEvent('phase_update', { phase: 'Test Generation', status: 'skipped' });
+
+            const sandboxPool = await sandboxTask;
+            _sandboxPool = sandboxPool;
 
             const regressionResult = await runEpicRegression({
                 runId,
@@ -681,8 +731,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 linkedProject,
                 prDetails,
                 codeContextSection,
-                containerName,
-                sandboxDir,
+                sandboxPool,
                 sendEvent,
                 runSummary
             });
@@ -697,7 +746,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
             sendEvent('phase_update', { phase: 'Pass', status: overallSuccess ? 'completed' : 'failed' });
 
             emitSummary();
-            cleanupSandbox(runId, containerName);
+            cleanupSandboxPool(runId, sandboxPool);
             sendEvent('complete', { success: overallSuccess });
             return;
         }
@@ -705,8 +754,81 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // ------------------------------------------------------------------
         // Standard path: non-bug-fix PR — generate new test cases per scenario.
         // ------------------------------------------------------------------
-        // Phase 4: Test Generation
+        // Phase 4 & 5: Pipelined Test Generation & Sandbox Execution
         sendEvent('phase_update', { phase: 'Test Generation', status: 'running' });
+        sendEvent('phase_update', { phase: 'Sandbox Testing', status: 'running' });
+
+        const executionQueue = [];
+        let isGenerationFinished = false;
+        const scenarioResults = {};
+        
+        for (const m of mappedScenarios) {
+            scenarioResults[m.id || m.scenarioId] = { passed: 0, failed: 0 };
+        }
+
+        // ------------------------------------------------------------------
+        // Background Executor: Pulls generated test cases from the queue as 
+        // soon as they are ready, provided the sandbox pool has finished starting.
+        // ------------------------------------------------------------------
+        const executionTaskPromise = (async () => {
+            const sandboxPool = await sandboxTask;
+            _sandboxPool = sandboxPool;
+            const availableContainers = [...sandboxPool];
+            const executing = [];
+
+            while (!isGenerationFinished || executionQueue.length > 0 || executing.length > 0) {
+                if (executionQueue.length === 0 || availableContainers.length === 0) {
+                    await new Promise(r => setTimeout(r, 50));
+                    continue;
+                }
+
+                const taskItem = executionQueue.shift();
+                const container = availableContainers.pop();
+
+                const p = (async () => {
+                    const { scenarioId, scenarioDescription, tc } = taskItem;
+                    try {
+                        const tcStatus = await executeTestCaseWithRetries({
+                            testCase: tc,
+                            containerName: container.containerName,
+                            sandboxDir: container.sandboxDir,
+                            runId,
+                            prUrl,
+                            codeContextSection,
+                            linkedProject,
+                            refinementCandidates,
+                            sendEvent,
+                            runSummary,
+                            scenarioDescription
+                        });
+
+                        if (tcStatus === 'pass') {
+                            scenarioResults[scenarioId].passed++;
+                            overallSuccess = true;
+                        } else {
+                            scenarioResults[scenarioId].failed++;
+                        }
+                        emitSummary();
+
+                        const { passed, failed } = scenarioResults[scenarioId];
+                        sendEvent('scenario_execution_updated', {
+                            scenarioId,
+                            status: failed === 0 ? 'running' : 'partial', // Interim status
+                            totals: { passed, failed, running: 0 }
+                        });
+                    } finally {
+                        availableContainers.push(container);
+                        executing.splice(executing.indexOf(p), 1);
+                    }
+                })();
+                
+                // Clear out from executing array when done
+                p.finally(() => {
+                    executing.splice(executing.indexOf(p), 1);
+                });
+                executing.push(p);
+            }
+        })();
 
         // Map over all scenarios and run LLM generation in parallel
         const generationPromises = mappedScenarios.map(async (scenarioMapping) => {
@@ -805,6 +927,9 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 };
                 upsertTestCase(saved);
                 persistedCases.push(saved);
+                
+                // Pipeline to background executor!
+                executionQueue.push({ scenarioId, scenarioDescription, tc: saved });
             }
 
             // Emit detail event so View Details shows generated cases immediately
@@ -819,50 +944,25 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
         // Wait for all scenarios to finish generating in parallel
         const generatedResults = (await Promise.all(generationPromises)).filter(Boolean);
+        
+        // Signal that no more test cases will be queued
+        isGenerationFinished = true;
+        sendEvent('phase_update', { phase: 'Test Generation', status: 'completed' });
 
-        // Phase 5: Sandbox execution with stateful retry per test case
-        sendEvent('phase_update', { phase: 'Sandbox Testing', status: 'running' });
+        // Wait for the background executor to finish the remaining queue and all active executions
+        await executionTaskPromise;
 
-        // Run sandbox execution sequentially to avoid file I/O race conditions in the container
+        // Finalize statuses for Phase 5
         for (const result of generatedResults) {
-            const { scenarioId, persistedCases, scenarioDescription } = result;
-
-            let scenarioPassed = 0;
-            let scenarioFailed = 0;
-
-            for (const tc of persistedCases) {
-                const tcStatus = await executeTestCaseWithRetries({
-                    testCase: tc,
-                    containerName,
-                    sandboxDir,
-                    runId,
-                    prUrl,
-                    codeContextSection,
-                    linkedProject,
-                    refinementCandidates,
-                    sendEvent,
-                    runSummary,
-                    scenarioDescription
-                });
-
-                if (tcStatus === 'pass') {
-                    scenarioPassed++;
-                    overallSuccess = true;
-                } else {
-                    scenarioFailed++;
-                }
-
-                emitSummary();
-            }
-
-            const scenarioStatus = scenarioFailed === 0 ? 'pass'
-                : scenarioPassed === 0 ? 'fail'
+            const { passed, failed } = scenarioResults[result.scenarioId];
+            const scenarioStatus = failed === 0 && passed > 0 ? 'pass'
+                : passed === 0 ? 'fail'
                 : 'partial';
 
             sendEvent('scenario_execution_updated', {
-                scenarioId,
+                scenarioId: result.scenarioId,
                 status: scenarioStatus,
-                totals: { passed: scenarioPassed, failed: scenarioFailed, running: 0 }
+                totals: { passed, failed, running: 0 }
             });
         }
 
@@ -878,7 +978,9 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('phase_update', { phase: 'Pass', status: overallSuccess ? 'completed' : 'failed' });
 
         emitSummary();
-        cleanupSandbox(runId, containerName);
+        if (_sandboxPool) {
+            cleanupSandboxPool(runId, _sandboxPool);
+        }
         sendEvent('complete', { success: overallSuccess });
 
     } catch (error) {
@@ -889,7 +991,9 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('log', { level: 'ERROR', message: `Fatal Error: ${error.message}` });
         sendEvent('error', { message: error.message });
         sendEvent('complete', { success: false });
-        cleanupSandbox(runId, _sandboxContainerName);
+        if (_sandboxPool) {
+            cleanupSandboxPool(runId, _sandboxPool);
+        }
     }
 }
 

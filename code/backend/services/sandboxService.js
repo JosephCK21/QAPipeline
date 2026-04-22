@@ -132,107 +132,100 @@ async function dockerRun(args, timeoutMs = 120000) {
 // ---------------------------------------------------------------------------
 
 /**
- * Creates a sandbox directory, clones the repo, starts ONE persistent Docker
- * container for the run, and pre-installs the app's own dependencies.
+ * Creates a pool of sandbox directories, clones the repo into each, starts
+ * multiple persistent Docker containers for the run, and pre-installs dependencies.
  *
- * Returns { sandboxDir, containerName } — both are needed by executeTest and cleanupSandbox.
+ * Returns an array of { sandboxDir, containerName } objects.
  */
-async function createSandbox(runId, prDetails) {
-    const baseTmp = process.platform === 'win32' ? 'C:\\tmp' : '/tmp';
-    const sandboxDir = path.join(baseTmp, 'autoqa-sandbox', runId);
-    const containerName = `autoqa-sandbox-${runId}`;
+async function createSandboxPool(runId, prDetails, concurrency = 2) {
+    const createPromises = [];
 
-    await fs.mkdir(sandboxDir, { recursive: true });
+    for (let i = 1; i <= concurrency; i++) {
+        createPromises.push((async () => {
+            const baseTmp = process.platform === 'win32' ? 'C:\\tmp' : '/tmp';
+            const sandboxDir = path.join(baseTmp, 'autoqa-sandbox', `${runId}-${i}`);
+            const containerName = `autoqa-sandbox-${runId}-${i}`;
 
-    // -- Clone or flat-drop ------------------------------------------------
-    try {
-        if (prDetails.headRepoFullName && prDetails.headRef) {
-            let repoUrl = `https://github.com/${prDetails.headRepoFullName}.git`;
-            if (process.env.GITHUB_TOKEN) {
-                repoUrl = `https://${process.env.GITHUB_TOKEN}@github.com/${prDetails.headRepoFullName}.git`;
-            }
-            const timeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
-            // Use execPromise for git (no quoting issues — no inner shell)
-            await execPromise(
-                `git clone --depth 1 -b ${prDetails.headRef} "${repoUrl}" "${sandboxDir}"`,
-                { timeout: timeoutMs }
-            );
-            console.log(`[Sandbox] Cloned repo: ${prDetails.headRepoFullName} @ ${prDetails.headRef}`);
+            await fs.mkdir(sandboxDir, { recursive: true });
 
-            // Overlay mock data if present
-            await Promise.all((prDetails.files || []).map(async file => {
-                if (file.filename === 'mock_data.json') {
-                    await fs.writeFile(path.join(sandboxDir, 'mock_data.json'), file.content, 'utf8');
+            // -- Clone or flat-drop ------------------------------------------------
+            try {
+                if (prDetails.headRepoFullName && prDetails.headRef) {
+                    let repoUrl = `https://github.com/${prDetails.headRepoFullName}.git`;
+                    if (process.env.GITHUB_TOKEN) {
+                        repoUrl = `https://${process.env.GITHUB_TOKEN}@github.com/${prDetails.headRepoFullName}.git`;
+                    }
+                    const timeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
+                    await execPromise(
+                        `git clone --depth 1 -b ${prDetails.headRef} "${repoUrl}" "${sandboxDir}"`,
+                        { timeout: timeoutMs }
+                    );
+                    console.log(`[Sandbox] Cloned repo into pool ${i}`);
+
+                    // Overlay mock data if present
+                    await Promise.all((prDetails.files || []).map(async file => {
+                        if (file.filename === 'mock_data.json') {
+                            await fs.writeFile(path.join(sandboxDir, 'mock_data.json'), file.content, 'utf8');
+                        }
+                    }));
+                } else {
+                    await Promise.all((prDetails.files || []).map(async file => {
+                        const filePath = path.join(sandboxDir, path.basename(file.filename));
+                        await fs.writeFile(filePath, file.content, 'utf8');
+                    }));
                 }
-            }));
-        } else {
-            await Promise.all((prDetails.files || []).map(async file => {
-                const filePath = path.join(sandboxDir, path.basename(file.filename));
-                await fs.writeFile(filePath, file.content, 'utf8');
-            }));
-        }
-    } catch (err) {
-        console.error('[Sandbox] Clone failed, falling back to flat file drop:', err.message);
-        await Promise.all((prDetails.files || []).map(async file => {
-            const filePath = path.join(sandboxDir, path.basename(file.filename));
-            await fs.writeFile(filePath, file.content, 'utf8');
-        }));
+            } catch (err) {
+                console.error(`[Sandbox] Clone failed for pool ${i}, falling back to flat file drop:`, err.message);
+                await Promise.all((prDetails.files || []).map(async file => {
+                    const filePath = path.join(sandboxDir, path.basename(file.filename));
+                    await fs.writeFile(filePath, file.content, 'utf8');
+                }));
+            }
+
+            // -- Start ONE persistent container ------------------------------------
+            const volumeDir = sandboxDir.replace(/\\/g, '/');
+            const runTimeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
+            const installTimeoutMs = Math.max(runTimeoutMs, 300000);
+
+            try {
+                await execFilePromise('docker', ['rm', '-f', containerName]).catch(() => { });
+
+                await dockerRun([
+                    'run', '-d',
+                    '--name', containerName,
+                    '-v', `${volumeDir}:/app`,
+                    '-w', '/app',
+                    'node:20-slim',
+                    'tail', '-f', '/dev/null'
+                ], runTimeoutMs);
+
+                console.log(`[Sandbox] Container started: ${containerName}`);
+
+                const pkgJsonPath = path.join(sandboxDir, 'package.json');
+                if (fssync.existsSync(pkgJsonPath)) {
+                    await dockerRun([
+                        'exec', containerName,
+                        'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock'
+                    ], installTimeoutMs);
+                    console.log(`[Sandbox] Pre-installed app dependencies in ${containerName}.`);
+                }
+
+                await dockerRun([
+                    'exec', containerName,
+                    'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock',
+                    'jest', 'supertest', 'jest-environment-node'
+                ], installTimeoutMs);
+                console.log(`[Sandbox] Pre-installed jest in ${containerName}.`);
+            } catch (err) {
+                console.error(`[Sandbox] Container startup failed for ${containerName}:`, err.message);
+                throw err;
+            }
+
+            return { sandboxDir, containerName };
+        })());
     }
 
-    // -- Start ONE persistent container ------------------------------------
-    // Volume path: Docker on Windows accepts C:/... forward-slash form.
-    const volumeDir = sandboxDir.replace(/\\/g, '/');
-    const runTimeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
-    if (runTimeoutMs < 60000) {
-        console.warn(
-            `[Sandbox] SANDBOX_TIMEOUT_MS=${runTimeoutMs} is low; Jest/npm steps inside Docker often exceed 30s. Consider 120000 or higher.`
-        );
-    }
-    // Pre-install steps download many packages — give them 5 minutes regardless
-    // of the per-test timeout setting, since this only runs once per pipeline run.
-    const installTimeoutMs = Math.max(runTimeoutMs, 300000);
-
-    try {
-        // Remove any stale container with the same name (e.g. from a crashed previous run)
-        await execFilePromise('docker', ['rm', '-f', containerName]).catch(() => {});
-
-        // Start a long-lived container that does nothing but stay alive.
-        await dockerRun([
-            'run', '-d',
-            '--name', containerName,
-            '-v', `${volumeDir}:/app`,
-            '-w', '/app',
-            'node:20-slim',
-            'tail', '-f', '/dev/null'
-        ], runTimeoutMs);
-
-        console.log(`[Sandbox] Container started: ${containerName}`);
-
-        // Pre-install the app's own dependencies once inside the container.
-        const pkgJsonPath = path.join(sandboxDir, 'package.json');
-        const hasPkgJson = fssync.existsSync(pkgJsonPath);
-        if (hasPkgJson) {
-            await dockerRun([
-                'exec', containerName,
-                'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock'
-            ], installTimeoutMs);
-            console.log(`[Sandbox] Pre-installed app dependencies.`);
-        }
-
-        // Pre-install jest and common test utilities so executeTest never needs
-        // to install them per-attempt (avoids repeated lockfile writes on Windows volumes).
-        await dockerRun([
-            'exec', containerName,
-            'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock',
-            'jest', 'supertest', 'jest-environment-node'
-        ], installTimeoutMs);
-        console.log(`[Sandbox] Pre-installed jest and test utilities.`);
-    } catch (err) {
-        console.error('[Sandbox] Container startup failed:', err.message);
-        throw err;
-    }
-
-    return { sandboxDir, containerName };
+    return await Promise.all(createPromises);
 }
 
 /**
@@ -287,7 +280,7 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
             // Use spawnCapture — reliably captures stdout+stderr on Windows even
             // when the process exits non-zero (unlike execFilePromise which drops them).
             // Merge stderr into stdout via sh -c "... 2>&1" so all output is in one stream.
-            const jestCmd = `npx jest ${testFilename} --no-coverage --forceExit --runInBand --detectOpenHandles --testEnvironment=node --testTimeout=30000 2>&1`;
+            const jestCmd = `./node_modules/.bin/jest ${testFilename} --no-coverage --forceExit --runInBand --testEnvironment=node --testTimeout=30000 2>&1`;
             const { stdout, stderr } = await spawnCapture(
                 'docker', ['exec', containerName, 'sh', '-c', jestCmd],
                 { timeout: testTimeout }
@@ -327,37 +320,38 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
 }
 
 /**
- * Stops and removes the persistent container, then deletes the sandbox directory.
+ * Stops and removes the persistent containers, then deletes the sandbox directories.
  * The container must be stopped BEFORE deleting the directory on Windows —
  * Docker Desktop holds file locks on the volume mount while the container is live.
  */
-function cleanupSandbox(runId, containerName) {
-    const baseTmp = process.platform === 'win32' ? 'C:\\tmp' : '/tmp';
-    const sandboxDir = path.join(baseTmp, 'autoqa-sandbox', runId);
+function cleanupSandboxPool(runId, pool) {
+    if (!pool || !Array.isArray(pool)) return;
 
-    const removeDir = () => {
-        fs.rm(sandboxDir, { recursive: true, force: true })
-            .catch(err => console.warn(`[Sandbox] Sandbox dir cleanup warning: ${err.message}`));
-    };
+    for (const { sandboxDir, containerName } of pool) {
+        const removeDir = () => {
+            fs.rm(sandboxDir, { recursive: true, force: true })
+                .catch(err => console.warn(`[Sandbox] Sandbox dir cleanup warning: ${err.message}`));
+        };
 
-    if (containerName) {
-        // Stop the container first (releases volume file locks on Windows),
-        // then remove it, then delete the directory.
-        execFilePromise('docker', ['stop', containerName])
-            .then(() => execFilePromise('docker', ['rm', containerName]))
-            .then(() => removeDir())
-            .catch(err => {
-                console.warn(`[Sandbox] Container cleanup warning: ${err.message}`);
-                // Still try to remove the directory even if docker stop/rm failed
-                removeDir();
-            });
-    } else {
-        removeDir();
+        if (containerName) {
+            // Stop the container first (releases volume file locks on Windows),
+            // then remove it, then delete the directory.
+            execFilePromise('docker', ['stop', containerName])
+                .then(() => execFilePromise('docker', ['rm', containerName]))
+                .then(() => removeDir())
+                .catch(err => {
+                    console.warn(`[Sandbox] Container cleanup warning: ${err.message}`);
+                    // Still try to remove the directory even if docker stop/rm failed
+                    removeDir();
+                });
+        } else {
+            removeDir();
+        }
     }
 }
 
 module.exports = {
-    createSandbox,
+    createSandboxPool,
     executeTest,
-    cleanupSandbox,
+    cleanupSandboxPool,
 };
