@@ -7,7 +7,11 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "jira:check": "node scripts/checkJiraApi.js",
     "jira:simulate-webhook": "node scripts/simulateJiraWebhook.js",
-    "jira:delete-story-comments": "node scripts/deleteJiraStoryComments.js"
+    "jira:delete-story-comments": "node scripts/deleteJiraStoryComments.js",
+    "jira:seed-sayarat": "node scripts/seedSayaratJiraIssues.js",
+    "jira:delete-sayarat": "node scripts/deleteSayaratJiraIssues.js",
+    "jira:seed-todo": "node scripts/seedTodoJiraIssues.js",
+    "jira:delete-todo": "node scripts/deleteTodoJiraIssues.js"
   },
   "keywords": [],
   "author": "",
@@ -16,19 +20,19 @@
   "dependencies": {
     "@babel/parser": "^7.29.2",
     "@babel/traverse": "^7.29.0",
-    "@google/genai": "^1.48.0",
     "@octokit/rest": "^22.0.1",
     "axios": "^1.14.0",
     "better-sqlite3": "^12.9.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.1",
     "express": "^5.2.1",
-    "localtunnel": "^2.0.2",
     "mammoth": "^1.12.0",
     "multer": "^2.1.1",
+    "openai": "^6.34.0",
     "pdf-parse": "^1.1.1",
+    "smee-client": "^5.0.0",
     "socket.io": "^4.8.3",
-    "socket.io-client": "^4.8.3",
+    "tiktoken": "^1.0.22",
     "uuid": "^13.0.0",
     "zod": "^4.3.6"
   }

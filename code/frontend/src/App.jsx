@@ -18,9 +18,9 @@ export const useAppContext = () => useContext(AppContext);
 function App() {
   const [activeRuns, setActiveRuns] = useState([]);
   const [settings, setSettings] = useState({
-    reasoningModel: 'gpt-4-turbo',
-    codingModel: 'claude-3-opus',
-    largeContextModel: 'gemini-1.5-pro'
+    reasoningModel: 'gpt-5.4',
+    codingModel: 'gpt-5.4-mini',
+    largeContextModel: 'gpt-5.4'
   });
   const [dashboardMetrics, setDashboardMetrics] = useState({
     activeSandboxes: 0,
@@ -36,6 +36,10 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0); // For forcing child components to re-fetch data
   const [llmTraces, setLlmTraces] = useState([]);
+  const [darkMode, setDarkMode] = useState(() => {
+    const stored = localStorage.getItem('darkMode');
+    return stored === 'true';
+  });
 
   // Load initial data and Socket.io listeners
   useEffect(() => {
@@ -125,6 +129,19 @@ function App() {
     setTimeout(() => setToast(null), 5000);
   };
 
+  // Dark mode: sync .dark class on <html> and persist preference
+  useEffect(() => {
+    const root = document.documentElement;
+    if (darkMode) {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+    localStorage.setItem('darkMode', darkMode);
+  }, [darkMode]);
+
+  const toggleDarkMode = () => setDarkMode(prev => !prev);
+
   const updateSettings = (newSettings) => {
     setSettings(newSettings);
     showToast('Settings updated successfully!', 'success');
@@ -147,17 +164,19 @@ function App() {
     setSidebarCollapsed,
     refreshKey, // Exporting to child components to trigger data refresh automatically
     llmTraces,
-    setLlmTraces
+    setLlmTraces,
+    darkMode,
+    toggleDarkMode
   };
 
   return (
     <AppContext.Provider value={contextValue}>
       <Router>
-        <div className="flex min-h-screen bg-[#121212]">
+        <div className={`flex min-h-screen ${darkMode ? 'bg-[#0D1117]' : 'bg-[#F4F5F7]'}`}>
           <Sidebar />
           <div className={`flex-1 flex flex-col transition-all duration-300 ${sidebarCollapsed ? 'ml-16' : 'ml-64'}`}>
             <Navbar />
-            <main className="flex-1 p-6 overflow-auto">
+            <main className={`flex-1 p-6 overflow-auto ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>
               <Routes>
                 <Route path="/" element={<ProjectsHub />} />
                 <Route path="/projects/:projectId" element={<ProjectDashboard />} />
@@ -165,18 +184,18 @@ function App() {
                 <Route path="/pipelines" element={<PipelineRunsList />} />
                 <Route path="/projects/:projectId/run/:runId/scripts" element={<ScriptDetail />} />
                 <Route path="/llm-traces" element={<AgentChatDebug />} />
-
               </Routes>
             </main>
           </div>
-          
+
           {/* Toast Notification */}
           {toast && (
-            <div className={`fixed bottom-6 right-6 px-6 py-4 rounded-lg shadow-lg animate-slide-in z-50 ${
-              toast.type === 'success' ? 'bg-green-600' : 
-              toast.type === 'error' ? 'bg-red-600' : 'bg-[#6272A4]'
+            <div className={`fixed bottom-6 right-6 px-5 py-3 rounded-md shadow-lg animate-slide-in z-50 border ${
+              toast.type === 'success' ? 'bg-[#E3FCEF] border-[#ABF5D1] text-[#006644]' :
+              toast.type === 'error'   ? 'bg-[#FFEBE6] border-[#FFBDAD] text-[#A61C00]' :
+                                         'bg-[#DEEBFF] border-[#B3D4FF] text-[#0747A6]'
             }`}>
-              <p className="text-white font-medium">{toast.message}</p>
+              <p className="font-medium text-sm">{toast.message}</p>
             </div>
           )}
         </div>

@@ -64,6 +64,7 @@ async function fetchPRDetails(url) {
 
     return {
         title: pr.title,
+        body: pr.body || '',
         author: pr.user.login,
         branch: `${pr.head.ref} -> ${pr.base.ref}`,
         headRef: pr.head.ref,
@@ -246,24 +247,38 @@ async function fetchStagingCodebase(owner, repo) {
 
 // Fetch the full content of specific files from a given branch (not just the diff patch).
 // Used to give the LLM full context when generating test cases.
-async function fetchFullFileContents(owner, repo, ref, filePaths) {
-    const results = [];
+async function fetchFullFileContents(owner, repo, ref, filePaths, opts = {}) {
     const SKIP_DIRS = ['node_modules/', 'dist/', 'build/', '.next/', '__pycache__/'];
     const MAX_FILE_CHARS = 12000;
+    const CONCURRENCY = 5;
+    const quiet = Boolean(opts.quiet);
 
-    for (const filePath of filePaths) {
-        if (SKIP_DIRS.some(d => filePath.includes(d))) continue;
+    const eligible = filePaths.filter(fp => !SKIP_DIRS.some(d => fp.includes(d)));
+
+    const fetchOne = async (filePath) => {
         try {
             const { data } = await octokit.rest.repos.getContent({ owner, repo, path: filePath, ref });
-            if (data.type !== 'file' || !data.content) continue;
+            if (data.type !== 'file' || !data.content) return null;
             const content = Buffer.from(data.content, 'base64').toString('utf8');
-            results.push({
+            return {
                 path: filePath,
                 content: content.length > MAX_FILE_CHARS ? content.slice(0, MAX_FILE_CHARS) + '\n// ... truncated' : content
-            });
+            };
         } catch (err) {
-            results.push({ path: filePath, content: `// Could not fetch: ${err.message}` });
+            return quiet ? null : { path: filePath, content: `// Could not fetch: ${err.message}` };
         }
+    };
+
+    // Fetch up to CONCURRENCY files simultaneously to stay within GitHub rate limits.
+    const results = [];
+    for (let i = 0; i < eligible.length; i += CONCURRENCY) {
+        const batch = eligible.slice(i, i + CONCURRENCY);
+        const batchResults = await Promise.all(batch.map(fetchOne));
+        for (const r of batchResults) { if (r) results.push(r); }
+    }
+
+    if (quiet && results.length === 0 && filePaths.length > 0) {
+        console.log(`[GitHub] Probed ${filePaths.length} candidate test file(s) — none found in repo.`);
     }
     return results;
 }

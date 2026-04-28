@@ -1,29 +1,20 @@
-const { genAI, emitLlmTrace } = require('./geminiService');
-
-function safeParseJSON(text) {
-    if (!text) return {};
-
-    try {
-        return JSON.parse(text);
-    } catch (error) {
-        const fenced = String(text).match(/```(?:json)?\s*([\s\S]*?)```/i);
-        if (fenced) {
-            try {
-                return JSON.parse(fenced[1]);
-            } catch (innerError) {
-                // Fall through to broad extraction.
-            }
-        }
-
-        const first = String(text).indexOf('{');
-        const last = String(text).lastIndexOf('}');
-        if (first !== -1 && last !== -1 && last > first) {
-            return JSON.parse(String(text).slice(first, last + 1));
-        }
-
-        throw error;
-    }
-}
+const {
+    client,
+    DEFAULT_MODEL,
+    TESTCASE_EFFORT,
+    REASONING_SUMMARY,
+    OUTPUT_VERBOSITY,
+    CACHE_KEYS,
+    buildCacheParams,
+    emitLlmTrace,
+    extractResponseText,
+    extractReasoningSummary,
+    extractUsage,
+    safeParseJSON,
+    assertTokenLimit,
+    ensureWithinBudget,
+    PROMPT_TOKEN_BUDGET
+} = require('./llmService');
 
 const MAPPING_RESPONSE_SCHEMA = {
     type: 'object',
@@ -39,7 +30,8 @@ const MAPPING_RESPONSE_SCHEMA = {
                     rationale:      { type: 'string' },
                     impactedFiles:  { type: 'array', items: { type: 'string' } }
                 },
-                required: ['scenarioId', 'requirementId', 'confidence', 'rationale', 'impactedFiles']
+                required: ['scenarioId', 'requirementId', 'confidence', 'rationale', 'impactedFiles'],
+                additionalProperties: false
             }
         },
         unresolvedChanges: {
@@ -50,18 +42,36 @@ const MAPPING_RESPONSE_SCHEMA = {
                     filename: { type: 'string' },
                     reason:   { type: 'string' }
                 },
-                required: ['filename', 'reason']
+                required: ['filename', 'reason'],
+                additionalProperties: false
             }
         }
     },
-    required: ['mappings', 'unresolvedChanges']
+    required: ['mappings', 'unresolvedChanges'],
+    additionalProperties: false
 };
+
+// Static instructions — held separately for OpenAI prompt caching.
+const PR_MAPPING_INSTRUCTIONS = `You are an expert QA impact analyst.
+
+Your job is to map which RTM test scenarios are relevant to the changes in a pull request.
+
+MAPPING RULES:
+1) Map ONLY to scenarioId values from the catalog provided in the user message — do not invent new IDs.
+2) A changed file can map to multiple scenarios.
+3) Only include scenarios that are genuinely affected by the code changes.
+4) confidence must be a number between 0 and 1.
+5) For every changed file you cannot map confidently, include it in unresolvedChanges.
+
+Return a JSON object with "mappings" and "unresolvedChanges" arrays matching the provided schema.`;
 
 function normalizeScenarioItem(item) {
     return {
         id: String(item?.scenarioId || item?.id || '').trim(),
+        title: String(item?.title || '').trim(),
         description: String(item?.description || '').trim(),
         type: String(item?.type || '').trim(),
+        storyId: String(item?.storyId || '').trim(),
         relatedReq: String(item?.relatedReq || item?.parentReq || '').trim(),
         obsolete: Boolean(item?.obsolete)
     };
@@ -150,9 +160,8 @@ async function mapPrChangesToScenarios({ prDetails, jiraRtmEntry, documentTexts 
         };
     }
 
-    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+    const model = DEFAULT_MODEL;
 
-    // Include both the patch/diff AND the full file content so the LLM has complete context
     const enrichedFiles = files.map((file) => ({
         filename: file.filename,
         status: file.status,
@@ -160,11 +169,8 @@ async function mapPrChangesToScenarios({ prDetails, jiraRtmEntry, documentTexts 
         fullContent: String(file.content || '').slice(0, 6000)
     }));
 
-    const prompt = `You are an expert QA impact analyst.
-
-Your job is to map which RTM test scenarios are relevant to the changes in this pull request.
-
-SCENARIO CATALOG (these are the only valid scenarioId values):
+    // Variable-only payload — the static mapping rules live in PR_MAPPING_INSTRUCTIONS.
+    const rawPrompt = `SCENARIO CATALOG (these are the only valid scenarioId values):
 ${JSON.stringify(scenarios, null, 2)}
 
 PULL REQUEST CONTEXT:
@@ -175,33 +181,50 @@ CHANGED FILES (with diffs and full content):
 ${JSON.stringify(enrichedFiles, null, 2)}
 
 PROJECT DOCUMENTS:
-${JSON.stringify(documentTexts.slice(0, 5), null, 2)}
+${JSON.stringify(documentTexts.slice(0, 5), null, 2)}`;
 
-MAPPING RULES:
-1) Map ONLY to scenarioId values from the catalog above — do not invent new IDs.
-2) A changed file can map to multiple scenarios.
-3) Only include scenarios that are genuinely affected by the code changes.
-4) confidence must be a number between 0 and 1.
-5) For every changed file you cannot map confidently, include it in unresolvedChanges.
-
-Return a JSON object with "mappings" and "unresolvedChanges" arrays.`;
+    // Even with the per-file 6k char cap above, mass file changes can blow
+    // past the budget — soft-trim from the middle (scenario catalog is at the
+    // top; instructions are the priority for caching).
+    const prompt = ensureWithinBudget(rawPrompt, PROMPT_TOKEN_BUDGET, 'mapPrChangesToScenarios');
+    await assertTokenLimit(prompt, model);
 
     console.log(`[prScenarioMappingService] Calling LLM (${model}) with ${enrichedFiles.length} file(s) and ${scenarios.length} scenario(s)`);
 
     try {
         const _prStartMs = Date.now();
         emitLlmTrace({ caller: 'mapPrChangesToScenarios', model, phase: 'request', prompt });
-        const interaction = await genAI.interactions.create({
+        const response = await client.responses.create({
             model,
+            instructions: PR_MAPPING_INSTRUCTIONS,
             input: prompt,
-            response_mime_type: 'application/json',
-            response_format: MAPPING_RESPONSE_SCHEMA
+            text: {
+                format: {
+                    type: 'json_schema',
+                    name: 'PrScenarioMapping',
+                    schema: MAPPING_RESPONSE_SCHEMA,
+                    strict: true
+                },
+                verbosity: OUTPUT_VERBOSITY
+            },
+            reasoning: { effort: TESTCASE_EFFORT, summary: REASONING_SUMMARY },
+            ...buildCacheParams(CACHE_KEYS.PR_MAPPING),
+            store: true
         });
 
-        const outputs = Array.isArray(interaction.outputs) ? interaction.outputs : [];
-        const textOutput = outputs.filter(o => o.type === 'text').pop();
-        const rawText = textOutput?.text || '';
-        emitLlmTrace({ caller: 'mapPrChangesToScenarios', model, phase: 'response', response: rawText, durationMs: Date.now() - _prStartMs });
+        const rawText = extractResponseText(response);
+        const reasoningSummary = extractReasoningSummary(response);
+        const usage = extractUsage(response);
+        emitLlmTrace({
+            caller: 'mapPrChangesToScenarios',
+            model,
+            phase: 'response',
+            response: rawText,
+            reasoningSummary,
+            durationMs: Date.now() - _prStartMs,
+            responseId: response.id,
+            usage
+        });
         console.log(`[prScenarioMappingService] Raw LLM response (first 500 chars): ${rawText.slice(0, 500)}`);
         const parsed = safeParseJSON(rawText);
         console.log(`[prScenarioMappingService] Parsed mappings: ${Array.isArray(parsed?.mappings) ? parsed.mappings.length : 'parse error'}`);

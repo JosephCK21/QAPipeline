@@ -2,136 +2,167 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ------------------------------------------------------------------ */
+/* Theme tokens — light (default) and dark (.dark on <html>)          */
+/* ------------------------------------------------------------------ */
+:root {
+  --color-bg:           #F4F5F7;
+  --color-surface:      #FFFFFF;
+  --color-surface-soft: #F1F2F4;
+  --color-surface-sunken: #FAFBFC;
+  --color-border:       #DFE1E6;
+  --color-border-strong:#C1C7D0;
+  --color-text:         #172B4D;
+  --color-text-secondary: #5E6C84;
+  --color-text-muted:   #8993A4;
+  --color-brand:        #0C66E4;
+  --color-brand-hover:  #0747A6;
+  --color-brand-soft:   #E9F2FF;
+  --color-success:      #00875A;
+  --color-success-soft: #E3FCEF;
+  --color-danger:       #C9372C;
+  --color-danger-soft:  #FFEBE6;
+  --color-warning:      #B65C00;
+  --color-warning-soft: #FFF7D6;
+  --color-shadow:       rgba(9, 30, 66, 0.08);
+}
+
+.dark {
+  --color-bg:           #0D1117;
+  --color-surface:      #161B22;
+  --color-surface-soft: #1C2333;
+  --color-surface-sunken: #0D1117;
+  --color-border:       #30363D;
+  --color-border-strong:#484F58;
+  --color-text:         #E6EDF3;
+  --color-text-secondary: #8B949E;
+  --color-text-muted:   #6E7681;
+  --color-brand:        #58A6FF;
+  --color-brand-hover:  #79C0FF;
+  --color-brand-soft:   rgba(56, 139, 253, 0.15);
+  --color-success:      #3FB950;
+  --color-success-soft: rgba(63, 185, 80, 0.15);
+  --color-danger:       #F85149;
+  --color-danger-soft:  rgba(248, 81, 73, 0.15);
+  --color-warning:      #D29922;
+  --color-warning-soft: rgba(210, 153, 34, 0.15);
+  --color-shadow:       rgba(0, 0, 0, 0.3);
+}
+
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
+html,
 body {
-  font-family: 'Inter', sans-serif;
-  background-color: #121212;
-  color: #F8F8F2;
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background-color: var(--color-bg);
+  color: var(--color-text);
   min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
-/* Custom scrollbar */
+/* Scrollbar — adapts to theme */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #1E1E2F;
+  background: var(--color-bg);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #6272A4;
-  border-radius: 4px;
+  background: var(--color-border-strong);
+  border: 2px solid var(--color-bg);
+  border-radius: 6px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #7c8ab8;
+  background: var(--color-text-muted);
+}
+
+/* Firefox */
+* {
+  scrollbar-color: var(--color-border-strong) var(--color-bg);
+  scrollbar-width: thin;
 }
 
 /* Animation keyframes */
 @keyframes pulse {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.5;
-  }
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.5; }
 }
 
 @keyframes slideIn {
-  from {
-    transform: translateX(-100%);
-    opacity: 0;
-  }
-  to {
-    transform: translateX(0);
-    opacity: 1;
-  }
+  from { transform: translateX(100%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
 }
 
 @keyframes fadeIn {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes progressBar {
-  from {
-    width: 0%;
-  }
-  to {
-    width: 100%;
-  }
+  from { width: 0%; }
+  to   { width: 100%; }
 }
 
-.animate-pulse {
-  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-}
+.animate-pulse      { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+.animate-slide-in   { animation: slideIn 0.3s ease-out; }
+.animate-fade-in    { animation: fadeIn 0.25s ease-out; }
+.animate-progress   { animation: progressBar 3s ease-in-out; }
 
-.animate-slide-in {
-  animation: slideIn 0.3s ease-out;
-}
-
-.animate-fade-in {
-  animation: fadeIn 0.3s ease-out;
-}
-
-.animate-progress {
-  animation: progressBar 3s ease-in-out;
-}
-
-/* Terminal styling */
+/* Terminal / log panel */
 .terminal-log {
-  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
   font-size: 13px;
   line-height: 1.6;
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+  border-radius: 6px;
 }
 
-.log-info {
-  color: #50FA7B;
-}
+.log-info  { color: var(--color-brand); }
+.log-warn  { color: var(--color-warning); }
+.log-error { color: var(--color-danger); }
 
-.log-warn {
-  color: #FFB86C;
-}
-
-.log-error {
-  color: #FF5555;
-}
-
-/* Glass effect */
+/* Soft glass card */
 .glass {
-  background: rgba(30, 30, 47, 0.8);
-  backdrop-filter: blur(10px);
-  border: 1px solid rgba(98, 114, 164, 0.3);
+  background: var(--color-surface);
+  backdrop-filter: none;
+  border: 1px solid var(--color-border);
+  box-shadow: 0 1px 2px var(--color-shadow), 0 0 1px var(--color-shadow);
 }
 
 /* Status colors */
-.status-completed {
-  color: #50FA7B;
+.status-completed { color: var(--color-success); }
+.status-running   { color: var(--color-brand); }
+.status-pending   { color: var(--color-text-secondary); }
+.status-failed    { color: var(--color-danger); }
+.status-blocked   { color: var(--color-warning); }
+
+/* Focus ring */
+*:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
-.status-running {
-  color: #8BE9FD;
+button:focus,
+a:focus,
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
 }
 
-.status-pending {
-  color: #6272A4;
-}
-
-.status-failed {
-  color: #FF5555;
-}
-
-.status-blocked {
-  color: #FFB86C;
+/* Dark mode transition helper for components that use inline bg */
+.dark-transition {
+  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
 }

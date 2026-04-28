@@ -4,39 +4,67 @@ import { useAppContext } from '../App';
 import {
   ArrowLeft, AlertTriangle, Loader, CheckCircle2, XCircle, Clock,
   ChevronRight, ChevronDown, Code2, Database, ListChecks, RefreshCw,
-  Activity, GitBranch, Terminal
+  Activity, GitBranch, Terminal, ShieldAlert, Wrench
 } from 'lucide-react';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 function statusColor(status) {
-  if (status === 'pass')       return 'text-green-400';
-  if (status === 'fail' || status === 'final_fail') return 'text-red-400';
-  if (status === 'running')    return 'text-blue-400';
-  if (status === 'generating') return 'text-indigo-400';
-  if (status === 'partial')    return 'text-orange-400';
-  return 'text-gray-400';
+  const s = String(status || '').toLowerCase();
+  if (s === 'pass') return 'text-[#00875A]';
+  if (s === 'fail' || s === 'final_fail') return 'text-[#C9372C]';
+  if (s === 'healing') return 'text-[#0C66E4]';
+  if (s === 'running') return 'text-[#B65C00]';
+  if (s === 'generating') return 'text-indigo-400';
+  if (s === 'partial') return 'text-orange-400';
+  return 'text-[#5E6C84]';
 }
 
 function statusIcon(status, size = 'w-4 h-4') {
-  if (status === 'pass')                         return <CheckCircle2 className={`${size} text-green-400`} />;
-  if (status === 'fail' || status === 'final_fail') return <XCircle className={`${size} text-red-400`} />;
-  if (status === 'running' || status === 'generating') return <Loader className={`${size} text-blue-400 animate-spin`} />;
-  if (status === 'partial')                      return <AlertTriangle className={`${size} text-orange-400`} />;
-  return <Clock className={`${size} text-gray-500`} />;
+  const s = String(status || '').toLowerCase();
+  if (s === 'pass') return <CheckCircle2 className={`${size} text-[#00875A]`} />;
+  if (s === 'fail' || s === 'final_fail') return <XCircle className={`${size} text-[#C9372C]`} />;
+  if (s === 'healing') return <RefreshCw className={`${size} text-[#0C66E4] animate-pulse`} />;
+  if (s === 'running') return <Loader className={`${size} text-[#B65C00] animate-spin`} />;
+  if (s === 'generating') return <Loader className={`${size} text-indigo-400 animate-spin`} />;
+  if (s === 'partial') return <AlertTriangle className={`${size} text-orange-400`} />;
+  return <Clock className={`${size} text-[#8993A4]`} />;
 }
 
 function statusBadge(status) {
+  const s = String(status || '').toLowerCase();
   const map = {
-    pass:       'bg-green-500/15 border-green-500/30 text-green-300',
-    fail:       'bg-red-500/15 border-red-500/30 text-red-300',
-    final_fail: 'bg-red-500/15 border-red-500/30 text-red-300',
-    running:    'bg-blue-500/15 border-blue-500/30 text-blue-300',
+    pass:       'bg-green-500/15 border-green-500/30 text-[#00875A]',
+    fail:       'bg-red-500/15 border-red-500/30 text-[#C9372C]',
+    final_fail: 'bg-red-500/15 border-red-500/30 text-[#C9372C]',
+    running:    'bg-amber-500/15 border-amber-500/30 text-[#B65C00]',
+    healing:    'bg-blue-500/15 border-blue-500/30 text-[#0C66E4]',
     generating: 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300',
     partial:    'bg-orange-500/15 border-orange-500/30 text-orange-300',
   };
-  return map[status] || 'bg-gray-700/30 border-gray-600/30 text-gray-400';
+  return map[s] || 'bg-[#DFE1E6]/30 border-[#C1C7D0]/30 text-[#5E6C84]';
+}
+
+// ---------------------------------------------------------------------------
+// Regression pill — shown on attempts and test-case headers when a regression
+// run stamped the outcome.
+// ---------------------------------------------------------------------------
+function RegressionPill({ regression }) {
+  if (!regression || regression === 'clean_pass') return null;
+
+  const styleMap = {
+    adapted:         { cls: 'bg-[#FFF7D6] border-[#F8E08E] text-[#B65C00]', icon: <Wrench className="w-3 h-3" />,       label: 'Adapted' },
+    regression_fail: { cls: 'bg-[#FFEBE6] border-[#FFBDAD] text-[#C9372C]', icon: <ShieldAlert className="w-3 h-3" />, label: 'Regression' },
+    pending:         { cls: 'bg-[#DEEBFF] border-[#B3D4FF] text-[#0747A6]', icon: <RefreshCw className="w-3 h-3" />,    label: 'Regression run' }
+  };
+  const entry = styleMap[regression];
+  if (!entry) return null;
+  return (
+    <span className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border font-semibold ${entry.cls}`}>
+      {entry.icon}{entry.label}
+    </span>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -48,49 +76,50 @@ function AttemptRow({ attempt }) {
     : `Attempt ${attempt.attempt} — ${attempt.status === 'pass' ? 'Passed' : 'Failed'}`;
 
   return (
-    <div className="border border-gray-800 rounded">
+    <div className="border border-[#DFE1E6] rounded">
       <button
         onClick={() => setOpen(o => !o)}
-        className={`w-full flex items-center justify-between px-3 py-2 text-xs rounded ${open ? 'bg-[#1a1a26]' : 'hover:bg-gray-800/40'} transition-colors`}
+        className={`w-full flex items-center justify-between px-3 py-2 text-xs rounded ${open ? 'bg-[#F4F5F7]' : 'hover:bg-[#F1F2F4]'} transition-colors`}
       >
         <div className="flex items-center gap-2">
           {statusIcon(attempt.status, 'w-3.5 h-3.5')}
           <span className={statusColor(attempt.status)}>{label}</span>
+          <RegressionPill regression={attempt.regression} />
           {attempt.startedAt && (
-            <span className="text-gray-600 text-[10px]">{new Date(attempt.startedAt).toLocaleTimeString()}</span>
+            <span className="text-[#8993A4] text-[10px]">{new Date(attempt.startedAt).toLocaleTimeString()}</span>
           )}
         </div>
-        {open ? <ChevronDown className="w-3.5 h-3.5 text-gray-500" /> : <ChevronRight className="w-3.5 h-3.5 text-gray-500" />}
+        {open ? <ChevronDown className="w-3.5 h-3.5 text-[#8993A4]" /> : <ChevronRight className="w-3.5 h-3.5 text-[#8993A4]" />}
       </button>
 
       {open && (
-        <div className="px-3 pb-3 space-y-2 border-t border-gray-800 bg-[#0d0d14] rounded-b">
+        <div className="px-3 pb-3 space-y-2 border-t border-[#DFE1E6] bg-[#FAFBFC] rounded-b">
           {attempt.failureOutput && (
             <div className="mt-2">
-              <p className="text-[10px] text-red-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+              <p className="text-[10px] text-[#C9372C] uppercase tracking-wider mb-1 flex items-center gap-1">
                 <Terminal className="w-3 h-3" /> Failure Output
               </p>
-              <pre className="text-[10px] text-red-300 font-mono whitespace-pre-wrap overflow-auto max-h-48 bg-red-900/10 border border-red-900/30 p-2 rounded">
+              <pre className="text-[10px] text-[#C9372C] font-mono whitespace-pre-wrap overflow-auto max-h-48 bg-red-900/10 border border-red-900/30 p-2 rounded">
                 {attempt.failureOutput}
               </pre>
             </div>
           )}
           {attempt.scriptSnapshot && (
             <div className="mt-2">
-              <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1 flex items-center gap-1">
+              <p className="text-[10px] text-[#8993A4] uppercase tracking-wider mb-1 flex items-center gap-1">
                 <Code2 className="w-3 h-3" /> Script Used in This Attempt
               </p>
-              <pre className="text-[10px] text-gray-300 font-mono whitespace-pre-wrap overflow-auto max-h-64 bg-[#0a0a12] border border-gray-800 p-2 rounded">
+              <pre className="text-[10px] text-[#5E6C84] font-mono whitespace-pre-wrap overflow-auto max-h-64 bg-[#F4F5F7] border border-[#DFE1E6] p-2 rounded">
                 {attempt.scriptSnapshot}
               </pre>
             </div>
           )}
           {attempt.output && attempt.status === 'pass' && (
             <div className="mt-2">
-              <p className="text-[10px] text-green-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+              <p className="text-[10px] text-[#00875A] uppercase tracking-wider mb-1 flex items-center gap-1">
                 <Terminal className="w-3 h-3" /> Sandbox Output
               </p>
-              <pre className="text-[10px] text-green-300 font-mono whitespace-pre-wrap overflow-auto max-h-48 bg-green-900/10 border border-green-900/30 p-2 rounded">
+              <pre className="text-[10px] text-[#00875A] font-mono whitespace-pre-wrap overflow-auto max-h-48 bg-green-900/10 border border-green-900/30 p-2 rounded">
                 {attempt.output}
               </pre>
             </div>
@@ -110,8 +139,8 @@ function TestCasePanel({ testCase, attempts }) {
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="p-4 border-b border-gray-800 bg-[#161622]">
-        <div className="flex items-center gap-2 mb-1">
+      <div className="p-4 border-b border-[#DFE1E6] bg-[#F4F5F7]">
+        <div className="flex items-center gap-2 mb-1 flex-wrap">
           <span className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${statusBadge(testCase.status)}`}>
             {testCase.status || 'pending'}
           </span>
@@ -123,23 +152,50 @@ function TestCasePanel({ testCase, attempts }) {
               <RefreshCw className="w-3 h-3" />{testCase.healAttempts} heal{testCase.healAttempts !== 1 ? 's' : ''}
             </span>
           )}
+          <RegressionPill regression={testCase.regression} />
         </div>
         <p className="text-xs font-mono text-indigo-400">{testCase.testCaseId}</p>
-        <p className="text-sm font-semibold text-white mt-0.5 leading-tight">{testCase.title}</p>
+        <p className="text-sm font-semibold text-[#172B4D] mt-0.5 leading-tight">{testCase.title}</p>
         {testCase.language && (
-          <p className="text-[10px] text-gray-500 mt-1 flex items-center gap-1">
+          <p className="text-[10px] text-[#8993A4] mt-1 flex items-center gap-1">
             <Code2 className="w-3 h-3" />{testCase.language}
           </p>
         )}
       </div>
 
+      {/* Regression banner — shown when the test case was adapted or failed in a regression run */}
+      {(testCase.regression === 'adapted' || testCase.regression === 'regression_fail') && testCase.originalFailureOutput && (
+        <div className={`px-4 py-3 border-b ${testCase.regression === 'adapted' ? 'bg-[#FFF7D6] border-[#F8E08E]' : 'bg-[#FFEBE6] border-[#FFBDAD]'}`}>
+          <p className="text-[10px] uppercase tracking-wider font-semibold flex items-center gap-1 mb-1" style={{ color: testCase.regression === 'adapted' ? '#B65C00' : '#C9372C' }}>
+            <ShieldAlert className="w-3 h-3" />
+            {testCase.regression === 'adapted'
+              ? 'Potential regression — original script failed, adapted version passed'
+              : 'Regression failure — existing script could not be made green'}
+          </p>
+          <details className="text-[11px]">
+            <summary className="cursor-pointer text-[#5E6C84] hover:text-[#172B4D]">Show original failure output</summary>
+            <pre className="mt-2 font-mono whitespace-pre-wrap overflow-auto max-h-48 bg-white border border-[#DFE1E6] p-2 rounded text-[#C9372C]">
+              {testCase.originalFailureOutput}
+            </pre>
+            {testCase.originalScript && (
+              <>
+                <summary className="cursor-pointer text-[#5E6C84] hover:text-[#172B4D] mt-2">Show original script</summary>
+                <pre className="mt-2 font-mono whitespace-pre-wrap overflow-auto max-h-64 bg-white border border-[#DFE1E6] p-2 rounded text-[#5E6C84]">
+                  {testCase.originalScript}
+                </pre>
+              </>
+            )}
+          </details>
+        </div>
+      )}
+
       {/* Tabs */}
-      <div className="flex border-b border-gray-800 bg-[#1a1a26]">
+      <div className="flex border-b border-[#DFE1E6] bg-[#F4F5F7]">
         {[['steps', 'Steps'], ['script', 'Script'], ['data', 'Test Data'], ['attempts', `Attempts (${attempts.length})`]].map(([key, label]) => (
           <button
             key={key}
             onClick={() => setTab(key)}
-            className={`px-4 py-2.5 text-xs font-medium border-b-2 transition-colors ${tab === key ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-gray-500 hover:text-gray-300'}`}
+            className={`px-4 py-2.5 text-xs font-medium border-b-2 transition-colors ${tab === key ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]'}`}
           >
             {label}
           </button>
@@ -147,26 +203,26 @@ function TestCasePanel({ testCase, attempts }) {
       </div>
 
       {/* Tab Content */}
-      <div className="flex-1 overflow-auto p-4 bg-[#0d0d14]">
+      <div className="flex-1 overflow-auto p-4 bg-[#FAFBFC]">
         {tab === 'steps' && (
           <div className="space-y-2">
             {(!testCase.steps || testCase.steps.length === 0)
-              ? <p className="text-sm text-gray-500 italic">No steps recorded.</p>
+              ? <p className="text-sm text-[#8993A4] italic">No steps recorded.</p>
               : testCase.steps.map((step, i) => (
-                  <div key={i} className="flex gap-3 bg-[#1e1e2d] border border-gray-800 p-3 rounded">
+                  <div key={i} className="flex gap-3 bg-[#FFFFFF] border border-[#DFE1E6] p-3 rounded">
                     <span className="flex-shrink-0 w-5 h-5 rounded-full bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 text-[10px] flex items-center justify-center font-bold">{i + 1}</span>
                     <div>
-                      <p className="text-xs text-gray-200 font-medium">{step.action}</p>
-                      {step.expectedResult && <p className="text-[10px] text-gray-500 italic mt-0.5">Expected: {step.expectedResult}</p>}
+                      <p className="text-xs text-[#172B4D] font-medium">{step.action}</p>
+                      {step.expectedResult && <p className="text-[10px] text-[#8993A4] italic mt-0.5">Expected: {step.expectedResult}</p>}
                     </div>
                   </div>
                 ))
             }
             {testCase.codeFiles?.length > 0 && (
               <div className="mt-4">
-                <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1 flex items-center gap-1"><GitBranch className="w-3 h-3"/>Covers</p>
+                <p className="text-[10px] text-[#8993A4] uppercase tracking-wider mb-1 flex items-center gap-1"><GitBranch className="w-3 h-3"/>Covers</p>
                 {testCase.codeFiles.map(f => (
-                  <span key={f} className="block text-[11px] font-mono text-gray-400 bg-gray-800/50 px-2 py-0.5 rounded mb-1">{f}</span>
+                  <span key={f} className="block text-[11px] font-mono text-[#5E6C84] bg-[#F1F2F4] px-2 py-0.5 rounded mb-1">{f}</span>
                 ))}
               </div>
             )}
@@ -175,20 +231,20 @@ function TestCasePanel({ testCase, attempts }) {
 
         {tab === 'script' && (
           testCase.testScript
-            ? <pre className="text-xs text-gray-300 font-mono whitespace-pre-wrap leading-relaxed">{testCase.testScript}</pre>
-            : <p className="text-sm text-gray-500 italic">No script generated.</p>
+            ? <pre className="text-xs text-[#5E6C84] font-mono whitespace-pre-wrap leading-relaxed">{testCase.testScript}</pre>
+            : <p className="text-sm text-[#8993A4] italic">No script generated.</p>
         )}
 
         {tab === 'data' && (
           testCase.testData && Object.keys(testCase.testData).length > 0
-            ? <pre className="text-xs text-gray-300 font-mono whitespace-pre-wrap">{JSON.stringify(testCase.testData, null, 2)}</pre>
-            : <p className="text-sm text-gray-500 italic">No test data.</p>
+            ? <pre className="text-xs text-[#5E6C84] font-mono whitespace-pre-wrap">{JSON.stringify(testCase.testData, null, 2)}</pre>
+            : <p className="text-sm text-[#8993A4] italic">No test data.</p>
         )}
 
         {tab === 'attempts' && (
           <div className="space-y-2">
             {attempts.length === 0
-              ? <p className="text-sm text-gray-500 italic">No attempt records yet.</p>
+              ? <p className="text-sm text-[#8993A4] italic">No attempt records yet.</p>
               : attempts.map((att, i) => <AttemptRow key={i} attempt={att} />)
             }
           </div>
@@ -244,13 +300,13 @@ function ScriptDetail() {
   }, [runId, refreshKey]);
 
   if (loading) return (
-    <div className="flex items-center justify-center h-full text-gray-400">
+    <div className="flex items-center justify-center h-full text-[#5E6C84]">
       <Loader className="w-8 h-8 animate-spin" />
     </div>
   );
 
   if (error || !runData) return (
-    <div className="p-8 text-center text-red-400">
+    <div className="p-8 text-center text-[#C9372C]">
       <AlertTriangle className="w-10 h-10 mx-auto mb-4" />
       <p>{error || 'No data available.'}</p>
       <Link to={`/projects/${projectId}`} className="text-indigo-400 hover:underline mt-4 inline-block">Return to Project</Link>
@@ -303,6 +359,7 @@ function ScriptDetail() {
   }
 
   const prDetails = events.find(e => e.type === 'pr_details')?.data || {};
+  const prClassification = events.find(e => e.type === 'pr_classification')?.data || null;
   const isRunning = runData.status === 'running';
   const isFailed = runData.status === 'failed' || runData.status === 'error';
   const isCompleted = runData.status === 'completed';
@@ -312,30 +369,44 @@ function ScriptDetail() {
   return (
     <div className="flex flex-col h-full space-y-4 max-w-full">
       {/* Back nav */}
-      <Link to={`/projects/${projectId}`} className="inline-flex items-center gap-2 text-gray-500 hover:text-gray-200 transition-colors text-sm">
+      <Link to={`/projects/${projectId}`} className="inline-flex items-center gap-2 text-[#8993A4] hover:text-[#172B4D] transition-colors text-sm">
         <ArrowLeft className="w-4 h-4" /> Back to Project
       </Link>
 
       {/* Run Header */}
-      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
+      <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-sm font-mono text-gray-400">Run #{runId.substring(0, 8)}</span>
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
+            <span className="text-sm font-mono text-[#5E6C84]">Run #{runId.substring(0, 8)}</span>
             <span className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${statusBadge(isCompleted ? 'pass' : isFailed ? 'fail' : 'running')}`}>
               {isCompleted ? 'Completed' : isFailed ? 'Failed' : 'Running'}
             </span>
             {isRunning && <Loader className="w-3.5 h-3.5 text-blue-400 animate-spin" />}
+            {prClassification?.isBugFix && (
+              <span
+                title={prClassification.rationale || 'Classified as a bug fix'}
+                className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded border font-semibold bg-[#EAE6FF] border-[#C0B6F2] text-[#5E4DB2]"
+              >
+                <ShieldAlert className="w-3 h-3" /> Regression Run
+                {prClassification.source && <span className="opacity-70">· {prClassification.source}</span>}
+              </span>
+            )}
           </div>
-          {prDetails.title && <p className="text-base font-bold text-white">{prDetails.title}</p>}
-          {prDetails.branch && <p className="text-xs text-gray-500 mt-1 flex items-center gap-1"><GitBranch className="w-3 h-3"/>{prDetails.branch}</p>}
+          {prDetails.title && <p className="text-base font-bold text-[#172B4D]">{prDetails.title}</p>}
+          {prDetails.branch && <p className="text-xs text-[#8993A4] mt-1 flex items-center gap-1"><GitBranch className="w-3 h-3"/>{prDetails.branch}</p>}
+          {prClassification?.isBugFix && prClassification.rationale && (
+            <p className="text-[11px] text-[#5E4DB2] mt-1 max-w-2xl">
+              <span className="font-semibold">Why:</span> {prClassification.rationale}
+            </p>
+          )}
         </div>
 
         {/* Mini counters */}
         <div className="flex items-center gap-4 text-xs">
-          {summary.scenarioCount > 0 && <span className="flex items-center gap-1 text-gray-400"><Activity className="w-3.5 h-3.5"/>{summary.scenarioCount} scenarios</span>}
-          {summary.testCaseCount > 0 && <span className="flex items-center gap-1 text-gray-400"><ListChecks className="w-3.5 h-3.5"/>{summary.testCaseCount} cases</span>}
-          {summary.passedCount > 0 && <span className="flex items-center gap-1 text-green-400"><CheckCircle2 className="w-3.5 h-3.5"/>{summary.passedCount} passed</span>}
-          {summary.failedCount > 0 && <span className="flex items-center gap-1 text-red-400"><XCircle className="w-3.5 h-3.5"/>{summary.failedCount} failed</span>}
+          {summary.scenarioCount > 0 && <span className="flex items-center gap-1 text-[#5E6C84]"><Activity className="w-3.5 h-3.5"/>{summary.scenarioCount} scenarios</span>}
+          {summary.testCaseCount > 0 && <span className="flex items-center gap-1 text-[#5E6C84]"><ListChecks className="w-3.5 h-3.5"/>{summary.testCaseCount} cases</span>}
+          {summary.passedCount > 0 && <span className="flex items-center gap-1 text-[#00875A]"><CheckCircle2 className="w-3.5 h-3.5"/>{summary.passedCount} passed</span>}
+          {summary.failedCount > 0 && <span className="flex items-center gap-1 text-[#C9372C]"><XCircle className="w-3.5 h-3.5"/>{summary.failedCount} failed</span>}
           {summary.retryCount > 0 && <span className="flex items-center gap-1 text-orange-400"><RefreshCw className="w-3.5 h-3.5"/>{summary.retryCount} retries</span>}
         </div>
       </div>
@@ -343,13 +414,13 @@ function ScriptDetail() {
       {/* Main content: scenario list + test case panel side-by-side */}
       <div className="flex flex-1 gap-4 min-h-0 overflow-hidden" style={{ minHeight: '520px' }}>
         {/* Left: Scenario list */}
-        <div className="w-full md:w-[340px] flex-shrink-0 bg-gray-900 border border-gray-800 rounded-lg overflow-y-auto">
-          <div className="p-3 border-b border-gray-800">
-            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Scenarios & Test Cases</p>
+        <div className="w-full md:w-[340px] flex-shrink-0 bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg overflow-y-auto">
+          <div className="p-3 border-b border-[#DFE1E6]">
+            <p className="text-xs font-bold text-[#5E6C84] uppercase tracking-wider">Scenarios & Test Cases</p>
           </div>
 
           {allScenarioIds.length === 0 ? (
-            <div className="p-6 text-center text-gray-500 text-sm italic">
+            <div className="p-6 text-center text-[#8993A4] text-sm italic">
               {isRunning ? 'Generating test cases…' : 'No scenarios mapped to this PR.'}
             </div>
           ) : (
@@ -364,7 +435,7 @@ function ScriptDetail() {
                     {/* Scenario Row */}
                     <button
                       onClick={() => toggleScenario(scenarioId)}
-                      className="w-full flex items-center justify-between px-3 py-2.5 hover:bg-gray-800/50 transition-colors text-left"
+                      className="w-full flex items-center justify-between px-3 py-2.5 hover:bg-[#F1F2F4] transition-colors text-left"
                     >
                       <div className="flex items-center gap-2 min-w-0">
                         {statusIcon(sStatus?.status || (isRunning ? 'running' : 'pending'), 'w-3.5 h-3.5')}
@@ -372,17 +443,17 @@ function ScriptDetail() {
                       </div>
                       <div className="flex items-center gap-2 flex-shrink-0">
                         {tcs.length > 0 && (
-                          <span className="text-[10px] text-gray-500">{tcs.filter(t => t.status === 'pass').length}/{tcs.length}</span>
+                          <span className="text-[10px] text-[#8993A4]">{tcs.filter(t => t.status === 'pass').length}/{tcs.length}</span>
                         )}
-                        {isExpanded ? <ChevronDown className="w-3.5 h-3.5 text-gray-500" /> : <ChevronRight className="w-3.5 h-3.5 text-gray-500" />}
+                        {isExpanded ? <ChevronDown className="w-3.5 h-3.5 text-[#8993A4]" /> : <ChevronRight className="w-3.5 h-3.5 text-[#8993A4]" />}
                       </div>
                     </button>
 
                     {/* Test Cases under scenario */}
                     {isExpanded && (
-                      <div className="bg-[#0d0d14]">
+                      <div className="bg-[#FAFBFC]">
                         {tcs.length === 0 ? (
-                          <p className="px-4 py-2 text-[10px] text-gray-600 italic">
+                          <p className="px-4 py-2 text-[10px] text-[#8993A4] italic">
                             {isRunning ? 'Generating…' : 'No test cases.'}
                           </p>
                         ) : (
@@ -395,14 +466,14 @@ function ScriptDetail() {
                                 className={`w-full flex items-center justify-between px-4 py-2 text-left transition-colors border-l-2 ${
                                   isSelected
                                     ? 'bg-indigo-500/10 border-indigo-500'
-                                    : 'hover:bg-gray-800/40 border-transparent'
+                                    : 'hover:bg-[#F1F2F4] border-transparent'
                                 }`}
                               >
                                 <div className="flex items-center gap-2 min-w-0">
                                   {statusIcon(tc.status, 'w-3 h-3')}
                                   <div className="min-w-0">
-                                    <p className="text-[10px] font-mono text-gray-400 truncate">{tc.testCaseId}</p>
-                                    <p className="text-[10px] text-gray-500 truncate">{tc.title}</p>
+                                    <p className="text-[10px] font-mono text-[#5E6C84] truncate">{tc.testCaseId}</p>
+                                    <p className="text-[10px] text-[#8993A4] truncate">{tc.title}</p>
                                   </div>
                                 </div>
                                 <div className="flex-shrink-0 flex items-center gap-1">
@@ -423,14 +494,14 @@ function ScriptDetail() {
         </div>
 
         {/* Right: Test Case Detail */}
-        <div className="flex-1 bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+        <div className="flex-1 bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg overflow-hidden">
           {selectedTestCase ? (
             <TestCasePanel
               testCase={selectedTestCase}
               attempts={testCaseAttempts[selectedTestCase.testCaseId] || []}
             />
           ) : (
-            <div className="flex flex-col items-center justify-center h-full text-gray-500">
+            <div className="flex flex-col items-center justify-center h-full text-[#8993A4]">
               <ListChecks className="w-10 h-10 mb-3 opacity-30" />
               <p className="text-sm">Select a test case to see details</p>
               <p className="text-xs mt-1 opacity-70">Expand a scenario on the left to see its test cases</p>
