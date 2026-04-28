@@ -1,10 +1,11 @@
 const { fetchPRDetails, fetchFullFileContents, inferTestFilePaths, fetchPRDependencies } = require('./services/githubService');
-const { cleanupSandboxPool, createSandboxPool, executeTest } = require('./services/sandboxService');
+const { cleanupSandboxPool, createSandboxPool, executeTest, validateSyntaxLocal } = require('./services/sandboxService');
 const { findProjectByGithubRepo } = require('./services/projectStore');
 const { getDocsForProject } = require('./services/documentAssociationStore');
 const { extractTextFromFiles } = require('./services/documentParserService');
 const { mapPrChangesToScenarios } = require('./services/prScenarioMappingService');
 const { classifyPrAsBugFix } = require('./services/prClassificationService');
+const { pruneFileContentForContext } = require('./services/astPrunerService');
 const { generateTestCasesForScenario, repairTestCaseScript } = require('./services/llmService');
 
 const {
@@ -236,17 +237,30 @@ async function executeTestCaseWithRetries({
         });
         sendEvent('log', { level: 'INFO', message: `[Sandbox] ${testCase.testCaseId} attempt ${attempt}/${MAX_HEAL_ATTEMPTS}` });
 
-        // Run the script inside the persistent container.
-        // testCase.testData is passed separately and injected as a preamble by the sandbox,
-        // so the script can reference all fixture values via the testData variable.
-        const sandboxResult = await executeTest(
-            containerName,
-            sandboxDir,
-            testCase.language || 'javascript',
-            currentScript,
-            `test_${testCase.testCaseId}_attempt${attempt}.spec.${testCase.language === 'python' ? 'py' : 'js'}`,
-            testCase.testData || {}
-        );
+        const syntaxCheck = validateSyntaxLocal(currentScript, testCase.language || 'javascript');
+
+        let sandboxResult;
+        if (!syntaxCheck.valid) {
+            sendEvent('phase_update', { phase: 'Syntax Validation', status: 'failed' });
+            sendEvent('log', {
+                level: 'WARN',
+                message: `[Syntax validation] ${testCase.testCaseId} attempt ${attempt}: ${syntaxCheck.error}`
+            });
+            sandboxResult = {
+                success: false,
+                output: `[Syntax validation] ${syntaxCheck.error}`,
+                error: syntaxCheck.error
+            };
+        } else {
+            sandboxResult = await executeTest(
+                containerName,
+                sandboxDir,
+                testCase.language || 'javascript',
+                currentScript,
+                `test_${testCase.testCaseId}_attempt${attempt}.spec.${testCase.language === 'python' ? 'py' : 'js'}`,
+                testCase.testData || {}
+            );
+        }
 
         const attemptEndedAt = new Date().toISOString();
 
@@ -705,10 +719,20 @@ async function runPipeline(runId, prUrl, repoFullName) {
             classifyTask, codeContextTask
         ]);
 
-        // Build single concatenated context string for LLM prompts
+        // Build single concatenated context string for LLM prompts (prune very large files for token budget)
         const codeContextSection = [
-            ...(codeContext.fullFiles || []).map(f => `=== FILE: ${f.path} ===\n${f.content}`),
-            ...(codeContext.testFiles || []).map(f => `=== EXISTING TEST: ${f.path} ===\n${f.content}`)
+            ...(codeContext.fullFiles || []).map(f => {
+                const text = pruneFileContentForContext(f.path, f.content, {
+                    onPrune: p => sendEvent('log', { level: 'DEBUG', message: `[Code context] Pruned large file body for tokens: ${p}` })
+                });
+                return `=== FILE: ${f.path} ===\n${text}`;
+            }),
+            ...(codeContext.testFiles || []).map(f => {
+                const text = pruneFileContentForContext(f.path, f.content, {
+                    onPrune: p => sendEvent('log', { level: 'DEBUG', message: `[Code context] Pruned large file body for tokens: ${p}` })
+                });
+                return `=== EXISTING TEST: ${f.path} ===\n${text}`;
+            })
         ].join('\n\n');
 
         const prDiffSection = (prDetails.files || [])

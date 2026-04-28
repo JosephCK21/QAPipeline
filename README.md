@@ -17,16 +17,17 @@ This document is a technical reference: architecture, **application flow**, **wh
 7. [Workflow: Jira to scenarios (RTM)](#workflow-jira-to-scenarios-rtm)
 8. [Workflow: GitHub PR to test run](#workflow-github-pr-to-test-run)
 9. [Bug-fix classification and epic regression](#bug-fix-classification-and-epic-regression)
-10. [Sandbox execution and test healing](#sandbox-execution-and-test-healing)
-11. [Run outcome semantics](#run-outcome-semantics)
-12. [HTTP API reference](#http-api-reference)
-13. [Real-time events (Socket.IO)](#real-time-events-socketio)
-14. [Frontend map](#frontend-map)
-15. [Configuration (environment variables)](#configuration-environment-variables)
-16. [Local development and operations](#local-development-and-operations)
-17. [Failure handling and dead letter queue](#failure-handling-and-dead-letter-queue)
-18. [Security notes](#security-notes)
-19. [Troubleshooting](#troubleshooting)
+10. [Sandbox execution and test healing](#sandbox-execution-and-test-healing) — Jest, Playwright E2E, pytest; dev server; syntax check
+11. [Code context pruning (`astPrunerService`)](#code-context-pruning-astprunerservice)
+12. [Run outcome semantics](#run-outcome-semantics)
+13. [HTTP API reference](#http-api-reference)
+14. [Real-time events (Socket.IO)](#real-time-events-socketio)
+15. [Frontend map](#frontend-map)
+16. [Configuration (environment variables)](#configuration-environment-variables)
+17. [Local development and operations](#local-development-and-operations)
+18. [Failure handling and dead letter queue](#failure-handling-and-dead-letter-queue)
+19. [Security notes](#security-notes)
+20. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -35,7 +36,7 @@ This document is a technical reference: architecture, **application flow**, **wh
 - **Scenarios in SQLite** (`rtm_scenarios`) represent testable conditions derived from or aligned with Jira (stories, epics, acceptance criteria). They are the backbone of the RTM and of PR mapping.
 - **GitHub webhooks** drive PR runs: when a linked repo receives a qualifying `pull_request` event, AutoQA spawns a **run** (UUID), streams progress to the UI, and executes [`runPipeline`](code/backend/pipeline.js) asynchronously after responding **202 Accepted** to GitHub.
 - **OpenAI** (via the official `openai` SDK in [`llmService.js`](code/backend/services/llmService.js)) powers: Jira → scenario generation, PR → scenario mapping, per-scenario test case generation, test script **repair** (healing), and optional **bug-fix vs feature** classification for regression mode.
-- **Execution** is not in-process: a pool of **Docker** containers with the PR branch cloned and dependencies installed runs **Jest** (JavaScript) or **pytest** (Python) for each generated file.
+- **Execution** is not in-process: a pool of **Docker** containers with the PR branch cloned and dependencies installed runs **Jest** or **Playwright Test** (JavaScript—Playwright is used when the generated script imports [`@playwright/test`](https://playwright.dev/docs/test-api)) or **pytest** (Python) for each test file. See [Sandbox execution and test healing](#sandbox-execution-and-test-healing).
 
 **Who uses it:** A developer or QA engineer configures projects in the UI, keeps Jira in sync, and uses the dashboard to watch PR runs, inspect test cases, and read logs.
 
@@ -111,7 +112,7 @@ flowchart LR
 
 ### GitHub PR to tests ([`runPipeline`](code/backend/pipeline.js))
 
-A qualifying **`pull_request`** webhook returns **202** immediately with a **`runId`**; **`runPipeline`** continues asynchronously. It **loads scenarios from SQLite**, fetches **PR metadata and files** plus **optional project document text**, then calls **`mapPrChangesToScenarios`** to choose **`scenarioId`s**. Next, **`classifyPrAsBugFix`** (if regression mode is enabled) runs **in parallel with** **`buildCodeContext`** (full files on the PR head, inferred test paths, dependency text). Depending on regression rules, either **epic regression** reuses existing **`test_cases`** or **generateTestCasesForScenario** runs **per mapped scenario**. Tests execute in a **sandbox pool**; failures invoke **`repairTestCaseScript`** until success or **max heals**. Progress streams via **`run_updated`** events.
+A qualifying **`pull_request`** webhook returns **202** immediately with a **`runId`**; **`runPipeline`** continues asynchronously. It **loads scenarios from SQLite**, fetches **PR metadata and files** plus **optional project document text**, then calls **`mapPrChangesToScenarios`** to choose **`scenarioId`s**. Next, **`classifyPrAsBugFix`** (if regression mode is enabled) runs **in parallel with** **`buildCodeContext`** (full files on the PR head, inferred test paths, dependency text). The **[FULL FILE CONTENTS]** prompt string is optionally **pruned** for very large JS/TS/PY files (**`astPrunerService`** — see [Code context pruning](#code-context-pruning-astprunerservice)). Depending on regression rules, either **epic regression** reuses existing **`test_cases`** or **generateTestCasesForScenario** runs **per mapped scenario**. Tests execute in a **sandbox pool**; failures invoke **`repairTestCaseScript`** until success or **max heals**. Progress streams via **`run_updated`** events.
 
 ```mermaid
 flowchart TB
@@ -144,7 +145,7 @@ Every production LLM step uses the OpenAI **Responses** API (`client.responses.c
 | `classifyPrAsBugFix` | After mapping; **skipped** when **`REGRESSION_ENABLED`** is **`false`** ([`pipeline.js`](code/backend/pipeline.js)); **LLM skipped entirely** when any linked Jira issue is typed **Bug** unless **`REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG`** ([`prClassificationService.js`](code/backend/services/prClassificationService.js)) | [`CLASSIFIER_INSTRUCTIONS`](code/backend/services/prClassificationService.js) | **`PR TITLE`**, **`PR BRANCH`**, **`PR BODY`**; **`LINKED JIRA ISSUES`** (types from REST); **`CHANGED FILES`** — **`buildDiffDigest`**: up to **20** files, **`patch`** truncated to **1500** chars each, plus truncation note if more files exist ([`prClassificationService.js`](code/backend/services/prClassificationService.js)). |
 | `generateTestScenarios` | **`runJiraPipeline`** per story (single-story loop) ([`jiraPipeline.js`](code/backend/jiraPipeline.js)) | [`SCENARIO_SYSTEM_INSTRUCTION`](code/backend/services/llmService.js) | Epic key/summary, Story key/title/description, AC, **`Supporting Documents`** (`localDocsText`), optional **already-assigned scenario IDs** to avoid duplicates ([`generateTestScenarios`](code/backend/services/llmService.js)). |
 | `generateTestScenariosForEpic` | **`runJiraPipeline`** batch epic path ([`jiraPipeline.js`](code/backend/jiraPipeline.js)) | [`SCENARIO_SYSTEM_INSTRUCTION`](code/backend/services/llmService.js) | Epic line, **`Supporting Documents`**, concatenated stories (description + AC), valid **`storyId`/`epicId`** lists ([`generateTestScenariosForEpic`](code/backend/services/llmService.js)); on failure falls back to **`generateTestScenarios`** per story. |
-| `generateTestCasesForScenario` | PR pipeline per **mapped scenario** ([`pipeline.js`](code/backend/pipeline.js)) — **skipped** when going straight to **`runEpicRegression`** | [`TESTCASE_GENERATION_INSTRUCTIONS`](code/backend/services/llmService.js) | **Scenario** — `ID`, description, type, priority, **`acceptanceCriteriaRef`** if present; **`[CHANGED CODE DIFF]`** (`prDiffSection` from PR files); **`[FULL FILE CONTENTS]`** concatenated **`codeContextSection`** (changed files plus **existing test file** contents); **`[DEPENDENCIES / PACKAGE INFO]`**; optional **`[REFINEMENT]`** previous **`testScript`** plus version when superseding ([`generateTestCasesForScenario`](code/backend/services/llmService.js)); optional **`alreadyGeneratedSummary`** (parallel gen currently passes empty). Threads **`conversationId`** / **`previousInteractionId`** from superseded **`test_cases`** ([`pipeline.js`](code/backend/pipeline.js)). |
+| `generateTestCasesForScenario` | PR pipeline per **mapped scenario** ([`pipeline.js`](code/backend/pipeline.js)) — **skipped** when going straight to **`runEpicRegression`** | [`TESTCASE_GENERATION_INSTRUCTIONS`](code/backend/services/llmService.js) | Same as listed in [`generateTestCasesForScenario`](code/backend/services/llmService.js), plus **`[REFERENCE EXAMPLES]`** — curated **few-shot** JS/Python harness snippets (`FEW_SHOT_EXAMPLES`), injected only in variable `input`, not cached `instructions`. Scenario — `ID`, description, type, priority, **`acceptanceCriteriaRef`** if present; **`[CHANGED CODE DIFF]`** (`prDiffSection` from PR files); **`[FULL FILE CONTENTS]`** concatenated **`codeContextSection`** (possibly pruned — see [Code context pruning](#code-context-pruning-astprunerservice)); **`[DEPENDENCIES / PACKAGE INFO]`**; optional **`[REFINEMENT]`** previous **`testScript`** plus version when superseding; optional **`alreadyGeneratedSummary`**. Threads **`conversationId`** / **`previousInteractionId`** from superseded **`test_cases`** ([`pipeline.js`](code/backend/pipeline.js)). |
 | `repairTestCaseScript` | After sandbox **failure** (`executeTestCaseWithRetries`); up to **`MAX_HEAL_ATTEMPTS`** ([`pipeline.js`](code/backend/pipeline.js)) | [`HEAL_INSTRUCTIONS`](code/backend/services/llmService.js) | **Stateful path** (prior conversation or **`previous_response_id`):** minimal user message — last failure output + failing **`testScript`** only ([`repairTestCaseScript`](code/backend/services/llmService.js)). **Stateless fallback:** full **`testCase`**, **`failureOutput`**, **`attemptHistory`**, **`scenarioDescription`**, **`codeContextSection`**, **`testData` JSON**. |
 
 ### Alternate / unused path: [`jiraScenarioService.js`](code/backend/services/jiraScenarioService.js)
@@ -155,7 +156,7 @@ Every production LLM step uses the OpenAI **Responses** API (`client.responses.c
 
 - **`OPENAI_STATEFUL_MODE`** — **`conversation`** (Conversation API attachment), **`chain`** (**`previous_response_id`**), **`zdr`** (**`store: false`**; prior reasoning replay via **`applyStatefulInput`** and encrypted reasoning items).
 - **Prompt caching** — **`CACHE_KEYS`** per caller (`qa:pr:mapping`, `qa:testcases:generate`, …), **`prompt_cache_retention`** (e.g. **`24h`** vs **`in_memory`**).
-- **Token limits** — **`MAX_TOKENS_ALLOWED`** (**30 000**) enforced by **`assertTokenLimit`** (tiktoken **`o200k_base`**); **`OPENAI_PROMPT_BUDGET`** (**~90 %** of ceiling by default) + **`ensureWithinBudget`** trims from the **middle** of oversized strings with a visible marker.
+- **Token limits** — **`MAX_TOKENS_ALLOWED`** (**30 000**) enforced by **`assertTokenLimit`** (tiktoken **`o200k_base`**); **`OPENAI_PROMPT_BUDGET`** (**~90 %** of ceiling by default) plus **`ensureWithinBudget`**, which trims oversized variable **`input`** slices from the **middle** with a visible marker; **`[REFERENCE EXAMPLES]`** few-shot snippets for **`generateTestCasesForScenario`** sit only in **`input`**, not in cached **`instructions`**.
 - **Traces** — Every request/response emits **`llm_trace`** for UI debugging (see [Frontend map](#frontend-map) Agent Console).
 
 ---
@@ -195,6 +196,7 @@ QAPipeline/
     │   │   ├── seedTodoJiraIssues.js
     │   │   └── simulateJiraWebhook.js
     │   └── services/
+    │       ├── astPrunerService.js
     │       ├── documentAssociationStore.js
     │       ├── documentParserService.js
     │       ├── githubService.js
@@ -286,7 +288,11 @@ These are **not** listed in the tree above but appear when you run or build loca
 - [`jiraScenarioService.js`](code/backend/services/jiraScenarioService.js) — Alternate Jira scenario generator (**`generateScenariosFromJiraContext`**, `JIRA_SCENARIO_INSTRUCTIONS`); **not used** by [`jiraPipeline.js`](code/backend/jiraPipeline.js) in the stock app (see [LLM context reference](#llm-context-reference)).
 - [`prScenarioMappingService.js`](code/backend/services/prScenarioMappingService.js) — Maps PR diffs/context to `scenarioId` list via OpenAI.
 - [`prClassificationService.js`](code/backend/services/prClassificationService.js) — Bug-fix vs feature classification for regression mode (Jira issue types + LLM).
-- [`sandboxService.js`](code/backend/services/sandboxService.js) — Docker pool, clone, npm/pytest installs, test execution and cleanup.
+- [`sandboxService.js`](code/backend/services/sandboxService.js) — Docker (**Playwright** base image **`mcr.microsoft.com/playwright:v1.44.0-jammy`**) pool, **`git`** clone into temp, **`npm`** / **`pip`** installs, **`validateSyntaxLocal`**, **`executeTest`** (**Jest** vs **Playwright Test** branching, optional **dev-server** **`wait-on`**, teardown), **`cleanupSandboxPool`**.
+
+**AST / trimming**
+
+- [`astPrunerService.js`](code/backend/services/astPrunerService.js) — Structural pruning for **LLM `[FULL FILE CONTENTS]`** when files are large (**`LARGE_FILE_CHARS`**); JSX-aware React bodies for Playwright; Python heuristic.
 - [`documentParserService.js`](code/backend/services/documentParserService.js) — Extracts text from uploaded PDF/Office/etc. for prompts.
 - [`documentAssociationStore.js`](code/backend/services/documentAssociationStore.js) — Persists associations in `data/jiraDocuments.json` keyed by AutoQA project id.
 - [`projectStore.js`](code/backend/services/projectStore.js) — CRUD for `data/projects.json` (AutoQA project records linked to Jira/GitHub).
@@ -356,6 +362,8 @@ Migrations in `initDb()` add columns when missing (e.g. `localProjectId` on `run
 ## Workflow: Jira to scenarios (RTM)
 
 > See also: [Application flow (end-to-end)](#application-flow-end-to-end) and [LLM context reference](#llm-context-reference) for sequence and model inputs.
+
+```mermaid
 flowchart TD
   subgraph sources [Ways to start]
     API[POST sync-jira]
@@ -426,7 +434,7 @@ flowchart TD
   BR{REGRESSION_ENABLED and isBugFix?}
   REG[runEpicRegression: existing test cases only]
   GEN[Generate test cases per scenario + queue execution]
-  EX[executeTestCaseWithRetries: Jest/pytest in Docker]
+  EX[executeTestCaseWithRetries: syntax + Jest/Playwright/pytest + Docker]
   H[Healing: repair test script up to 3x]
   FIN[complete event + updateRun + cleanup]
   WH --> V
@@ -439,7 +447,9 @@ flowchart TD
   PM --> CTX
   CTX --> BR
   BR -->|yes| REG
-  REG --> FIN
+  REG --> EX
+  EX --> H
+  H --> FIN
   BR -->|no| GEN
   GEN --> EX
   EX --> H
@@ -465,6 +475,7 @@ flowchart TD
 | Classification | (if regression enabled) `running` then `completed` or skip via env |
 | Code Context | `running` then `completed` |
 | Sandbox Setup | `running` then `completed` |
+| Syntax Validation | per test attempt (`failed` before Docker when JS/Python invalid) |
 | Test Generation / Sandbox Testing | Standard path: both run; bug-fix path may **skip** Test Generation |
 | Regression Execution | Bug-fix path only |
 | Test Healing | Marker phase; may note whether retries ran |
@@ -481,7 +492,7 @@ Other event types: `log`, `pr_details`, `pr_scenario_mapping`, `pr_classificatio
 
 - Fetches **full file contents** for changed files, **inferred test paths** ([`githubService.js`](code/backend/services/githubService.js): `fetchFullFileContents`, `inferTestFilePaths`), and **dependency text** (e.g. `package.json`) for prompts.
 
-### Refinement (supersession)
+When assembling the **`[FULL FILE CONTENTS]`** string for the LLM ([`codeContextSection` in `pipeline.js`](code/backend/pipeline.js)), each file body may be passed through [`pruneFileContentForContext`](code/backend/services/astPrunerService.js) if it exceeds a size threshold — see [Code context pruning (`astPrunerService`)](#code-context-pruning-astprunerservice). The in-memory objects returned by **`buildCodeContext`** are unchanged; only the prompt text is shortened.
 
 - If there are **existing test cases in the DB** whose referenced files overlap with the PR’s changed file list, they are **marked superseded** so new generated cases can replace them; generation may receive the **previous script** as **refinement** context and bump **version** numbers.
 
@@ -523,30 +534,57 @@ If **no epics** can be resolved from mapped scenarios, or **no existing test cas
 
 ## Sandbox execution and test healing
 
-### Pool creation ([`sandboxService.js`](code/backend/services/sandboxService.js))
+### Pool creation ([`createSandboxPool` in `sandboxService.js`](code/backend/services/sandboxService.js))
 
 - For each pool slot, creates a directory under the OS temp (on Windows, `C:\tmp\autoqa-sandbox\...`), **clones** the **GitHub head** of the PR with depth 1 and branch `headRef` when `prDetails` includes `headRepoFullName` and `headRef`. If `GITHUB_TOKEN` is set, the clone URL is authenticated.
 - If clone fails, the code may **fall back** to writing only **flat file payloads** from the webhook when present.
-- Starts a long-lived **Docker** container: image **`node:20-slim`**, working dir `/app`, mount the sandbox directory as a volume, command `tail -f /dev/null` to keep the container up.
-- If `package.json` exists in the clone, runs **`npm install`** for the app (no lockfile) inside the container, then pre-installs **Jest, supertest, jest-environment-node** for JavaScript tests.
+- Starts a long-lived **Docker** container: image **`mcr.microsoft.com/playwright:v1.44.0-jammy`** (Playwright-maintained Ubuntu image with **Node.js** matching the stack and browsers preinstalled). Working dir **`/app`**, sandbox directory mounted as a volume, command **`tail -f /dev/null`** to keep the container up.
+- If `package.json` exists in the clone, runs **`npm install`** for the app (no lockfile commit) inside the container, then pre-installs **Jest**, **supertest**, **jest-environment-node**, **`@playwright/test@1.44.0`** (aligned with the Docker image tag), **`wait-on`** (plus other packages resolved by **`npm`** from that dependency set).
+
+### Syntax validation ([`validateSyntaxLocal` in `sandboxService.js`](code/backend/services/sandboxService.js))
+
+- Before **`executeTest`** ([`executeTestCaseWithRetries` in `pipeline.js`](code/backend/pipeline.js)), the current test script string is validated in-process (**no Docker**).
+- **JavaScript:** `new Function(script)` — rejects invalid syntax early.
+- **Python:** parses via `python3` / `python` / **`py -3`** with `ast.parse` (stdin), or override **`PYTHON_SYNTAX_BIN`**. Failures emit phase **`Syntax Validation`** with status **`failed`** and follow the **same heal loop** shape as sandbox failures.
 
 ### `executeTest`
 
-- Writes the test file with an injected **preamble** so `testData` from the DB is available as `testData` (JS) or `test_data` (Python).
-- **Resets** known JSON data files in the app directory if they exist: `todos.json` → `[]`, `users.json` → `[]`, `sessions.json` → `{}` to avoid cross-test pollution.
-- **JavaScript:** Installs any **extra** npm dependencies detected from the test script (AST or regex) not already in the preinstall set, then runs **`npx jest`** (via `sh -c` in the container) with **no coverage**, `runInBand`, 30s test timeout, merged stdout/stderr.
-- **Python:** Installs `pytest`, `flask`, `requests`, `pytest-cov`, and detected imports, then runs **pytest** on the file.
-- **Timeout:** `SANDBOX_TIMEOUT_MS` (default 120000) applies to Docker operations and the test run.
+- Writes the script with an injected **preamble** so `testData` from the DB is available as **`testData`** (JS) or **`test_data`** (Python).
+- **Resets** known JSON fixture files in the sandbox if they exist for sample apps: `todos.json` → `[]`, `users.json` → `[]`, `sessions.json` → `{}`.
+- **`testLanguage`: JavaScript**
+
+  **Path A — Unit-style (default): Jest.** If `testLanguage === 'javascript'` and the **`testScript` body** (before preamble) does **not** contain the substring **`@playwright/test`**, the file is named per the caller (e.g. `test_<id>_attempt<n>.spec.js`). Extra npm deps from AST/import extraction are installed when not listed in **`PREINSTALLED`**. Runs **`./node_modules/.bin/jest <filename> …`** (**no coverage**, **`runInBand`**, **`testEnvironment=node`**, 30 s timeout) via **`spawnCapture`** (merged stdout/stderr).
+
+  **Path B — E2E: Playwright Test.** Detection: **`testScript` includes `'@playwright/test'`**. The file written to **`/app/autoqa.spec.js`** (fixed name). Loads **`package.json`** from the clone: **`scripts.dev`** → detached **`npm run dev`**, else **`scripts.start`** → **`npm run start`**; if neither exists → **early error**: `Dev server failed to start: missing scripts.dev or scripts.start in package.json`.
+
+  Waits after each run for HTTP readiness (**`wait-on`**): **`targetUrl`** is **`http://localhost:<port>`** with port **5173** if **`vite`** appears in **`dependencies`** / **`devDependencies`**, else **3000** if **`next`**, **`@next/next`**, or **`react-scripts`** appears; otherwise **5173** (heuristic).
+
+  Starts the dev command with **`docker exec -d`**; then **`npx wait-on <url> -t 30000`**. Runs **`npx playwright test autoqa.spec.js --workers=1`** (see [Playwright CLI](https://playwright.dev/docs/test-cli)). **`finally`:** teardown via **`docker exec … pkill -f node`** (`killPlaywrightBackgroundProcesses`) whenever the detached server was started (`didStartDevServer`) — avoids leaving dev servers tied to ports between cases on the pool slot (**broad matcher**).
+
+- **`testLanguage`: Python** — installs `pytest`, `flask`, `requests`, **`pytest-cov`**, detected imports (**minus builtins**); runs **`pytest`** on the file.
+
+- **`Timeout`:** **`SANDBOX_TIMEOUT_MS`** (default **120 000**) applies to **`docker`** operations and **`spawnCapture`** for the harness (dev-server wait adds its own capped timeout).
 
 ### Healing ([`MAX_HEAL_ATTEMPTS` = 3](code/backend/pipeline.js))
 
 - On **failure**, the last failure output is sent to [`repairTestCaseScript`](code/backend/services/llmService.js). The model returns an updated `testScript`.
-- The process **repeats** until success or max attempts. If the healer or LLM throws, the attempt is logged and the run may still eventually record failure.
-- **Important:** The **application under test is not modified** by healing — only the **generated test** code changes. Product bugs that cannot be “fixed” by adjusting the test may remain failing after all heals.
+- The process **repeats** until success or max attempts. **Syntax validation failures** consume an attempt before Docker; **sandbox** failures/healing behave the same. If the healer or LLM throws, the attempt is logged and the run may still eventually record failure.
+- **Important:** The **application under test is not modified** by healing — only the **generated test** code changes.
 
 ### Cleanup
 
-- [`cleanupSandboxPool`](code/backend/services/sandboxService.js) stops/removes containers and deletes sandbox directories (order matters on **Windows** due to Docker volume locks: stop container first).
+- [`cleanupSandboxPool`](code/backend/services/sandboxService.js) stops/removes containers and deletes sandbox directories (order matters on **Windows**: stop container **before** unlinking mounts).
+
+---
+
+## Code context pruning (`astPrunerService`)
+
+Implemented in [`astPrunerService.js`](code/backend/services/astPrunerService.js) and wired from [`pipeline.js`](code/backend/pipeline.js) (`pruneFileContentForContext` on each **`codeContextSection`** file line — optional DEBUG log **`onPrune`** per file).
+
+- Applies only when a file exceeds **`LARGE_FILE_CHARS`** (**5000** characters).
+- **`.js` / `.jsx` / `.ts` / `.tsx`:** Parses with **`@babel/parser`** ( **`typescript`** + **`jsx`** ), traverses **`FunctionDeclaration`**, **`FunctionExpression`** / **`ArrowFunctionExpression`** (block bodies), **`ClassMethod`** / **`ClassPrivateMethod`**. **`BlockStatement`s** spanning **more than five lines** collapse to stubs (`void 0` + block comment **`Implementation hidden to save tokens`**) unless a **top-level JSX return** is detected (~React): then leading statements replaced with **`/* Component logic hidden */`** preserving the **`return (… JSX …)`** for Playwright **`data-testid`** / locator hints. Parse errors **return original** source.
+- **`.py`:** Heuristic line scan for **`def`** / **`class`** bodies **over five lines**, replaced by **`pass  # Implementation hidden to save tokens`**.
+- **`ensureWithinBudget`** in [`llmService.js`](code/backend/services/llmService.js) remains **separate**, last-resort truncation of oversized prompt **`input`** for token budgeting.
 
 ---
 
@@ -840,12 +878,12 @@ The repo includes a maintenance script [code/backend/scripts/clearPipelineTestDa
 | **Sandbox / Docker errors** | Docker running? Disk space? `SANDBOX_TIMEOUT_MS` high enough? Private repo needs `GITHUB_TOKEN` for clone. |
 | **Webhooks 401** | Signature mismatch: verify secret bytes, and that the GitHub app matches how `verifyGitHubSignature` builds the HMAC. |
 | **Double runs** | Same PR URL re-delivered: dedupe only works **in-process**; two Node instances will not share `_activePipelineRuns`. |
+| **Syntax validation fails** | Inspect `phase_update` **`Syntax Validation`**. Broken **`testScript`** from the generator may need **`repairTestCaseScript`**; ensure JS is valid **`new Function`**, Python parses as **`ast`**. |
+| **Playwright: dev server fails** | Sandbox requires **`scripts.dev`** or **`scripts.start`** in the cloned repo **`package.json`**. Errors like **`wait-on` timeout**, wrong port heuristic (**vite** ⇒ 5173, **next** / **`react-scripts`** ⇒ 3000), or orphaned processes — check SANDBOX logs; **`SANDBOX_TIMEOUT_MS`** affects **`docker`**/install. |
 | **Regression when you expected generation** | `REGRESSION_ENABLED` and `classifyPrAsBugFix` — a linked **Jira Bug** or high-confidence “bug fix” from the LLM triggers **epic regression** and **skips** new test generation. |
-
----
 
 ## License and documentation
 
 - Project license: see [`code/backend/package.json`](code/backend/package.json) (`"license": "ISC"`).
 
-- This README is **descriptive of the current codebase** (including [Repository layout](#repository-layout), [Application flow (end-to-end)](#application-flow-end-to-end), and [LLM context reference](#llm-context-reference)); if you change event names, routes, env flags, LLM prompts, or add/remove files, update this file in the same commit when possible.
+- This README is **descriptive of the current codebase** (including [Repository layout](#repository-layout), [Application flow (end-to-end)](#application-flow-end-to-end), [LLM context reference](#llm-context-reference), [Sandbox execution](#sandbox-execution-and-test-healing), and [Code context pruning](#code-context-pruning-astprunerservice)); if you change event names, routes, env flags, LLM prompts, sandbox images, or add/remove files, update this document in the same commit when possible.

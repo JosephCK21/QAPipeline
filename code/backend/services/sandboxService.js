@@ -1,7 +1,7 @@
 const fs = require('fs/promises');
 const fssync = require('fs');
 const path = require('path');
-const { exec, execFile, spawn } = require('child_process');
+const { exec, execFile, execFileSync, spawn } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 const execFilePromise = util.promisify(execFile);
@@ -127,6 +127,61 @@ async function dockerRun(args, timeoutMs = 120000) {
     return execFilePromise('docker', args, { timeout: timeoutMs });
 }
 
+const PLAYWRIGHT_WAIT_ON_MS = 30000;
+
+/**
+ * @param {string} sandboxDir
+ * @returns {Promise<object|null>}
+ */
+async function loadPackageJsonForPlaywright(sandboxDir) {
+    const p = path.join(sandboxDir, 'package.json');
+    try {
+        const raw = await fs.readFile(p, 'utf8');
+        return JSON.parse(raw);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * @param {object|null} pkg
+ * @returns {{ devShellCmd: string | null, port: number, targetUrl: string }}
+ */
+function resolveDevCommandAndPort(pkg) {
+    if (!pkg || typeof pkg !== 'object') {
+        return { devShellCmd: null, port: 5173, targetUrl: 'http://localhost:5173' };
+    }
+    const scripts = pkg.scripts || {};
+    let devShellCmd = null;
+    if (scripts.dev) devShellCmd = 'npm run dev';
+    else if (scripts.start) devShellCmd = 'npm run start';
+
+    const merged = { ...pkg.dependencies, ...pkg.devDependencies };
+    const keys = Object.keys(merged);
+    const has = (name) => keys.includes(name);
+    let port = 5173;
+    if (has('vite')) {
+        port = 5173;
+    } else if (has('next') || has('@next/next') || has('react-scripts')) {
+        port = 3000;
+    }
+
+    const targetUrl = `http://localhost:${port}`;
+    return { devShellCmd, port, targetUrl };
+}
+
+async function killPlaywrightBackgroundProcesses(containerName) {
+    try {
+        await execFilePromise(
+            'docker',
+            ['exec', containerName, 'sh', '-c', 'pkill -f node || true'],
+            { timeout: 30000 }
+        );
+    } catch (e) {
+        console.warn(`[Sandbox] Playwright dev server cleanup warning: ${e.message}`);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SANDBOX LIFECYCLE
 // ---------------------------------------------------------------------------
@@ -195,7 +250,7 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
                     '--name', containerName,
                     '-v', `${volumeDir}:/app`,
                     '-w', '/app',
-                    'node:20-slim',
+                    'mcr.microsoft.com/playwright:v1.44.0-jammy',
                     'tail', '-f', '/dev/null'
                 ], runTimeoutMs);
 
@@ -213,9 +268,9 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
                 await dockerRun([
                     'exec', containerName,
                     'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock',
-                    'jest', 'supertest', 'jest-environment-node'
+                    'jest', 'supertest', 'jest-environment-node', '@playwright/test@1.44.0', 'wait-on'
                 ], installTimeoutMs);
-                console.log(`[Sandbox] Pre-installed jest in ${containerName}.`);
+                console.log(`[Sandbox] Pre-installed jest, @playwright/test, and wait-on in ${containerName}.`);
             } catch (err) {
                 console.error(`[Sandbox] Container startup failed for ${containerName}:`, err.message);
                 throw err;
@@ -236,10 +291,14 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
  * On Windows, Node.js execFile has a race condition (issue #56430) where
  * stdout/stderr pipes are destroyed before all data is read when the child
  * exits non-zero. spawn with `detached: false` keeps the pipes connected,
- * reliably capturing the full Jest/pytest output even on failure — which is
+ * reliably capturing the full Jest/Playwright/pytest output even on failure — which is
  * critical for the healer to see what went wrong.
  */
 async function executeTest(containerName, sandboxDir, testLanguage, testContent, testFilename, testData = {}) {
+    const isPlaywrightTest = testLanguage === 'javascript'
+        && typeof testContent === 'string'
+        && testContent.includes('@playwright/test');
+
     let scriptToRun = testContent;
     if (testLanguage === 'javascript') {
         scriptToRun = `const testData = ${JSON.stringify(testData, null, 2)};\n\n${testContent}`;
@@ -258,7 +317,8 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
         }
     }
 
-    const testPath = path.join(sandboxDir, testFilename);
+    const effectiveTestFilename = isPlaywrightTest ? 'autoqa.spec.js' : testFilename;
+    const testPath = path.join(sandboxDir, effectiveTestFilename);
     await fs.writeFile(testPath, scriptToRun, 'utf8');
 
     const dependencies = extractDependencies(testContent, testLanguage);
@@ -266,7 +326,10 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
 
     try {
         if (testLanguage === 'javascript') {
-            const PREINSTALLED = new Set(['jest', 'supertest', 'jest-environment-node']);
+            // extractDependencies maps '@playwright/test' to '@playwright' (first path segment).
+            const PREINSTALLED = new Set([
+                'jest', 'supertest', 'jest-environment-node', '@playwright/test', '@playwright', 'wait-on'
+            ]);
             const extraDeps = dependencies.filter(d => !PREINSTALLED.has(d));
 
             if (extraDeps.length > 0) {
@@ -277,12 +340,59 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                 );
             }
 
+            if (isPlaywrightTest) {
+                const pkg = await loadPackageJsonForPlaywright(sandboxDir);
+                const { devShellCmd, targetUrl } = resolveDevCommandAndPort(pkg);
+                if (!devShellCmd) {
+                    throw new Error('Dev server failed to start: missing scripts.dev or scripts.start in package.json');
+                }
+
+                let didStartDevServer = false;
+                try {
+                    await execFilePromise(
+                        'docker',
+                        ['exec', '-d', '-w', '/app', containerName, 'sh', '-c', devShellCmd],
+                        { timeout: testTimeout }
+                    );
+                    didStartDevServer = true;
+
+                    try {
+                        await execFilePromise(
+                            'docker',
+                            [
+                                'exec', containerName,
+                                'npx', 'wait-on', targetUrl,
+                                '-t', String(PLAYWRIGHT_WAIT_ON_MS)
+                            ],
+                            { timeout: PLAYWRIGHT_WAIT_ON_MS + 10000 }
+                        );
+                    } catch (waitErr) {
+                        const stderr = waitErr.stderr != null
+                            ? (Buffer.isBuffer(waitErr.stderr) ? waitErr.stderr.toString() : String(waitErr.stderr))
+                            : '';
+                        const detail = stderr.trim() || waitErr.message || String(waitErr);
+                        throw new Error(`Dev server failed to start: ${detail}`);
+                    }
+
+                    const runCmd = 'npx playwright test autoqa.spec.js --workers=1 2>&1';
+                    const { stdout, stderr } = await spawnCapture(
+                        'docker', ['exec', containerName, 'sh', '-c', runCmd],
+                        { timeout: testTimeout }
+                    );
+                    return { success: true, output: (stdout + '\n' + stderr).trim() };
+                } finally {
+                    if (didStartDevServer) {
+                        await killPlaywrightBackgroundProcesses(containerName);
+                    }
+                }
+            }
+
             // Use spawnCapture — reliably captures stdout+stderr on Windows even
             // when the process exits non-zero (unlike execFilePromise which drops them).
             // Merge stderr into stdout via sh -c "... 2>&1" so all output is in one stream.
-            const jestCmd = `./node_modules/.bin/jest ${testFilename} --no-coverage --forceExit --runInBand --testEnvironment=node --testTimeout=30000 2>&1`;
+            const runCmd = `./node_modules/.bin/jest ${testFilename} --no-coverage --forceExit --runInBand --testEnvironment=node --testTimeout=30000 2>&1`;
             const { stdout, stderr } = await spawnCapture(
-                'docker', ['exec', containerName, 'sh', '-c', jestCmd],
+                'docker', ['exec', containerName, 'sh', '-c', runCmd],
                 { timeout: testTimeout }
             );
             return { success: true, output: (stdout + '\n' + stderr).trim() };
@@ -319,6 +429,85 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
     }
 }
 
+const PYTHON_AST_PARSE_SCRIPT = 'import sys, ast; ast.parse(sys.stdin.read())';
+
+/**
+ * In-memory syntax check before Docker. Does not execute the test body.
+ * @param {string} testScript
+ * @param {string} language - "javascript" | "python" | other (returns valid for unknown)
+ * @returns {{ valid: true } | { valid: false, error: string }}
+ */
+function validateSyntaxLocal(testScript, language) {
+    const script = testScript == null ? '' : String(testScript);
+    const lang = String(language || '').toLowerCase();
+
+    if (lang === 'javascript') {
+        try {
+            // eslint-disable-next-line no-new-func
+            new Function(script);
+            return { valid: true };
+        } catch (e) {
+            return { valid: false, error: e.message || String(e) };
+        }
+    }
+
+    if (lang === 'python') {
+        return validatePythonSyntaxAst(script);
+    }
+
+    return { valid: true };
+}
+
+function validatePythonSyntaxAst(script) {
+    const inputBuf = Buffer.from(script, 'utf8');
+    const maxBuffer = Math.max(2 * 1024 * 1024, (inputBuf.length || 1) * 4);
+
+    /** @type {Array<string[]>} exe plus optional argv prefix (e.g. py -3) */
+    const attempts = [];
+    if (process.env.PYTHON_SYNTAX_BIN && String(process.env.PYTHON_SYNTAX_BIN).trim()) {
+        attempts.push(process.env.PYTHON_SYNTAX_BIN.trim().split(/\s+/));
+    }
+    attempts.push(['python3'], ['python'], ['py', '-3']);
+
+    let lastENOENT = false;
+    const seen = new Set();
+
+    for (const parts of attempts) {
+        const key = parts.join(' ');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const exe = parts[0];
+        const suffix = [...parts.slice(1), '-c', PYTHON_AST_PARSE_SCRIPT];
+        try {
+            execFileSync(exe, suffix, {
+                input: inputBuf,
+                maxBuffer,
+                windowsHide: true
+            });
+            return { valid: true };
+        } catch (e) {
+            if (e.code === 'ENOENT') {
+                lastENOENT = true;
+                continue;
+            }
+            const stderrRaw = e.stderr != null ? e.stderr : '';
+            const stderr = Buffer.isBuffer(stderrRaw)
+                ? stderrRaw.toString('utf8')
+                : String(stderrRaw);
+            const msg = stderr.trim() || e.message || String(e);
+            return { valid: false, error: msg };
+        }
+    }
+
+    const tail = lastENOENT
+        ? ' (no python3/python/py on PATH; set PYTHON_SYNTAX_BIN or install Python)'
+        : '';
+    return {
+        valid: false,
+        error: `Python syntax check failed: no interpreter succeeded${tail}`
+    };
+}
+
 /**
  * Stops and removes the persistent containers, then deletes the sandbox directories.
  * The container must be stopped BEFORE deleting the directory on Windows —
@@ -353,5 +542,6 @@ function cleanupSandboxPool(runId, pool) {
 module.exports = {
     createSandboxPool,
     executeTest,
+    validateSyntaxLocal,
     cleanupSandboxPool,
 };

@@ -665,6 +665,43 @@ Ensure no open handles (servers, intervals, sockets) remain after tests — add 
 If you already tried a similar approach in a previous turn and it failed, use a completely different strategy.
 Return ONLY the corrected script body. No explanation, no markdown fences, no comments about what changed. Just the raw executable code.`;
 
+/**
+ * Few-shot structural templates for JSON testScript output (style/layout only — not runnable against a specific repo).
+ * Injected only into generateTestCasesForScenario user input ([REFERENCE EXAMPLES] block).
+ */
+const FEW_SHOT_EXAMPLES = {
+    javascript: `jest.mock('../lib/widget', () => ({
+  load: jest.fn(() => ({ id: 'mock-record', ok: true }))
+}));
+
+describe('StructuralExample_notTheAppUnderTest', () => {
+  it('uses a mock and reads inputs from injected testData only', () => {
+    const widget = require('../lib/widget');
+    const result = widget.load(testData.req.id);
+
+    expect(widget.load).toHaveBeenCalledWith(testData.req.id);
+    expect(result.ok).toBe(true);
+  });
+});`,
+    python: `import pytest
+from unittest.mock import MagicMock
+
+
+@pytest.fixture
+def test_data():
+    return {"req": {"id": "stub-001"}, "expected_ok": True}
+
+
+def test_structural_fixture_and_mock(test_data):
+    mock_widget = MagicMock()
+    mock_widget.load.return_value = {"id": "mock-record", "ok": test_data["expected_ok"]}
+
+    out = mock_widget.load(test_data["req"]["id"])
+    assert mock_widget.load.called
+    assert out["ok"] is test_data["expected_ok"]
+`
+};
+
 // ---------------------------------------------------------------------------
 // Test case generation
 //
@@ -748,6 +785,16 @@ ${codeContextSection || 'No additional context.'}
 
 [DEPENDENCIES / PACKAGE INFO]:
 ${dependenciesSection || 'Not available.'}
+
+[REFERENCE EXAMPLES]
+These snippets illustrate FORMATTING AND STYLE ONLY. They are not the repository under review; do not copy paths or mocks literally—adapt the patterns to this PR's actual modules and filenames.
+At runtime JavaScript scripts receive an injected preamble: const testData = {"..."}; — the examples below reference testData the same way your testScript must (never declare const testData yourself).
+
+--- JavaScript structural example ---
+${FEW_SHOT_EXAMPLES.javascript}
+
+--- Python structural example ---
+${FEW_SHOT_EXAMPLES.python}
 
 Generate 2-4 concrete test cases for this scenario. Each test case must:
 - Have a unique testCaseId in format: TCN-${scenario.id}-<index>
