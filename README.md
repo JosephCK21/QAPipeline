@@ -1,102 +1,770 @@
 # AutoQA
 
-AutoQA is an AI-assisted quality workflow that links **Jira** (stories, epics, acceptance criteria), **GitHub** (PRs and file context), and **Google Gemini** to generate structured test scenarios, persist them, optionally comment back on Jira, and run a **PR test pipeline** (mapping scenarios, generating test cases, sandbox runs, and heal retries). A **React** dashboard talks to a **Node.js** backend over REST and **Socket.IO** for live updates.
+AutoQA is a local, AI-assisted quality workflow for teams that use **Jira** for requirements and **GitHub** for code. It maintains a **requirements traceability matrix (RTM)–style** catalog of test scenarios, links each AutoQA “project” to a Jira space and a GitHub repository, and runs a **pull request (PR) pipeline** that: maps PR changes to relevant scenarios, uses the **OpenAI API** to generate or reuse executable test scripts, runs them in an isolated **Docker** sandbox, and on failure can **heal** (automatically repair) the generated test script a limited number of times. A **React** dashboard (Vite) talks to a **Node.js** backend over REST and **Socket.IO** for live run updates.
+
+This document is a technical reference: architecture, **application flow**, **what each LLM call receives**, **full repository file index**, data model, workflows, API surface, configuration, and operations.
 
 ---
 
-## Example PR pipeline flow
+## Table of contents
 
-This is the path implemented in `code/backend/pipeline.js`, normally started when GitHub sends a **`pull_request`** webhook (`opened`, **`synchronize`**, or **`reopened`**) to `POST /api/webhooks/github`. The repository must already be **linked to a local AutoQA project** that has a **Jira project key**; otherwise the webhook is ignored. Scenarios for that Jira project should exist (for example from a prior **Sync Jira** / Jira pipeline run) so the mapper has something to attach to the PR.
+1. [Overview and goals](#overview-and-goals)
+2. [High-level architecture](#high-level-architecture)
+3. [Application flow (end-to-end)](#application-flow-end-to-end)
+4. [LLM context reference](#llm-context-reference)
+5. [Repository layout](#repository-layout) — tracked tree, root scripts, full file index
+6. [Data model](#data-model)
+7. [Workflow: Jira to scenarios (RTM)](#workflow-jira-to-scenarios-rtm)
+8. [Workflow: GitHub PR to test run](#workflow-github-pr-to-test-run)
+9. [Bug-fix classification and epic regression](#bug-fix-classification-and-epic-regression)
+10. [Sandbox execution and test healing](#sandbox-execution-and-test-healing)
+11. [Run outcome semantics](#run-outcome-semantics)
+12. [HTTP API reference](#http-api-reference)
+13. [Real-time events (Socket.IO)](#real-time-events-socketio)
+14. [Frontend map](#frontend-map)
+15. [Configuration (environment variables)](#configuration-environment-variables)
+16. [Local development and operations](#local-development-and-operations)
+17. [Failure handling and dead letter queue](#failure-handling-and-dead-letter-queue)
+18. [Security notes](#security-notes)
+19. [Troubleshooting](#troubleshooting)
 
-**Concrete example:** a developer opens a PR against `acme/widget-app` that changes the checkout module. AutoQA already has a project linking `acme/widget-app` to Jira project `WID`, and several scenarios were synced from Jira earlier.
+---
 
-1. **Webhook received** — GitHub delivers the PR payload. The backend responds `202 Accepted`, creates a new **run** id, emits **`pr_opened`** over Socket.IO for the dashboard, and starts **`runPipeline(runId, prUrl, repoFullName)`** in the background.
+## Overview and goals
 
-2. **Initializing** — Run status is set to *running*; the UI can show the new pipeline run row.
+- **Scenarios in SQLite** (`rtm_scenarios`) represent testable conditions derived from or aligned with Jira (stories, epics, acceptance criteria). They are the backbone of the RTM and of PR mapping.
+- **GitHub webhooks** drive PR runs: when a linked repo receives a qualifying `pull_request` event, AutoQA spawns a **run** (UUID), streams progress to the UI, and executes [`runPipeline`](code/backend/pipeline.js) asynchronously after responding **202 Accepted** to GitHub.
+- **OpenAI** (via the official `openai` SDK in [`llmService.js`](code/backend/services/llmService.js)) powers: Jira → scenario generation, PR → scenario mapping, per-scenario test case generation, test script **repair** (healing), and optional **bug-fix vs feature** classification for regression mode.
+- **Execution** is not in-process: a pool of **Docker** containers with the PR branch cloned and dependencies installed runs **Jest** (JavaScript) or **pytest** (Python) for each generated file.
 
-3. **PR mapping** — The backend loads **Jira scenarios** stored for the linked project, fetches **PR metadata and diffs** from GitHub, optionally pulls text from **uploaded project documents**, and calls **`mapPrChangesToScenarios`** (Gemini-assisted) to produce a list of **which scenarios this PR is intended to cover**. If the list is empty, the run completes with a warning and **no tests** are generated.
+**Who uses it:** A developer or QA engineer configures projects in the UI, keeps Jira in sync, and uses the dashboard to watch PR runs, inspect test cases, and read logs.
 
-4. **Code context** — For the PR’s head branch, the pipeline fetches **full contents of changed files**, **likely related test files** (inferred paths), and **dependency hints** (for example `package.json`). These are assembled into prompts for the next phase.
+---
 
-5. **Refinement (optional)** — If existing **test cases** in the DB already reference files touched by this PR, they are marked **superseded** so new versions can replace them; generation can treat those as **refinement** with the previous script as context.
-
-6. **Test generation (per mapped scenario)** — For each mapped scenario, **Gemini** generates a small set of concrete **test cases** (steps, data, executable script, language). Each case is **saved to SQLite** and linked to the run and PR.
-
-7. **Sandbox testing and healing** — A **shared sandbox directory** is created once per run. For each generated test case, the script runs in the **sandbox** (Node or Python). On failure, the pipeline asks Gemini to **repair the script** and retries, up to **three attempts** per test case. Pass/fail is written back to the DB; events and summaries stream to the UI.
-
-8. **Per-scenario rollup** — After all test cases for a scenario finish, the run records whether that scenario **passed**, **failed**, or **partially** passed.
-
-9. **Finish** — Sandbox files are cleaned up, final phases (including a **Test Healing** marker reflecting whether any retries occurred) are emitted, and the run is marked **completed** or **failed** according to whether anything passed overall.
+## High-level architecture
 
 ```mermaid
-flowchart TD
-    A[GitHub pull_request webhook] --> B{Repo linked to project with Jira key?}
-    B -->|No| Z[Ignore]
-    B -->|Yes| C[Create run + runPipeline]
-    C --> D[PR mapping: scenarios + diff + docs]
-    D --> E{Any mapped scenarios?}
-    E -->|No| Y[Complete: nothing to test]
-    E -->|Yes| F[Fetch code context + deps]
-    F --> G[Refinement: supersede old cases if needed]
-    G --> H[For each scenario: Gemini test cases]
-    H --> I[Sandbox run + heal retries]
-    I --> J[Update run + Socket.IO events]
-    J --> K[Cleanup + complete]
+flowchart TB
+  subgraph ext [External services]
+    GH[GitHub]
+    JiraAPI[Jira REST]
+    JiraWh[Jira webhooks optional]
+    OAI[OpenAI API]
+  end
+  subgraph app [AutoQA backend]
+    API[Express server.js]
+    IO[Socket.IO]
+    DB[(SQLite autoqa.db)]
+    Pipe[pipeline.js]
+    Jpipe[jiraPipeline.js]
+    Sand[sandboxService.js]
+  end
+  subgraph ui [Frontend]
+    Vite[Vite + React]
+  end
+  GH -->|webhooks| API
+  JiraWh -->|webhooks| API
+  API -->|sync| JiraAPI
+  API --> Pipe
+  API --> Jpipe
+  Pipe --> OAI
+  Jpipe --> OAI
+  Pipe --> Sand
+  API --> DB
+  Jpipe --> DB
+  API --> IO
+  IO <--> Vite
 ```
+
+- **Single HTTP server** ([`code/backend/server.js`](code/backend/server.js)) wraps Express and attaches Socket.IO to the same `http.Server`. `global.io` is set so pipeline and Jira code can broadcast.
+- **Persistence:** [`better-sqlite3`](code/backend/db.js) with WAL mode. Projects are also stored in [`code/backend/data/projects.json`](code/backend/services/projectStore.js) (JSON on disk, not a SQL table).
+- **Pipelines:** [`pipeline.js`](code/backend/pipeline.js) (PR test flow); [`jiraPipeline.js`](code/backend/jiraPipeline.js) (Jira-driven scenario generation).
+
+---
+
+## Application flow (end-to-end)
+
+**Actors:** operators using the React dashboard; **GitHub** (repos, API, PR webhooks); **Jira** (REST, optional webhooks); **OpenAI** via [`llmService.js`](code/backend/services/llmService.js); **Docker** for sandbox execution. The backend owns orchestration ([`server.js`](code/backend/server.js)), SQLite ([`db.js`](code/backend/db.js)), and real-time UI updates (Socket.IO).
+
+### Jira to RTM scenarios ([`runJiraPipeline`](code/backend/jiraPipeline.js))
+
+Triggered by manual **`POST .../sync-jira`**, **`POST .../webhooks/jira`**, or the queue processor after an accepted job. The pipeline loads the AutoQA project’s **associated Jira project documents**, extracts text (`extractTextFromFiles`), then calls **`generateTestScenariosForEpic`** (batch epic path) or **`generateTestScenarios`** per story from [`llmService.js`](code/backend/services/llmService.js)—not [`jiraScenarioService.js`](code/backend/services/jiraScenarioService.js) (see [LLM context reference](#llm-context-reference)). Each scenario is **`upsertScenario`**’d into SQLite and optional **`postScenarioComment`** updates Jira stories. Completion emits **`jira_scenarios_generated`** / **`refresh_data`** over Socket.IO.
+
+```mermaid
+flowchart LR
+  subgraph sources [Triggers]
+    M[Manual sync-jira]
+    JW[Jira webhook POST]
+  end
+  subgraph jiraPipe [runJiraPipeline]
+    Doc[extractTextFromFiles]
+    LLM[generateTestScenarios Epic or Story]
+    U[upsertScenario]
+    Cm[Optional Jira comment]
+  end
+  Q[jiraWebhookQueueService]
+  M --> Q
+  JW --> Q
+  Q --> Doc
+  Doc --> LLM --> U --> Cm
+```
+
+### GitHub PR to tests ([`runPipeline`](code/backend/pipeline.js))
+
+A qualifying **`pull_request`** webhook returns **202** immediately with a **`runId`**; **`runPipeline`** continues asynchronously. It **loads scenarios from SQLite**, fetches **PR metadata and files** plus **optional project document text**, then calls **`mapPrChangesToScenarios`** to choose **`scenarioId`s**. Next, **`classifyPrAsBugFix`** (if regression mode is enabled) runs **in parallel with** **`buildCodeContext`** (full files on the PR head, inferred test paths, dependency text). Depending on regression rules, either **epic regression** reuses existing **`test_cases`** or **generateTestCasesForScenario** runs **per mapped scenario**. Tests execute in a **sandbox pool**; failures invoke **`repairTestCaseScript`** until success or **max heals**. Progress streams via **`run_updated`** events.
+
+```mermaid
+flowchart TB
+  A202[Webhook 202 Accepted]
+  MAP[mapPrChangesToScenarios]
+  PAR[classifyPrAsBugFix and buildCodeContext in parallel]
+  BR{Bug fix and epic regression?}
+  GEN[generateTestCasesForScenario]
+  REG[runEpicRegression]
+  POOL[Sandbox pool executeTestCase plus repair when needed]
+  END[complete plus cleanup]
+  A202 --> MAP --> PAR --> BR
+  BR -->|yes| REG --> POOL --> END
+  BR -->|no| GEN --> POOL --> END
+```
+
+In the diagram, **`REG`** is taken when **`REGRESSION_ENABLED`** is on and **`classifyPrAsBugFix`** classifies the PR as a bug fix—then **new generation may be skipped** (see [Bug-fix classification and epic regression](#bug-fix-classification-and-epic-regression)). Otherwise the **`no`** branch runs **`GEN`** then **sandbox** execution.
+
+---
+
+## LLM context reference
+
+Every production LLM step uses the OpenAI **Responses** API (`client.responses.create`): a **fixed `instructions`** string is kept stable for **prompt caching** (**`buildCacheParams`** / **`CACHE_KEYS`** in [`llmService.js`](code/backend/services/llmService.js)); the **`input`** field carries variable PR/Jira/context text. **`emitLlmTrace`** publishes **`llm_trace`** Socket.IO events (paired request/response) for the Agent Console.
+
+### Call matrix: `instructions` versus variable `input`
+
+| Caller (trace label) | When it runs | Instructions constant | Variable `input` contains |
+|---------------------|--------------|----------------------|---------------------------|
+| `mapPrChangesToScenarios` | PR pipeline after **`fetchPRDetails`** + project docs ([`pipeline.js`](code/backend/pipeline.js)) | [`PR_MAPPING_INSTRUCTIONS`](code/backend/services/prScenarioMappingService.js) | **`SCENARIO CATALOG`** — JSON of normalized RTM scenarios from DB; **`PULL REQUEST CONTEXT`** — title, branch; **`CHANGED FILES`** — JSON per file `filename`, `status`, **`patch` (≤ ~6000 chars)** and **`fullContent` (≤ ~6000 chars)**; **`PROJECT DOCUMENTS`** — text blobs **≤ 5** slices ([`prScenarioMappingService.js`](code/backend/services/prScenarioMappingService.js)). Non-code extensions are omitted from mapping. |
+| `classifyPrAsBugFix` | After mapping; **skipped** when **`REGRESSION_ENABLED`** is **`false`** ([`pipeline.js`](code/backend/pipeline.js)); **LLM skipped entirely** when any linked Jira issue is typed **Bug** unless **`REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG`** ([`prClassificationService.js`](code/backend/services/prClassificationService.js)) | [`CLASSIFIER_INSTRUCTIONS`](code/backend/services/prClassificationService.js) | **`PR TITLE`**, **`PR BRANCH`**, **`PR BODY`**; **`LINKED JIRA ISSUES`** (types from REST); **`CHANGED FILES`** — **`buildDiffDigest`**: up to **20** files, **`patch`** truncated to **1500** chars each, plus truncation note if more files exist ([`prClassificationService.js`](code/backend/services/prClassificationService.js)). |
+| `generateTestScenarios` | **`runJiraPipeline`** per story (single-story loop) ([`jiraPipeline.js`](code/backend/jiraPipeline.js)) | [`SCENARIO_SYSTEM_INSTRUCTION`](code/backend/services/llmService.js) | Epic key/summary, Story key/title/description, AC, **`Supporting Documents`** (`localDocsText`), optional **already-assigned scenario IDs** to avoid duplicates ([`generateTestScenarios`](code/backend/services/llmService.js)). |
+| `generateTestScenariosForEpic` | **`runJiraPipeline`** batch epic path ([`jiraPipeline.js`](code/backend/jiraPipeline.js)) | [`SCENARIO_SYSTEM_INSTRUCTION`](code/backend/services/llmService.js) | Epic line, **`Supporting Documents`**, concatenated stories (description + AC), valid **`storyId`/`epicId`** lists ([`generateTestScenariosForEpic`](code/backend/services/llmService.js)); on failure falls back to **`generateTestScenarios`** per story. |
+| `generateTestCasesForScenario` | PR pipeline per **mapped scenario** ([`pipeline.js`](code/backend/pipeline.js)) — **skipped** when going straight to **`runEpicRegression`** | [`TESTCASE_GENERATION_INSTRUCTIONS`](code/backend/services/llmService.js) | **Scenario** — `ID`, description, type, priority, **`acceptanceCriteriaRef`** if present; **`[CHANGED CODE DIFF]`** (`prDiffSection` from PR files); **`[FULL FILE CONTENTS]`** concatenated **`codeContextSection`** (changed files plus **existing test file** contents); **`[DEPENDENCIES / PACKAGE INFO]`**; optional **`[REFINEMENT]`** previous **`testScript`** plus version when superseding ([`generateTestCasesForScenario`](code/backend/services/llmService.js)); optional **`alreadyGeneratedSummary`** (parallel gen currently passes empty). Threads **`conversationId`** / **`previousInteractionId`** from superseded **`test_cases`** ([`pipeline.js`](code/backend/pipeline.js)). |
+| `repairTestCaseScript` | After sandbox **failure** (`executeTestCaseWithRetries`); up to **`MAX_HEAL_ATTEMPTS`** ([`pipeline.js`](code/backend/pipeline.js)) | [`HEAL_INSTRUCTIONS`](code/backend/services/llmService.js) | **Stateful path** (prior conversation or **`previous_response_id`):** minimal user message — last failure output + failing **`testScript`** only ([`repairTestCaseScript`](code/backend/services/llmService.js)). **Stateless fallback:** full **`testCase`**, **`failureOutput`**, **`attemptHistory`**, **`scenarioDescription`**, **`codeContextSection`**, **`testData` JSON**. |
+
+### Alternate / unused path: [`jiraScenarioService.js`](code/backend/services/jiraScenarioService.js)
+
+**[`generateScenariosFromJiraContext`](code/backend/services/jiraScenarioService.js)** uses **`JIRA_SCENARIO_INSTRUCTIONS`** plus a **`buildPrompt`** payload (epic/story/descriptions + optional extracted doc chunks). Nothing in **`jiraPipeline.js`** **`require`**s this module today—it is an **alternate** implementation you could wire in; production RTM sync uses **`llmService`** scenario generators above.
+
+### Cross-cutting mechanics ([`llmService.js`](code/backend/services/llmService.js))
+
+- **`OPENAI_STATEFUL_MODE`** — **`conversation`** (Conversation API attachment), **`chain`** (**`previous_response_id`**), **`zdr`** (**`store: false`**; prior reasoning replay via **`applyStatefulInput`** and encrypted reasoning items).
+- **Prompt caching** — **`CACHE_KEYS`** per caller (`qa:pr:mapping`, `qa:testcases:generate`, …), **`prompt_cache_retention`** (e.g. **`24h`** vs **`in_memory`**).
+- **Token limits** — **`MAX_TOKENS_ALLOWED`** (**30 000**) enforced by **`assertTokenLimit`** (tiktoken **`o200k_base`**); **`OPENAI_PROMPT_BUDGET`** (**~90 %** of ceiling by default) + **`ensureWithinBudget`** trims from the **middle** of oversized strings with a visible marker.
+- **Traces** — Every request/response emits **`llm_trace`** for UI debugging (see [Frontend map](#frontend-map) Agent Console).
 
 ---
 
 ## Repository layout
 
+There is **no root `package.json`** and **no `config/` directory** in this repository: dependencies are installed per app under [`code/backend`](code/backend) and [`code/frontend`](code/frontend).
+
+### Tracked file tree
+
+Every path below is tracked by git (run `git ls-files` to regenerate). Comment lines are documentation only and are not part of the filesystem.
+
 ```text
-AutoQA/
-├── start.js                 # Starts backend + Vite dev (convenience)
-├── package.json             # Root-level deps (e.g. smee, socket.io-client)
-├── config/                  # Misc tooling config
-├── code/
-│   ├── backend/             # Express API + pipelines + SQLite
-│   │   ├── server.js        # HTTP server, routes, webhooks, Socket.IO
-│   │   ├── db.js            # SQLite (scenarios, runs, test cases, DLQ, sync log)
-│   │   ├── pipeline.js      # GitHub PR test generation & sandbox execution
-│   │   ├── jiraPipeline.js  # Jira sync → scenarios → DB + Jira comments
-│   │   ├── schemas.js       # Zod validation helpers for APIs / webhooks
-│   │   ├── data/            # autoqa.db, projects.json (created at runtime)
-│   │   ├── uploads/         # Uploaded project documents
-│   │   ├── scripts/         # CLI helpers (Jira checks, webhooks, cleanup)
-│   │   └── services/        # GitHub, Jira, Gemini, sandbox, documents, etc.
-│   └── frontend/            # Vite + React + Tailwind UI
-│       ├── src/
-│       │   ├── App.jsx
-│       │   ├── main.jsx
-│       │   ├── components/  # Dashboard UI (stepper, metrics, layout, …)
-│       │   ├── pages/       # Projects hub, dashboard, runs, settings, …
-│       │   └── lib/         # Env helpers, client utilities
-│       └── vite.config.js   # Build output: dist/
-└── README.md
+QAPipeline/
+├── .gitattributes
+├── .gitignore
+├── README.md
+├── clear.js
+├── installbeforerun.js
+├── start.js
+└── code/
+    ├── backend/
+    │   ├── .env.example
+    │   ├── db.js
+    │   ├── jiraPipeline.js
+    │   ├── package-lock.json
+    │   ├── package.json
+    │   ├── pipeline.js
+    │   ├── schemas.js
+    │   ├── server.js
+    │   ├── scripts/
+    │   │   ├── checkJiraApi.js
+    │   │   ├── clearPipelineTestData.js
+    │   │   ├── deleteJiraStoryComments.js
+    │   │   ├── deleteSayaratJiraIssues.js
+    │   │   ├── deleteTodoJiraIssues.js
+    │   │   ├── seedTodoJiraIssues.js
+    │   │   └── simulateJiraWebhook.js
+    │   └── services/
+    │       ├── documentAssociationStore.js
+    │       ├── documentParserService.js
+    │       ├── githubService.js
+    │       ├── jiraScenarioService.js
+    │       ├── jiraService.js
+    │       ├── jiraWebhookQueueService.js
+    │       ├── llmService.js
+    │       ├── prClassificationService.js
+    │       ├── prScenarioMappingService.js
+    │       ├── projectStore.js
+    │       └── sandboxService.js
+    └── frontend/
+        ├── .env.example
+        ├── index.html
+        ├── package-lock.json
+        ├── package.json
+        ├── postcss.config.js
+        ├── tailwind.config.js
+        ├── vite.config.js
+        └── src/
+            ├── App.jsx
+            ├── index.css
+            ├── main.jsx
+            ├── components/
+            │   ├── BranchPolicyMatrix.jsx
+            │   ├── DetailTabs.jsx
+            │   ├── EpicStackedChart.jsx
+            │   ├── ExecutionStepper.jsx
+            │   ├── MetricCard.jsx
+            │   ├── Navbar.jsx
+            │   ├── RTMMatrix.jsx
+            │   └── Sidebar.jsx
+            ├── lib/
+            │   ├── env.js
+            │   └── epicMetrics.js
+            └── pages/
+                ├── AgentChatDebug.jsx
+                ├── PipelineRunDetail.jsx
+                ├── PipelineRunsList.jsx
+                ├── ProjectDashboard.jsx
+                ├── ProjectSettings.jsx
+                ├── ProjectsHub.jsx
+                └── ScriptDetail.jsx
 ```
 
+### Runtime and gitignored artifacts
+
+These are **not** listed in the tree above but appear when you run or build locally:
+
+| Location | Purpose |
+|---------|---------|
+| `code/backend/node_modules/`, `code/frontend/node_modules/` | npm dependencies |
+| `code/frontend/dist/` | Production build output (`npm run build`) |
+| [`code/backend/data/`](code/backend/data) | SQLite `autoqa.db` (+ WAL/SHM) and JSON files (ignored except `.gitkeep` patterns in [`.gitignore`](.gitignore)) |
+| `code/backend/uploads/` | Uploaded requirement and Jira documents |
+| **`code/backend/scripts/seedSayaratJiraIssues.js`** | Referenced by `npm run jira:seed-sayarat`; the file itself is **`gitignored`** so local seed datasets are not committed. [`deleteSayaratJiraIssues.js`](code/backend/scripts/deleteSayaratJiraIssues.js) `require`s the same module — keep a local copy or adjust paths if you use Sayarat scripts. |
+
+### Root scripts and repository metadata
+
+| File | Role |
+|------|------|
+| [`.gitattributes`](.gitattributes) | `* text=auto` — Git performs LF normalization for text files. |
+| [`.gitignore`](.gitignore) | Ignores editor folders, `node_modules`, `dist`, backend `.env`, dynamic `data/*.json`, uploads, DB files, and the private Sayarat seed script. |
+| [`start.js`](start.js) | Spawns `node server.js` in `code/backend` and `npm run dev` in `code/frontend`; forwards SIGINT/SIGTERM to both children. |
+| [`installbeforerun.js`](installbeforerun.js) | Runs `npm install` sequentially in `code/backend` and `code/frontend`. |
+| [`clear.js`](clear.js) | Deletes SQLite DB + WAL/SHM, JSON files under `data/` (including `projects.json`, `requirementsMap.json`, `rtm_baselines.json`, `runHistory.json`, `jiraDocuments.json`), removes `uploads/` and the OS temp sandbox root `autoqa-sandbox`, then recreates empty `data/` and upload subfolders. |
+
+### Complete file index (by area)
+
+**Root**
+
+- [`README.md`](README.md) — This technical reference.
+
+**Backend — core**
+
+- [`code/backend/server.js`](code/backend/server.js) — Express HTTP API (projects, Jira, GitHub, runs, webhooks), `multer` uploads, Socket.IO on the same HTTP server, optional smee.io GitHub forwarding, `getRunHistory` helper for `runHistory.json` (see [Data model](#data-model)).
+- [`code/backend/db.js`](code/backend/db.js) — `better-sqlite3` schema, migrations, CRUD for scenarios, runs, test cases, DLQ, `story_sync_log`, helpers used by pipelines and routes.
+- [`code/backend/pipeline.js`](code/backend/pipeline.js) — GitHub PR pipeline: mapping, classification, generation, sandbox execution, healing, regression; emits `run_updated` / `refresh_data` via Socket.IO.
+- [`code/backend/jiraPipeline.js`](code/backend/jiraPipeline.js) — Jira-driven scenario generation; upserts scenarios, optional Jira comments; emits `jira_scenarios_generated` and `refresh_data`.
+- [`code/backend/schemas.js`](code/backend/schemas.js) — Zod schemas for validated request bodies (e.g. webhooks, project create).
+- [`code/backend/.env.example`](code/backend/.env.example) — Documented environment variables for the backend.
+
+**Backend — services**
+
+- [`llmService.js`](code/backend/services/llmService.js) — OpenAI SDK (Responses API), token budgeting, prompt caching params, scenario/test generation, PR mapping, healing, traces; emits `llm_trace` when configured.
+- [`githubService.js`](code/backend/services/githubService.js) — Octokit: repos, PR metadata, diffs, file contents, dependency discovery, inferred test paths.
+- [`jiraService.js`](code/backend/services/jiraService.js) — Jira REST: issues, transitions, comments, health, ADF/plain text helpers.
+- [`jiraWebhookQueueService.js`](code/backend/services/jiraWebhookQueueService.js) — Serialized async queue for Jira webhook jobs so concurrent runs do not stampede Jira/OpenAI.
+- [`jiraScenarioService.js`](code/backend/services/jiraScenarioService.js) — Alternate Jira scenario generator (**`generateScenariosFromJiraContext`**, `JIRA_SCENARIO_INSTRUCTIONS`); **not used** by [`jiraPipeline.js`](code/backend/jiraPipeline.js) in the stock app (see [LLM context reference](#llm-context-reference)).
+- [`prScenarioMappingService.js`](code/backend/services/prScenarioMappingService.js) — Maps PR diffs/context to `scenarioId` list via OpenAI.
+- [`prClassificationService.js`](code/backend/services/prClassificationService.js) — Bug-fix vs feature classification for regression mode (Jira issue types + LLM).
+- [`sandboxService.js`](code/backend/services/sandboxService.js) — Docker pool, clone, npm/pytest installs, test execution and cleanup.
+- [`documentParserService.js`](code/backend/services/documentParserService.js) — Extracts text from uploaded PDF/Office/etc. for prompts.
+- [`documentAssociationStore.js`](code/backend/services/documentAssociationStore.js) — Persists associations in `data/jiraDocuments.json` keyed by AutoQA project id.
+- [`projectStore.js`](code/backend/services/projectStore.js) — CRUD for `data/projects.json` (AutoQA project records linked to Jira/GitHub).
+
+**Backend — scripts**
+
+- [`checkJiraApi.js`](code/backend/scripts/checkJiraApi.js) — `npm run jira:check` — Prints issue metadata for `ISSUE_KEY` to validate Jira credentials.
+- [`simulateJiraWebhook.js`](code/backend/scripts/simulateJiraWebhook.js) — POSTs a sample `jira:issue_updated` payload to local AutoQA for integration testing.
+- [`deleteJiraStoryComments.js`](code/backend/scripts/deleteJiraStoryComments.js) — Finds/removes AutoQA-tagged comments on Jira stories (dry-run unless `--apply`).
+- [`clearPipelineTestData.js`](code/backend/scripts/clearPipelineTestData.js) — Wipes test cases, run history, DLQ, and scenario run fields via `clearAllPipelineExecutionData()` (see script header).
+- [`seedTodoJiraIssues.js`](code/backend/scripts/seedTodoJiraIssues.js) / [`deleteTodoJiraIssues.js`](code/backend/scripts/deleteTodoJiraIssues.js) — Seed or delete the “Pro To-Do FRD” epic/story set in Jira (`jira:seed-todo` / `jira:delete-todo`).
+- [`deleteSayaratJiraIssues.js`](code/backend/scripts/deleteSayaratJiraIssues.js) — Deletes Sayarat FRD epic/story pairs (`jira:delete-sayarat`); requires [`seedSayaratJiraIssues.js`](code/backend/scripts/) (gitignored locally).
+
+**Backend — locks**
+
+- [`code/backend/package-lock.json`](code/backend/package-lock.json) — Lockfile for backend npm installs.
+
+**Frontend — config and shell**
+
+- [`code/frontend/package.json`](code/frontend/package.json), [`package-lock.json`](code/frontend/package-lock.json) — React/Vite dependencies and scripts.
+- [`vite.config.js`](code/frontend/vite.config.js) — Vite + `@vitejs/plugin-react`, build output `dist`.
+- [`tailwind.config.js`](code/frontend/tailwind.config.js), [`postcss.config.js`](code/frontend/postcss.config.js), [`src/index.css`](code/frontend/src/index.css) — Tailwind/PostCSS and global styles (including `.dark`).
+- [`index.html`](code/frontend/index.html) — HTML shell: title “AutoQA”, mounts `src/main.jsx`.
+- [`code/frontend/.env.example`](code/frontend/.env.example) — `VITE_*` variables (e.g. Jira base URL for links).
+
+**Frontend — application source**
+
+- [`main.jsx`](code/frontend/src/main.jsx) — React 18 `createRoot`, StrictMode, imports `index.css`.
+- [`App.jsx`](code/frontend/src/App.jsx) — `BrowserRouter`, `AppContext` (settings, toasts, `refreshKey`, `llmTraces`, dark mode, sidebar state), Socket.IO client to `http://localhost:3001`, route table (see [Frontend map](#frontend-map)).
+- **Pages** — See the [Frontend map](#frontend-map) table for routes; [`PipelineRunDetail.jsx`](code/frontend/src/pages/PipelineRunDetail.jsx) is **not registered** in `App.jsx` (standalone component; run drill-down uses **ProjectDashboard** with query params from **PipelineRunsList**).
+- **Components** — Layout and feature UI: [`Sidebar.jsx`](code/frontend/src/components/Sidebar.jsx) (nav: Projects, Pipeline Runs, Agent Console), [`Navbar.jsx`](code/frontend/src/components/Navbar.jsx) (search UI, dark-mode toggle), [`ExecutionStepper.jsx`](code/frontend/src/components/ExecutionStepper.jsx), [`DetailTabs.jsx`](code/frontend/src/components/DetailTabs.jsx), [`RTMMatrix.jsx`](code/frontend/src/components/RTMMatrix.jsx), [`BranchPolicyMatrix.jsx`](code/frontend/src/components/BranchPolicyMatrix.jsx), [`EpicStackedChart.jsx`](code/frontend/src/components/EpicStackedChart.jsx), [`MetricCard.jsx`](code/frontend/src/components/MetricCard.jsx).
+- [`lib/env.js`](code/frontend/src/lib/env.js) — Exports `JIRA_BASE_URL` from `import.meta.env.VITE_JIRA_BASE_URL` (trimmed).
+- [`lib/epicMetrics.js`](code/frontend/src/lib/epicMetrics.js) — Normalizes test-case status, strict scenario pass/fail/pending, per-epic aggregates for charts and coverage.
+
 ---
 
-## Prerequisites
+## Data model
 
-- **Node.js** (LTS recommended) and **npm**
-- Backend **environment** variables: copy `code/backend/.env.example` to `code/backend/.env` and set at least **Jira**, **GitHub**, and **Gemini** values as needed for your environment.
+### SQLite tables (see [`db.js`](code/backend/db.js))
+
+| Table | Purpose |
+|--------|---------|
+| `rtm_scenarios` | Scenarios: `scenarioId`, `projectKey`, `epicId`, `storyId`, title, description, acceptance references, type, priority, status, run metadata, etc. |
+| `run_history` | Pipeline runs: `runId`, `repoFullName`, `prUrl`, `status`, timestamps, `events`, `logs`, `llm_traces`, `scenario_statuses`, `localProjectId` |
+| `test_cases` | Generated or refined tests: `testCaseId`, `scenarioId`, `testScript`, `language`, `version`, `healAttempts`, `conversationId`, `latestResponseId`, links to `runId` / `prUrl` |
+| `dead_letter_queue` | Failed webhook or pipeline work for inspection (`source`, `payload`, `error`, `retryCount`, `status`) |
+| `story_sync_log` | Per-story content hash and sync time to avoid reprocessing unchanged Jira issues |
+
+Migrations in `initDb()` add columns when missing (e.g. `localProjectId` on `run_history`, conversation columns on `test_cases`).
+
+### File-backed stores
+
+| File path | Owned by | Purpose |
+|-----------|----------|---------|
+| **`data/projects.json`** | [`projectStore.js`](code/backend/services/projectStore.js) | AutoQA projects: id, name, `jiraProjectKey`, `githubRepoFullName`, timestamps. |
+| **`data/requirementsMap.json`** | Routes in [`server.js`](code/backend/server.js) (GitHub requirements upload/delete) | Maps requirement uploads to repos for association UIs. |
+| **`data/rtm_baselines.json`** | Baseline route in [`server.js`](code/backend/server.js) | Per-repo RTM baseline snapshots (`GET /api/github/repos/:owner/:repo/baseline`). |
+| **`data/jiraDocuments.json`** | [`documentAssociationStore.js`](code/backend/services/documentAssociationStore.js) | Per–AutoQA-project lists of associated Jira document metadata. |
+| **`data/runHistory.json`** | Parser in [`server.js`](code/backend/server.js) (`getRunHistory`) | Read-only JSON structure; **not referenced elsewhere** in the stock server — effectively **legacy / unused** for live runs (authoritative history is **`run_history`** in SQLite). [`clear.js`](clear.js) still deletes this file for a clean reset. |
+
+### Uploads
+
+- Requirements and Jira-related uploads land under `code/backend/uploads/` (subfolders such as `requirements/`, `jira-docs/`), with associations tracked via [`documentAssociationStore`](code/backend/services/documentAssociationStore.js).
 
 ---
 
-## Running the app (development)
+## Workflow: Jira to scenarios (RTM)
 
-### Option A — one command from the repo root
+> See also: [Application flow (end-to-end)](#application-flow-end-to-end) and [LLM context reference](#llm-context-reference) for sequence and model inputs.
+flowchart TD
+  subgraph sources [Ways to start]
+    API[POST sync-jira]
+    WH[Jira webhook]
+  end
+  subgraph queue [Queue]
+    Q[jiraWebhookQueueService]
+  end
+  subgraph run [runJiraPipeline]
+    A[fetch issues / epics + docs]
+    B[LLM: generateTestScenarios or generateTestScenariosForEpic]
+    C[upsertScenario per scenario]
+    D[postScenarioComment to Jira story]
+  end
+  API --> Q
+  WH --> Q
+  Q --> run
+  A --> B
+  B --> C
+  C --> D
+```
 
-Starts the API on **http://localhost:3001** and the Vite dev server for the UI (default Vite port, often **5173**).
+### Manual sync: `POST /api/projects/:projectId/sync-jira`
+
+- Requires a **linked Jira space** (`jiraProjectKey` on the project).
+- Fetches Jira issues in the **configured trigger status** (see `JIRA_TRIGGER_STATUS` in [`.env.example`](code/backend/.env.example), defaulting to a string like "Selected for Development" when not set in code paths that reference it).
+- **Skips** stories whose **content hash** matches the last sync ([`computeStoryHash`](code/backend/db.js), `story_sync_log`).
+- **Groups** changed stories by **parent epic** and enqueues **one job per epic** with `storyKeys` for batch scenario generation, or enqueues **orphan** stories individually ([`jiraPipeline.js`](code/backend/jiraPipeline.js) batch mode vs single-story mode).
+
+### Jira webhooks: `POST /api/webhooks/jira`
+
+- **Signature:** Optional `JIRA_WEBHOOK_SECRET` via `X-Hub-Signature` (HMAC-SHA256 over **raw** body) — see `verifyJiraWebhookSignature` in [`server.js`](code/backend/server.js). If no secret is set, signature check is skipped.
+- **Events processed:** `jira:issue_updated` only, with a **status transition to** the configured `JIRA_TRIGGER_STATUS`, project linked in AutoQA, and issue type **Story** or **Epic** (other types are ignored with `received: false` and a reason string).
+- Enqueues work into [`jiraWebhookQueueService`](code/backend/services/jiraWebhookQueueService.js). The job processor (registered in `server.js`) calls **`runJiraPipeline`** with the issue key, project id, and optional `storyKeys` for epics.
+- On handler failure, the payload is written to the **DLQ** via `publishToDLQ('jira_webhook', ...)`.
+
+### Jira pipeline behavior ([`jiraPipeline.js`](code/backend/jiraPipeline.js))
+
+- Loads **Jira project documents** for the AutoQA project, extracts text, and calls the LLM to produce structured scenarios.
+- **Persists** each scenario with `upsertScenario`.
+- **Comments** on Jira story issues with the generated scenario summary when configured (`postScenarioComment`).
+- Emits Socket.IO: `jira_scenarios_generated`, `refresh_data`.
+
+### Useful Jira-related HTTP routes
+
+- `GET /api/jira/health` — Connectivity, config, webhook readiness, last trigger state, queue snapshot.
+- `GET /api/jira/spaces` — List Jira projects/spaces for linking.
+- `GET /api/projects/:projectId/jira-rtm` — RTM-style payload for the project dashboard.
+- `GET /api/projects/:projectId/scenarios` — Scenarios for a project.
+- `GET/POST/DELETE /api/projects/:projectId/jira-documents` — Associate or remove Jira project documents.
+- `GET /api/jira/queue` — Webhook queue status.
+
+---
+
+## Workflow: GitHub PR to test run
+
+> See also: [Application flow (end-to-end)](#application-flow-end-to-end) and [LLM context reference](#llm-context-reference) for sequence and model inputs.
+
+```mermaid
+flowchart TD
+  WH[POST /api/webhooks/github pull_request]
+  V{Repo linked in projects.json AND jiraProjectKey?}
+  DEDUP{Another run in flight for same prUrl?}
+  R[202 + runId + pr_opened socket]
+  P[runPipeline in background]
+  PM[PR Mapping: mapPrChangesToScenarios]
+  CTX[Code Context + optional Classification + Sandbox pool]
+  BR{REGRESSION_ENABLED and isBugFix?}
+  REG[runEpicRegression: existing test cases only]
+  GEN[Generate test cases per scenario + queue execution]
+  EX[executeTestCaseWithRetries: Jest/pytest in Docker]
+  H[Healing: repair test script up to 3x]
+  FIN[complete event + updateRun + cleanup]
+  WH --> V
+  V -->|no| IG[Log ignore / refresh]
+  V -->|yes| DEDUP
+  DEDUP -->|yes| SK[Skip duplicate]
+  DEDUP -->|no| R
+  R --> P
+  P --> PM
+  PM --> CTX
+  CTX --> BR
+  BR -->|yes| REG
+  REG --> FIN
+  BR -->|no| GEN
+  GEN --> EX
+  EX --> H
+  H --> FIN
+```
+
+### Webhook: `POST /api/webhooks/github`
+
+- **Signature:** If `GITHUB_WEBHOOK_SECRET` is set, `X-Hub-Signature-256` must match an HMAC-SHA256 of **`JSON.stringify(req.body)`** (see `verifyGitHubSignature` — note: some GitHub examples hash raw body; the implementation here uses `JSON.stringify` of the parsed body, so the GitHub “secret” and delivery format must match this behavior).
+- **PR events** that start the pipeline: `action` in `opened`, `synchronize`, `reopened`.
+- **Precondition:** The repository `full_name` must match a project with **`githubRepoFullName` and `jiraProjectKey` both set** — otherwise the webhook is ignored (logged) and no pipeline runs.
+- **Deduplication:** A module-level `Map` `_activePipelineRuns` keys **PR URL** to **runId** while `runPipeline` is in progress; duplicate events for the same `prUrl` are skipped. This applies **per Node process** only (not shared across multiple server instances).
+- **Async execution:** The handler returns **202** immediately, then `require('./pipeline').runPipeline(...)` is invoked. Rejected pipeline promises publish to the DLQ with source `github_webhook`.
+
+### Phases and streaming ([`createEventLogger` in `pipeline.js`](code/backend/pipeline.js))
+
+`sendEvent` updates SQLite `run_history` and emits Socket.IO `run_updated` with `{ runId, type, data }`, plus `refresh_data` for list refresh.
+
+| Phase (examples) | `phase_update` values |
+|------------------|------------------------|
+| Initializing | `running` then `completed` |
+| PR Mapping | `running` then `completed` |
+| Classification | (if regression enabled) `running` then `completed` or skip via env |
+| Code Context | `running` then `completed` |
+| Sandbox Setup | `running` then `completed` |
+| Test Generation / Sandbox Testing | Standard path: both run; bug-fix path may **skip** Test Generation |
+| Regression Execution | Bug-fix path only |
+| Test Healing | Marker phase; may note whether retries ran |
+| Pass | `completed` or `failed` (reflects `overallSuccess` at end) |
+
+Other event types: `log`, `pr_details`, `pr_scenario_mapping`, `pr_classification`, `scenario_execution_updated`, `test_case_attempt`, `test_cases_saved`, `regression_summary`, `run_summary_updated`, `complete` (`success: true/false`), `error`.
+
+### PR scenario mapping
+
+- Loads all **Jira scenarios** for the project key from the DB, fetches **PR metadata, diff, and files** from GitHub, and may merge **project document** text. Calls [`mapPrChangesToScenarios`](code/backend/services/prScenarioMappingService.js) (OpenAI) to return which `scenarioId`s this PR is intended to cover, with rationale and confidence.
+- If **mappings is empty** (or after enrichment nothing runnable): the run logs a **warning** and calls `complete` with `success: true` — **no test generation**, run status still completes “successfully” with nothing to test.
+
+### Code context
+
+- Fetches **full file contents** for changed files, **inferred test paths** ([`githubService.js`](code/backend/services/githubService.js): `fetchFullFileContents`, `inferTestFilePaths`), and **dependency text** (e.g. `package.json`) for prompts.
+
+### Refinement (supersession)
+
+- If there are **existing test cases in the DB** whose referenced files overlap with the PR’s changed file list, they are **marked superseded** so new generated cases can replace them; generation may receive the **previous script** as **refinement** context and bump **version** numbers.
+
+### Test generation and persistence
+
+- For each **mapped scenario** (merged with full RTM row for title, description, AC refs), the LLM [`generateTestCasesForScenario`](code/backend/services/llmService.js) returns concrete cases with **steps, test data, and executable `testScript`**, and language (JavaScript or Python).
+- Rows are **upserted** to `test_cases` with `conversationId` and `latestResponseId` (or `generationInteractionId`) for stateful follow-up and healing.
+- A **concurrent executor** waits for a **sandbox pool** and runs each test case with retries/healing (see below).
+
+---
+
+## Bug-fix classification and epic regression
+
+Controlled by **environment** (see [`.env.example`](code/backend/.env.example)):
+
+- `REGRESSION_ENABLED` — Default is effectively **on** (only disabled when set to the string `false` in the check in `pipeline.js` which uses `String(...).toLowerCase() !== 'false'` for the feature flag). When disabled, classification is skipped and the standard “generate new tests” path always runs.
+- `REGRESSION_BUGFIX_CONFIDENCE_THRESHOLD` — Default **0.6**; used when combining LLM `isBugFix` with confidence.
+- `REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG` — If `true`, still calls the LLM for rationale when a Jira **Bug** is linked (by default, Jira Bug short-circuits without an LLM call).
+
+### `classifyPrAsBugFix` ([`prClassificationService.js`](code/backend/services/prClassificationService.js))
+
+1. **Extracts Jira keys** from PR title, body, and branch (pattern like `ABC-123`).
+2. **Fetches each issue** from Jira. If **any** linked issue has `issueType` **Bug** (case-insensitive), the PR is treated as a **bug fix** with high confidence (`source: 'jira'` or `'both'`).
+3. Otherwise the **LLM** classifies the PR from title, body, and a **truncated file/diff digest**.
+4. **Final `isBugFix`:** Jira Bug wins. Else LLM must return `isBugFix: true` **and** `confidence >= threshold`.
+
+### `runEpicRegression` ([`pipeline.js`](code/backend/pipeline.js))
+
+- When **regression is enabled** and the PR is classified as a **bug fix**:
+  - **Test Generation phase is skipped** (marked `skipped` in the UI log stream).
+  - Resolves **epic ids** from the **mapped** scenarios, finds **all non-obsolete scenarios** under those epics, and loads the **latest version** of each **non-superseded** `test_case` with a non-empty `testScript`.
+  - **Re-executes** all of them against the **PR’s head** in the sandbox pool (with the same **heal retry** logic, `regressionMode: true`).
+  - Emits `regression_summary` with counts and `scenario_execution_updated` for each scenario.
+- Test case final outcomes include **`clean_pass`**, **`adapted`** (passed only after a heal), and **`regression_fail`** (still failing after all attempts), as recorded in the pipeline logic.
+
+If **no epics** can be resolved from mapped scenarios, or **no existing test cases** exist, regression may **no-op** with warnings and a successful empty result where applicable.
+
+---
+
+## Sandbox execution and test healing
+
+### Pool creation ([`sandboxService.js`](code/backend/services/sandboxService.js))
+
+- For each pool slot, creates a directory under the OS temp (on Windows, `C:\tmp\autoqa-sandbox\...`), **clones** the **GitHub head** of the PR with depth 1 and branch `headRef` when `prDetails` includes `headRepoFullName` and `headRef`. If `GITHUB_TOKEN` is set, the clone URL is authenticated.
+- If clone fails, the code may **fall back** to writing only **flat file payloads** from the webhook when present.
+- Starts a long-lived **Docker** container: image **`node:20-slim`**, working dir `/app`, mount the sandbox directory as a volume, command `tail -f /dev/null` to keep the container up.
+- If `package.json` exists in the clone, runs **`npm install`** for the app (no lockfile) inside the container, then pre-installs **Jest, supertest, jest-environment-node** for JavaScript tests.
+
+### `executeTest`
+
+- Writes the test file with an injected **preamble** so `testData` from the DB is available as `testData` (JS) or `test_data` (Python).
+- **Resets** known JSON data files in the app directory if they exist: `todos.json` → `[]`, `users.json` → `[]`, `sessions.json` → `{}` to avoid cross-test pollution.
+- **JavaScript:** Installs any **extra** npm dependencies detected from the test script (AST or regex) not already in the preinstall set, then runs **`npx jest`** (via `sh -c` in the container) with **no coverage**, `runInBand`, 30s test timeout, merged stdout/stderr.
+- **Python:** Installs `pytest`, `flask`, `requests`, `pytest-cov`, and detected imports, then runs **pytest** on the file.
+- **Timeout:** `SANDBOX_TIMEOUT_MS` (default 120000) applies to Docker operations and the test run.
+
+### Healing ([`MAX_HEAL_ATTEMPTS` = 3](code/backend/pipeline.js))
+
+- On **failure**, the last failure output is sent to [`repairTestCaseScript`](code/backend/services/llmService.js). The model returns an updated `testScript`.
+- The process **repeats** until success or max attempts. If the healer or LLM throws, the attempt is logged and the run may still eventually record failure.
+- **Important:** The **application under test is not modified** by healing — only the **generated test** code changes. Product bugs that cannot be “fixed” by adjusting the test may remain failing after all heals.
+
+### Cleanup
+
+- [`cleanupSandboxPool`](code/backend/services/sandboxService.js) stops/removes containers and deletes sandbox directories (order matters on **Windows** due to Docker volume locks: stop container first).
+
+---
+
+## Run outcome semantics
+
+- **`overallSuccess` (standard path):** Set to `true` the **first time any single test case** returns **pass** after sandbox + healing. It is **not** reset if later test cases fail. So a run can end with `complete: { success: true }` while some scenarios show **failed** or **partial** and some test cases are red.
+- **`complete` with `success: false`:** Thrown **fatal** errors in `runPipeline` (e.g. uncaught exception during sandbox pool creation) may emit `error` and `complete: { success: false }`. **Zero** mapped scenarios with an early return still returns **`success: true`** with a warning.
+- **Bug-fix / regression path:** The same “any pass flips success” idea applies: `runEpicRegression` sets `overallSuccess` when **any** re-run passes.
+
+Interpreting the dashboard: **read per-scenario totals and per-test-case status**, not only the final run checkmark.
+
+---
+
+## HTTP API reference
+
+All routes are under the backend base URL (default `http://localhost:3001`).
+
+### Projects
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/projects` | List AutoQA projects |
+| POST | `/api/projects` | Create project (body: `name` / `projectKey`) |
+| GET | `/api/projects/:projectId` | Get one project |
+| DELETE | `/api/projects/:projectId` | Delete project and related data |
+| PATCH | `/api/projects/:projectId/jira-link` | Link Jira project key and name |
+| PATCH | `/api/projects/:projectId/github-link` | Link `owner/repo` full name |
+| POST | `/api/projects/:projectId/sync-jira` | Manual Jira → queue flow (see Jira section) |
+
+### Jira and scenarios
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/jira/spaces` | Jira project list for picker |
+| GET | `/api/projects/:projectId/jira-rtm` | RTM payload |
+| GET | `/api/projects/:projectId/scenarios` | Scenarios for project |
+| GET/POST/DELETE | `/api/projects/:projectId/jira-documents` | Jira project document uploads and removal |
+
+### GitHub and requirements (selection)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/github/repos` | List repos (linked account via token) |
+| GET | `/api/github/repos/requirements` | Requirements doc mapping list |
+| POST | `/api/github/repos/requirements` | Upload requirement file |
+| DELETE | `/api/github/repos/requirements` | Remove requirement |
+| GET | `/api/github/repos/:owner/:repo/branch-tree` | Branch tree (UI) |
+| GET | `/api/github/repos/:owner/:repo/baseline` | Read RTM baselines for repo |
+
+### Webhooks (integrations)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/webhooks/github` | GitHub events; PR pipeline when conditions match |
+| POST | `/api/webhooks/jira` | Jira issue updates; filtered as described |
+
+### Runs and test cases
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/runs` | List runs from `run_history` |
+| GET | `/api/runs/:runId` | Single run document |
+| DELETE | `/api/runs/:runId` | Delete run and associated data |
+| GET | `/api/runs/:runId/test-cases` | Test cases for a run |
+
+### Jira health and queue
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/jira/health` | Jira + webhook + queue summary |
+| GET | `/api/jira/queue` | Webhook queue status |
+
+**Note:** There is **no** public HTTP route in `server.js` for listing the **dead_letter_queue**; use [`getDLQEvents`](code/backend/db.js) from a script or a REPL, or add an admin route in a fork if needed.
+
+---
+
+## Real-time events (Socket.IO)
+
+The browser connects to the backend (default `http://localhost:3001` from [`App.jsx`](code/frontend/src/App.jsx); CORS is open on the server).
+
+### Emitted by the backend (authoritative)
+
+These event names are broadcast from [`server.js`](code/backend/server.js), [`pipeline.js`](code/backend/pipeline.js), [`jiraPipeline.js`](code/backend/jiraPipeline.js), or [`llmService.js`](code/backend/services/llmService.js):
+
+| Event | When / payload (typical) |
+|-------|---------------------------|
+| `pr_opened` | GitHub PR webhook accepted; includes `runId`, repo names, etc. |
+| `jira_story_triggered` | Jira webhook job accepted before `runJiraPipeline` (includes `issueKey`, `runId`). |
+| `jira_scenarios_generated` | Jira pipeline finished scenario generation for an issue. |
+| `run_updated` | Pipeline progress: `{ runId, type, data }` — phases, logs, test attempts, `complete`, etc. |
+| `llm_trace` | Development trace object when LLM calls opt in to tracing. |
+| `repo_created` / `branch_created` | Non-PR GitHub webhook paths in `server.js` (e.g. create events). |
+| `refresh_data` | Emitted often after mutations; clients bump `refreshKey` to refetch lists. |
+
+### Subscribed in the frontend only (not emitted by stock backend)
+
+[`App.jsx`](code/frontend/src/App.jsx) also registers `socket.on('jira_rtm_updated', …)` and `socket.on('jira_run_updated', …)`. **No `global.io.emit` for these names exists** in the checked-in backend; they are **placeholders** for future or forked server code. RTM and run UIs still update via `refresh_data`, `run_updated`, and HTTP fetches.
+
+---
+
+## Frontend map
+
+### React routes (registered in [`App.jsx`](code/frontend/src/App.jsx))
+
+```mermaid
+flowchart LR
+  subgraph routes [Routes]
+    R1["/ → ProjectsHub"]
+    R2["/projects/:projectId → ProjectDashboard"]
+    R3["/projects/:projectId/settings → ProjectSettings"]
+    R4["/pipelines → PipelineRunsList"]
+    R5["/projects/:projectId/run/:runId/scripts → ScriptDetail"]
+    R6["/llm-traces → AgentChatDebug"]
+  end
+```
+
+- **Run detail UX:** [`PipelineRunsList`](code/frontend/src/pages/PipelineRunsList.jsx) navigates to **`/projects/:id?workspace=github-runs&runId=...`** on the project dashboard, not to a dedicated `/runs/:id` route. [`PipelineRunDetail.jsx`](code/frontend/src/pages/PipelineRunDetail.jsx) implements an alternate run-detail view but is **not imported in the router** — add a `<Route>` if you want that page reachable.
+
+### Global UI behavior ([`AppContext`](code/frontend/src/App.jsx))
+
+- **Socket.IO** — Subscribes to the events in the previous section; shows **toasts** for PR opened, run completion/failure, Jira triggers, etc.
+- **Dark mode** — `darkMode` toggles the `dark` class on `<html>` and persists to `localStorage`.
+- **Client-only “settings”** — `settings.reasoningModel`, `codingModel`, `largeContextModel` are stored in **`localStorage`** under `settings`. They are **not sent to the backend** in the stock app; they are UI presets only.
+- **`refreshKey`** — Incremented on `refresh_data` and `jira_rtm_updated` so child pages refetch.
+- **`llmTraces`** — Appends up to 200 `llm_trace` events for the Agent Console page.
+
+### Pages
+
+| File | Route | Role |
+|------|-------|------|
+| [`ProjectsHub.jsx`](code/frontend/src/pages/ProjectsHub.jsx) | `/` | List and create AutoQA projects. |
+| [`ProjectDashboard.jsx`](code/frontend/src/pages/ProjectDashboard.jsx) | `/projects/:projectId` | Project home: RTM, metrics, GitHub runs workspace (query `workspace`, `runId`). |
+| [`ProjectSettings.jsx`](code/frontend/src/pages/ProjectSettings.jsx) | `/projects/:projectId/settings` | Link Jira space and GitHub repo, manual Jira sync. |
+| [`PipelineRunsList.jsx`](code/frontend/src/pages/PipelineRunsList.jsx) | `/pipelines` | All runs table; click navigates to ProjectDashboard with `runId`. |
+| [`ScriptDetail.jsx`](code/frontend/src/pages/ScriptDetail.jsx) | `/projects/:projectId/run/:runId/scripts` | Generated test script content, status, and metadata for a run. |
+| [`AgentChatDebug.jsx`](code/frontend/src/pages/AgentChatDebug.jsx) | `/llm-traces` | “Agent Console”: paired request/response **LLM traces** from `llm_trace` events. |
+| [`PipelineRunDetail.jsx`](code/frontend/src/pages/PipelineRunDetail.jsx) | *(none — not in `Routes`)* | Alternative run detail (stepper + tabs); wire up if needed. |
+
+### Components
+
+| File | Role |
+|------|------|
+| [`Sidebar.jsx`](code/frontend/src/components/Sidebar.jsx) | Fixed nav: Projects, Pipeline Runs (optional badge), Agent Console; collapse toggle. |
+| [`Navbar.jsx`](code/frontend/src/components/Navbar.jsx) | Top bar: search field, dark-mode toggle, user placeholder. |
+| [`ExecutionStepper.jsx`](code/frontend/src/components/ExecutionStepper.jsx) | Phase timeline for a pipeline run. |
+| [`DetailTabs.jsx`](code/frontend/src/components/DetailTabs.jsx) | Tabbed detail panels for runs. |
+| [`RTMMatrix.jsx`](code/frontend/src/components/RTMMatrix.jsx) | Requirements traceability matrix table. |
+| [`BranchPolicyMatrix.jsx`](code/frontend/src/components/BranchPolicyMatrix.jsx) | Branch / policy visualization. |
+| [`EpicStackedChart.jsx`](code/frontend/src/components/EpicStackedChart.jsx) | Stacked bar chart over epics (uses epic metrics helpers). |
+| [`MetricCard.jsx`](code/frontend/src/components/MetricCard.jsx) | Reusable statistic cards. |
+
+### Lib
+
+| File | Role |
+|------|------|
+| [`env.js`](code/frontend/src/lib/env.js) | `JIRA_BASE_URL` from `VITE_JIRA_BASE_URL` for deep links to Jira. |
+| [`epicMetrics.js`](code/frontend/src/lib/epicMetrics.js) | `normalizeTestCaseStatus`, `scenarioStrictStatus`, `computeEpicMetrics` — aggregates pass/fail and scenario strict status per epic for charts and dashboards. |
+
+**Frontend env:** [`code/frontend/.env.example`](code/frontend/.env.example) documents `VITE_JIRA_BASE_URL` for Jira issue links in the UI.
+
+---
+
+## Configuration (environment variables)
+
+Copy [`code/backend/.env.example`](code/backend/.env.example) to `code/backend/.env` and set at least the pieces you use.
+
+| Variable | Role |
+|----------|------|
+| `PORT` | API port (default 3001) |
+| `GITHUB_TOKEN` | GitHub API and authenticated sandbox **git clone** (token embedded in HTTPS URL — keep secrets out of logs) |
+| `GITHUB_WEBHOOK_SECRET` | If set, enables GitHub webhook HMAC verification |
+| `JIRA_BASE_URL` | e.g. `https://company.atlassian.net` |
+| `JIRA_USER_EMAIL` / `JIRA_API_TOKEN` | Jira REST auth |
+| `JIRA_PROJECT_KEY` / `JIRA_TRIGGER_STATUS` | Health checks and default trigger status strings |
+| `JIRA_WEBHOOK_SECRET` | Jira webhook HMAC; omit to skip |
+| `OPENAI_API_KEY` | Required for LLM features |
+| `OPENAI_MODEL` | e.g. `gpt-5.4-mini` |
+| `OPENAI_SCENARIO_EFFORT` / `OPENAI_TESTCASE_EFFORT` / `OPENAI_HEAL_EFFORT` | Reasoning **effort** for scenario gen, test gen, heal (see .env comments) |
+| `OPENAI_STATEFUL_MODE` | `conversation` (default) vs `chain` vs `zdr` — affects how state is retained across calls |
+| `OPENAI_REASONING_SUMMARY` | e.g. `auto` |
+| `OPENAI_CLASSIFIER_EFFORT` | PR bug-fix classification |
+| `OPENAI_OUTPUT_VERBOSITY` | Structured output verbosity |
+| `OPENAI_PROMPT_CACHE_RETENTION` | e.g. `24h` for long pipelines |
+| `REGRESSION_ENABLED` | `true` (default) / `false` to disable bug-fix path |
+| `REGRESSION_BUGFIX_CONFIDENCE_THRESHOLD` | 0–1, default 0.6 |
+| `SANDBOX_TIMEOUT_MS` | Default 120000; increase if Jest or npm install is slow in Docker |
+
+---
+
+## Local development and operations
+
+### First-time dependency install (repo root)
+
+```bash
+node installbeforerun.js
+```
+
+Runs `npm install` in `code/backend`, then `code/frontend` ([`installbeforerun.js`](installbeforerun.js)).
+
+### Reset local DB and file stores (repo root)
+
+```bash
+node clear.js
+```
+
+Deletes SQLite, JSON stores, uploads, and temp sandbox directories, then recreates empty folders ([`clear.js`](clear.js)). Use before a clean manual test cycle.
+
+### One command (dev servers)
 
 ```bash
 node start.js
 ```
 
-### Option B — backend and frontend separately
+This spawns the backend with `node server.js` in `code/backend` and Vite in `code/frontend` (see [`start.js`](start.js)). SIGINT kills both.
 
-**Backend** (from `code/backend`):
+### Split terminals
+
+**Backend**
 
 ```bash
 cd code/backend
@@ -104,7 +772,7 @@ npm install
 node server.js
 ```
 
-**Frontend** (from `code/frontend`):
+**Frontend**
 
 ```bash
 cd code/frontend
@@ -112,38 +780,72 @@ npm install
 npm run dev
 ```
 
-The UI is configured to call the API at **http://localhost:3001**; keep the backend running while you use the dashboard.
+The Vite app typically calls `http://localhost:3001` (configure as needed for your dev proxy).
 
----
-
-## Testing the production build with `npx serve`
-
-To serve the **built** static frontend (useful for smoke tests or checking the production bundle without Vite’s dev server):
+### Production-like static UI
 
 ```bash
 cd code/frontend
-npm install
 npm run build
 npx serve dist -s
 ```
 
-- **`-s`** (single-page application mode) rewrites unknown routes to `index.html`, which matches how a React router app is usually hosted.
-- **`npx serve`** runs the [`serve`](https://github.com/vercel/serve) static file server without adding it as a permanent dependency; you can pass a port with **`-l 3000`** (or another port) if needed.
+Run `node server.js` in parallel; the static build still expects the API on port 3001 unless you reconfigure the frontend build-time env.
 
-For full end-to-end behaviour (API + WebSockets + static UI), run **`node server.js`** in `code/backend` **in parallel** with `npx serve`, since the built UI still expects the backend at **http://localhost:3001**.
+### Docker
+
+- **Required** for PR test **execution** (sandbox). Install Docker Desktop (Windows/macOS) or the Docker engine on Linux.
+
+### Smee (development webhook tunnel)
+
+[`server.js`](code/backend/server.js) instantiates `smee-client` by default, forwarding a public **smee.io** channel to `http://localhost:PORT/api/webhooks/github` (Jira smee is created but not started in the snippet; console notes point GitHub to the smee URL). Replace the hardcoded `source` URL with your own smee channel for a secure demo.
+
+### Backend npm scripts ([`code/backend/package.json`](code/backend/package.json))
+
+| npm script | Command | Purpose |
+|------------|---------|---------|
+| `jira:check` | [`scripts/checkJiraApi.js`](code/backend/scripts/checkJiraApi.js) | Fetch one issue key; validates Jira env. |
+| `jira:simulate-webhook` | [`simulateJiraWebhook.js`](code/backend/scripts/simulateJiraWebhook.js) | POST sample Jira webhook to local AutoQA. |
+| `jira:delete-story-comments` | [`deleteJiraStoryComments.js`](code/backend/scripts/deleteJiraStoryComments.js) | Strip AutoQA-managed Jira comments (dry-run by default). |
+| `jira:seed-todo` | [`seedTodoJiraIssues.js`](code/backend/scripts/seedTodoJiraIssues.js) | Seed **Pro To-Do FRD** epics/stories (`-p PROJECT`, `--apply`). |
+| `jira:delete-todo` | [`deleteTodoJiraIssues.js`](code/backend/scripts/deleteTodoJiraIssues.js) | Delete those issues (requires `--apply --yes`). |
+| `jira:seed-sayarat` | `seedSayaratJiraIssues.js` | **Not in git** (see [Repository layout](#repository-layout)); add locally to use. |
+| `jira:delete-sayarat` | [`deleteSayaratJiraIssues.js`](code/backend/scripts/deleteSayaratJiraIssues.js) | Deletes Sayarat FRD issues; **requires** the seed module at `scripts/seedSayaratJiraIssues.js`. |
+
+## Failure handling and dead letter queue
+
+- **Pipeline `runPipeline` rejection** from the GitHub webhook `catch` calls [`publishToDLQ('github_webhook', { runId, prUrl, repoFullName }, err.message)`](code/backend/db.js).
+- **Jira webhook** processing errors can publish `publishToDLQ('jira_webhook', body, error.message)`.
+- Rows are stored in **`dead_letter_queue`**. `getDLQEvents(status)` can read them programmatically; there is **no** dedicated REST list in the stock `server.js`.
+
+The repo includes a maintenance script [code/backend/scripts/clearPipelineTestData.js](code/backend/scripts/clearPipelineTestData.js) (header comment) for wiping test data during development; read it before running.
 
 ---
 
-## Optional backend scripts
+## Security notes
 
-From `code/backend` (see `package.json`):
-
-- `npm run jira:check` — Jira API connectivity
-- `npm run jira:simulate-webhook` — local webhook simulation
-- `npm run jira:delete-story-comments` — managed-comment cleanup utility
+- **Never commit** `code/backend/.env` with real API keys, tokens, or webhook secrets.
+- **GitHub and Jira webhooks** should use **secrets** in production; treat smee public URLs as **development only** unless the channel and repository allow it.
+- **Sandbox clone URL** with embedded `GITHUB_TOKEN` can leak in logs if you add verbose network logging; avoid logging the full URL.
 
 ---
 
-## Security note
+## Troubleshooting
 
-Never commit real **`.env`** files or API tokens. Use `.env.example` as a template only.
+| Symptom | What to check |
+|--------|----------------|
+| **PR ignored** | `findProjectByGithubRepo` must find the repo and `jiraProjectKey` must be set. Webhook `repository.full_name` must match `githubRepoFullName` in `projects.json` exactly. |
+| **“No scenarios mapped”** / nothing to test | Jira project must have **scenarios in DB**; PR mapping may return an empty list if the model finds no link between diff and any scenario. |
+| **Jira pipeline “disabled”** | Console **warns** on startup if `JIRA_*` env vars in `REQUIRED_JIRA_ENV_VARS` are missing (`warnMissingJiraEnvVars`). |
+| **Sandbox / Docker errors** | Docker running? Disk space? `SANDBOX_TIMEOUT_MS` high enough? Private repo needs `GITHUB_TOKEN` for clone. |
+| **Webhooks 401** | Signature mismatch: verify secret bytes, and that the GitHub app matches how `verifyGitHubSignature` builds the HMAC. |
+| **Double runs** | Same PR URL re-delivered: dedupe only works **in-process**; two Node instances will not share `_activePipelineRuns`. |
+| **Regression when you expected generation** | `REGRESSION_ENABLED` and `classifyPrAsBugFix` — a linked **Jira Bug** or high-confidence “bug fix” from the LLM triggers **epic regression** and **skips** new test generation. |
+
+---
+
+## License and documentation
+
+- Project license: see [`code/backend/package.json`](code/backend/package.json) (`"license": "ISC"`).
+
+- This README is **descriptive of the current codebase** (including [Repository layout](#repository-layout), [Application flow (end-to-end)](#application-flow-end-to-end), and [LLM context reference](#llm-context-reference)); if you change event names, routes, env flags, LLM prompts, or add/remove files, update this file in the same commit when possible.
