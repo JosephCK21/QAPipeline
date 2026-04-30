@@ -632,7 +632,8 @@ RULES FOR THE testScript:
 PLAYWRIGHT BROWSER E2E (use only when the scenario requires exercising the real UI in a browser — not for HTTP-only APIs):
 - Use CommonJS: const { test, expect } = require('@playwright/test');
 - Prefer a single test('...', async ({ page }) => { ... }) inside one test.describe block for this file so failure screenshots map cleanly to one test case.
-- The sandbox starts the app dev server (npm run dev or npm start) and runs Playwright against it; navigate with page.goto using the real base URL (infer port from codeContext: Vite 5173, Next/react-scripts often 3000).
+- The sandbox starts the app dev server (npm run dev or npm start) and runs Playwright against it. Base URL: if process.env.AUTOQA_E2E_BASE_URL is set in the sandbox, use that (trimmed, no trailing slash) as the origin for page.goto; otherwise infer from codeContext (Vite 5173, Next/react-scripts often 3000).
+- Prefer web-first assertions on locators — e.g. await expect(page.getByRole('button', { name: /submit/i })).toBeVisible() — avoid expect(await page.textContent(...)) patterns unless unavoidable.
 - On failure, screenshots are captured automatically by the test runner — do not add page.screenshot() solely for failure diagnostics unless you need an extra mid-test capture.
 - Use accessibility-driven selectors (getByRole, getByLabel) when possible.
 
@@ -668,7 +669,7 @@ const HEAL_INSTRUCTIONS = `You are an expert test engineer fixing a failing test
 The testData variable is already injected as the first line at runtime — do NOT redeclare it.
 Do not hardcode any values that exist in testData — always reference them as testData.<group>.<key>.
 Fix any SyntaxError or duplicate identifier (e.g. a helper function name reused as const) — rename variables so every binding is unique.
-If the script uses @playwright/test, fix selectors, timeouts, and page.goto URLs to match the dev server port from the repo; do not add page.screenshot() only for failure dumps — failure screenshots are automatic.
+If the script uses @playwright/test, prefer web-first assertions on locators (expect(locator)...); fix selectors, timeouts, and page.goto origins to respect process.env.AUTOQA_E2E_BASE_URL when set, otherwise match the inferred dev-server port from the repo; do not add page.screenshot() only for failure dumps — failure screenshots are automatic.
 If the script uses app._router, manual middleware walking, or fake req/res mocks for an Express app, rewrite it to use supertest against the exported app with async/await and describe/it.
 If the app uses file-based storage (JSON files), the data files are reset to empty ([] or {}) before each test run. The test must create all data it needs (signup, login, create records) — never assume pre-existing data.
 Ensure no open handles (servers, intervals, sockets) remain after tests — add afterAll cleanup if needed.

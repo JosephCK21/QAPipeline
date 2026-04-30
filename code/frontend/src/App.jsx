@@ -22,6 +22,7 @@ function App() {
     codingModel: 'gpt-5.4-mini',
     largeContextModel: 'gpt-5.4'
   });
+  const [toast, setToast] = useState(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0); // For forcing child components to re-fetch data
   const [llmTraces, setLlmTraces] = useState([]);

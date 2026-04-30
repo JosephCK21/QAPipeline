@@ -125,6 +125,12 @@ async function dockerRun(args, timeoutMs = 120000) {
 
 const PLAYWRIGHT_WAIT_ON_MS = 30000;
 
+/**
+ * Keep in sync with mcr.microsoft.com/playwright Docker tag (v{VER}-jammy)
+ * and devDependency @playwright/test in createSandboxPool.
+ */
+const PLAYWRIGHT_VERSION = '1.59.1';
+
 /** Playwright traces allowed by env AUTOQA_PLAYWRIGHT_TRACE */
 const PLAYWRIGHT_TRACE_MODES = new Set(['on', 'retain-on-failure', 'on-first-retry']);
 
@@ -143,21 +149,40 @@ const TRACE = process.env.AUTOQA_PLAYWRIGHT_TRACE || 'off';
 const TRACE_OK = new Set(${JSON.stringify([...PLAYWRIGHT_TRACE_MODES])});
 const HEADED = process.env.AUTOQA_PLAYWRIGHT_HEADED === '1' || process.env.AUTOQA_PLAYWRIGHT_HEADED === 'true';
 const SLOWMO = parseInt(process.env.AUTOQA_PLAYWRIGHT_SLOWMO_MS || '0', 10) || 0;
+function parsePositive(ms) {
+    const n = parseInt(ms || '', 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+}
+function parseRetries(v) {
+    const n = parseInt(v ?? '', 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+}
+const ROOT_TIMEOUT = parsePositive(process.env.AUTOQA_PLAYWRIGHT_TEST_TIMEOUT_MS);
+const EXPECT_MS = parsePositive(process.env.AUTOQA_PLAYWRIGHT_EXPECT_TIMEOUT_MS);
+const ACTION_MS = parsePositive(process.env.AUTOQA_PLAYWRIGHT_ACTION_TIMEOUT_MS);
+const RETRIES = parseRetries(process.env.AUTOQA_PLAYWRIGHT_RETRIES);
+const _baseRaw = (process.env.AUTOQA_E2E_BASE_URL || '').trim();
+const BASE = _baseRaw.endsWith('/') ? _baseRaw.slice(0, -1) : _baseRaw;
 module.exports = defineConfig({
     testDir: '.',
     testMatch: /autoqa\\.spec\\.js$/,
     forbidOnly: true,
     fullyParallel: false,
     workers: 1,
+    ...(ROOT_TIMEOUT !== null ? { timeout: ROOT_TIMEOUT } : {}),
+    ...(RETRIES !== null ? { retries: RETRIES } : {}),
     reporter: process.env.AUTOQA_PLAYWRIGHT_HTML_REPORT === '1'
         ? [['list'], ['html', { outputFolder: 'test-results/playwright-html', open: 'never' }]]
         : [['list']],
     outputDir: 'test-results/playwright-autoqa',
+    ...(EXPECT_MS !== null ? { expect: { timeout: EXPECT_MS } } : {}),
     use: {
         ...devices['Desktop Chrome'],
         headless: !HEADED,
         screenshot: 'only-on-failure',
         trace: TRACE_OK.has(TRACE) ? TRACE : 'off',
+        ...(BASE ? { baseURL: BASE } : {}),
+        ...(ACTION_MS !== null ? { actionTimeout: ACTION_MS } : {}),
         ...(SLOWMO > 0 ? { launchOptions: { slowMo: SLOWMO } } : {})
     }
 });
@@ -266,13 +291,87 @@ async function loadPackageJsonForPlaywright(sandboxDir) {
 }
 
 /**
- * @param {object|null} pkg
- * @returns {{ devShellCmd: string | null, port: number, targetUrl: string }}
+ * @param {string | undefined} script
+ * @returns {number | null}
  */
-function resolveDevCommandAndPort(pkg) {
-    if (!pkg || typeof pkg !== 'object') {
-        return { devShellCmd: null, port: 5173, targetUrl: 'http://localhost:5173' };
+function extractPortFromNpmScript(script) {
+    if (!script || typeof script !== 'string') return null;
+    const patterns = [
+        /--port(?:=|\s+)(\d+)/i,
+        /(?:^|\s)-p\s+(\d+)(?=\s|$)/,
+        /\bPORT\s*=\s*(\d+)/i
+    ];
+    for (const re of patterns) {
+        const m = script.match(re);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (Number.isFinite(n) && n > 0 && n < 65536) return n;
+        }
     }
+    return null;
+}
+
+/**
+ * Best-effort read of Vite `server.port` from common config filenames.
+ * @param {string} sandboxDir
+ * @returns {Promise<number | null>}
+ */
+async function readVitePortFromSandbox(sandboxDir) {
+    const names = [
+        'vite.config.js', 'vite.config.mjs', 'vite.config.cjs',
+        'vite.config.ts', 'vite.config.mts', 'vite.config.cts'
+    ];
+    for (const name of names) {
+        const fp = path.join(sandboxDir, name);
+        try {
+            const text = await fs.readFile(fp, 'utf8');
+            const serverPort = text.match(/\bserver\s*:\s*\{[^}]*\bport\s*:\s*(\d+)/);
+            if (serverPort) {
+                const n = parseInt(serverPort[1], 10);
+                if (Number.isFinite(n) && n > 0 && n < 65536) return n;
+            }
+            const anyPort = text.match(/\bport\s*:\s*(\d{2,5})\b/);
+            if (anyPort) {
+                const n = parseInt(anyPort[1], 10);
+                if (Number.isFinite(n) && n > 0 && n < 65536) return n;
+            }
+        } catch {
+            continue;
+        }
+    }
+    return null;
+}
+
+/**
+ * @param {string} sandboxDir
+ * @param {object|null} pkg
+ * @returns {Promise<{ devShellCmd: string | null, port: number, targetUrl: string }>}
+ */
+async function resolveDevCommandAndTargetUrl(sandboxDir, pkg) {
+    const envBase = process.env.AUTOQA_E2E_BASE_URL;
+    const trimmed = typeof envBase === 'string' ? envBase.trim() : '';
+    if (trimmed) {
+        const targetUrl = trimmed.replace(/\/$/, '');
+        let port = 5173;
+        try {
+            const u = new URL(targetUrl);
+            if (u.port) port = parseInt(u.port, 10);
+            else if (u.protocol === 'https:') port = 443;
+            else if (u.protocol === 'http:') port = 80;
+        } catch {
+            /* keep default */
+        }
+        const scripts = pkg?.scripts || {};
+        const devShellCmd = scripts.dev ? 'npm run dev' : scripts.start ? 'npm run start' : null;
+        return { devShellCmd, port, targetUrl };
+    }
+
+    if (!pkg || typeof pkg !== 'object') {
+        const fromVite = await readVitePortFromSandbox(sandboxDir);
+        const port = fromVite ?? 5173;
+        return { devShellCmd: null, port, targetUrl: `http://localhost:${port}` };
+    }
+
     const scripts = pkg.scripts || {};
     let devShellCmd = null;
     if (scripts.dev) devShellCmd = 'npm run dev';
@@ -281,11 +380,16 @@ function resolveDevCommandAndPort(pkg) {
     const merged = { ...pkg.dependencies, ...pkg.devDependencies };
     const keys = Object.keys(merged);
     const has = (name) => keys.includes(name);
-    let port = 5173;
-    if (has('vite')) {
-        port = 5173;
-    } else if (has('next') || has('@next/next') || has('react-scripts')) {
-        port = 3000;
+
+    let port = extractPortFromNpmScript(scripts.dev)
+        ?? extractPortFromNpmScript(scripts.start);
+    if (port == null) {
+        port = await readVitePortFromSandbox(sandboxDir);
+    }
+    if (port == null) {
+        if (has('vite')) port = 5173;
+        else if (has('next') || has('@next/next') || has('react-scripts')) port = 3000;
+        else port = 5173;
     }
 
     const targetUrl = `http://localhost:${port}`;
@@ -372,7 +476,7 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
                     '--name', containerName,
                     '-v', `${volumeDir}:/app`,
                     '-w', '/app',
-                    'mcr.microsoft.com/playwright:v1.44.0-jammy',
+                    `mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-jammy`,
                     'tail', '-f', '/dev/null'
                 ], runTimeoutMs);
 
@@ -390,7 +494,7 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
                 await dockerRun([
                     'exec', containerName,
                     'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock',
-                    'jest', 'supertest', 'jest-environment-node', '@playwright/test@1.44.0', 'wait-on'
+                    'jest', 'supertest', 'jest-environment-node', `@playwright/test@${PLAYWRIGHT_VERSION}`, 'wait-on'
                 ], installTimeoutMs);
                 console.log(`[Sandbox] Pre-installed jest, @playwright/test, and wait-on in ${containerName}.`);
             } catch (err) {
@@ -472,7 +576,7 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                 await fs.rm(pwHtml, { recursive: true, force: true }).catch(() => {});
 
                 const pkg = await loadPackageJsonForPlaywright(sandboxDir);
-                const { devShellCmd, targetUrl } = resolveDevCommandAndPort(pkg);
+                const { devShellCmd, targetUrl } = await resolveDevCommandAndTargetUrl(sandboxDir, pkg);
                 if (!devShellCmd) {
                     throw new Error('Dev server failed to start: missing scripts.dev or scripts.start in package.json');
                 }
@@ -505,7 +609,17 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                     }
 
                     const execEnvArgs = ['exec', '-w', '/app'];
-                    const forwardKeys = ['AUTOQA_PLAYWRIGHT_TRACE', 'AUTOQA_PLAYWRIGHT_HEADED', 'AUTOQA_PLAYWRIGHT_SLOWMO_MS', 'AUTOQA_PLAYWRIGHT_HTML_REPORT'];
+                    const forwardKeys = [
+                        'AUTOQA_PLAYWRIGHT_TRACE',
+                        'AUTOQA_PLAYWRIGHT_HEADED',
+                        'AUTOQA_PLAYWRIGHT_SLOWMO_MS',
+                        'AUTOQA_PLAYWRIGHT_HTML_REPORT',
+                        'AUTOQA_PLAYWRIGHT_TEST_TIMEOUT_MS',
+                        'AUTOQA_PLAYWRIGHT_EXPECT_TIMEOUT_MS',
+                        'AUTOQA_PLAYWRIGHT_ACTION_TIMEOUT_MS',
+                        'AUTOQA_PLAYWRIGHT_RETRIES',
+                        'AUTOQA_E2E_BASE_URL'
+                    ];
                     for (const key of forwardKeys) {
                         if (process.env[key] !== undefined && process.env[key] !== '') {
                             execEnvArgs.push('-e', `${key}=${process.env[key]}`);
