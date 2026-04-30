@@ -771,8 +771,14 @@ Copy [`code/backend/.env.example`](code/backend/.env.example) to `code/backend/.
 | `REGRESSION_ENABLED` | `true` (default) / `false` to disable bug-fix path |
 | `REGRESSION_BUGFIX_CONFIDENCE_THRESHOLD` | 0–1, default 0.6 |
 | `SANDBOX_TIMEOUT_MS` | Default 120000; increase if Jest or npm install is slow in Docker |
+| `AUTOQA_PLAYWRIGHT_TRACE` | `off` (default), `on`, `retain-on-failure`, or `on-first-retry` — Playwright traces under `test-results/`; copied into the dashboard when present |
+| `AUTOQA_PLAYWRIGHT_HEADED` | `1` / `true` to disable headless in Docker (often impractical on Docker Desktop for Windows without a display) |
+| `AUTOQA_PLAYWRIGHT_SLOWMO_MS` | Optional slow motion in ms when headed (e.g. `100`) |
+| `AUTOQA_PLAYWRIGHT_HTML_REPORT` | Set `1` to add Playwright `html` reporter output under `test-results/playwright-html` in the sandbox |
 
----
+**Playwright failure screenshots:** `@playwright/test` runs use a generated config with `screenshot: 'only-on-failure'`. PNGs (and trace ZIPs when enabled) are copied to `code/backend/data/artifacts/<runId>/<sanitizedTestCaseId>/` and shown in **Pipeline run → test case → Attempts**.
+
+**Frontend:** optional `VITE_API_BASE_URL` (default `http://localhost:3001`) for screenshot/trace links if the API is not on localhost.
 
 ## Local development and operations
 
@@ -790,7 +796,7 @@ Runs `npm install` in `code/backend`, then `code/frontend` ([`installbeforerun.j
 node clear.js
 ```
 
-Deletes SQLite, JSON stores, uploads, and temp sandbox directories, then recreates empty folders ([`clear.js`](clear.js)). Use before a clean manual test cycle.
+Deletes SQLite, JSON stores, uploads, **run artifact screenshots** (`data/artifacts/`), and temp sandbox directories, then recreates empty folders ([`clear.js`](clear.js)). Use before a clean manual test cycle.
 
 ### One command (dev servers)
 

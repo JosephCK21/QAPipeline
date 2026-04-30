@@ -4,8 +4,12 @@ import { useAppContext } from '../App';
 import {
   ArrowLeft, AlertTriangle, Loader, CheckCircle2, XCircle, Clock,
   ChevronRight, ChevronDown, Code2, Database, ListChecks, RefreshCw,
-  Activity, GitBranch, Terminal, ShieldAlert, Wrench
+  Activity, GitBranch, Terminal, ShieldAlert, Wrench, ImageIcon, Film
 } from 'lucide-react';
+
+const API_BASE = typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL
+  ? String(import.meta.env.VITE_API_BASE_URL).replace(/\/$/, '')
+  : 'http://localhost:3001';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -94,6 +98,48 @@ function AttemptRow({ attempt }) {
 
       {open && (
         <div className="px-3 pb-3 space-y-2 border-t border-[#DFE1E6] bg-[#FAFBFC] rounded-b">
+          {attempt.failureScreenshots?.length > 0 && (
+            <div className="mt-2">
+              <p className="text-[10px] text-[#5E6C84] uppercase tracking-wider mb-1 flex items-center gap-1">
+                <ImageIcon className="w-3 h-3" /> Playwright failure screenshots
+              </p>
+              <div className="space-y-2">
+                {attempt.failureScreenshots.map((s) => (
+                  <a
+                    key={s.url}
+                    href={`${API_BASE}${s.url}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block border border-[#DFE1E6] rounded overflow-hidden bg-[#FFFFFF] hover:ring-2 hover:ring-indigo-400/40"
+                  >
+                    <img
+                      src={`${API_BASE}${s.url}`}
+                      alt={s.fileName || 'Failure screenshot'}
+                      className="w-full max-h-64 object-contain bg-[#171717]"
+                    />
+                    <span className="block text-[9px] text-[#8993A4] px-2 py-1 truncate">{s.fileName}</span>
+                  </a>
+                ))}
+              </div>
+            </div>
+          )}
+          {attempt.traces?.length > 0 && (
+            <div className="mt-2">
+              <p className="text-[10px] text-[#5E6C84] uppercase tracking-wider mb-1 flex items-center gap-1">
+                <Film className="w-3 h-3" /> Trace files
+              </p>
+              <ul className="text-[11px] text-indigo-500 space-y-1">
+                {attempt.traces.map((t) => (
+                  <li key={t.url}>
+                    <a href={`${API_BASE}${t.url}`} download={t.fileName} className="hover:underline break-all">{t.fileName}</a>
+                    <span className="block text-[9px] text-[#8993A4] mt-0.5">
+                      Inspect locally with: <code className="bg-[#F4F5F7] px-1 rounded text-[10px]">npx playwright show-trace &lt;this-file.zip&gt;</code>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {attempt.failureOutput && (
             <div className="mt-2">
               <p className="text-[10px] text-[#C9372C] uppercase tracking-wider mb-1 flex items-center gap-1">

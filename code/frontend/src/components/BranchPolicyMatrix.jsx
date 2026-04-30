@@ -1,10 +1,10 @@
 import React from 'react';
-import { useAppContext } from '../App';
 import { Check, X, GitBranch, ArrowRight, Shield, Zap, RefreshCw } from 'lucide-react';
 
-function BranchPolicyMatrix() {
-  const { branchPolicies } = useAppContext();
+/** Placeholder until branch policy data is wired from the backend. */
+const branchPolicies = [];
 
+function BranchPolicyMatrix() {
   return (
     <div className="bg-[#FFFFFF] rounded-xl border border-[#DFE1E6] overflow-hidden">
       <div className="p-4 border-b border-[#DFE1E6]">
@@ -16,6 +16,11 @@ function BranchPolicyMatrix() {
       </div>
       
       <div className="overflow-x-auto">
+        {branchPolicies.length === 0 ? (
+          <p className="px-4 py-8 text-sm text-[#5E6C84] text-center">
+            No branch policies loaded. Connect policy data from the API to populate this matrix.
+          </p>
+        ) : (
         <table className="w-full">
           <thead>
             <tr className="bg-[#DFE1E6]">
@@ -97,6 +102,7 @@ function BranchPolicyMatrix() {
             ))}
           </tbody>
         </table>
+        )}
       </div>
     </div>
   );

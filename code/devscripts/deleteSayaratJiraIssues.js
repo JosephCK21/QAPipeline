@@ -2,9 +2,9 @@
  * Delete the Sayarat FRD Epics (and their Stories) that were seeded into Jira.
  *
  * Usage:
- *   node scripts/deleteSayaratJiraIssues.js -p QPT                # dry run (default)
- *   node scripts/deleteSayaratJiraIssues.js -p QPT --apply --yes  # actually delete
- *   node scripts/deleteSayaratJiraIssues.js --only-epic 3 --apply --yes
+ *   node code/devscripts/deleteSayaratJiraIssues.js -p QPT                # dry run (default)
+ *   node code/devscripts/deleteSayaratJiraIssues.js -p QPT --apply --yes  # actually delete
+ *   node code/devscripts/deleteSayaratJiraIssues.js --only-epic 3 --apply --yes
  *
  * Behaviour:
  *  - Dry-run by default. Requires BOTH --apply AND --yes to actually delete.
@@ -18,8 +18,9 @@
  *   JIRA_BASE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY (or -p)
  */
 
-require('dotenv').config();
 const axios = require('axios');
+const { loadBackendEnv } = require('./_paths');
+loadBackendEnv();
 const { EPICS } = require('./seedSayaratJiraIssues');
 
 // ---------------------------------------------------------------------------
@@ -65,7 +66,7 @@ function parseArgs(argv) {
 
 function printUsage() {
     console.log('Usage:');
-    console.log('  node scripts/deleteSayaratJiraIssues.js --project <PROJECT_KEY> [--apply --yes]');
+    console.log('  node code/devscripts/deleteSayaratJiraIssues.js --project <PROJECT_KEY> [--apply --yes]');
     console.log('');
     console.log('Options:');
     console.log('  --project, -p <key>   Jira project key (default: JIRA_PROJECT_KEY)');
@@ -75,9 +76,9 @@ function printUsage() {
     console.log('  --delay-ms <n>        Delay between deletes in ms (default: 150)');
     console.log('');
     console.log('Examples:');
-    console.log('  node scripts/deleteSayaratJiraIssues.js -p QPT                # dry run of all');
-    console.log('  node scripts/deleteSayaratJiraIssues.js -p QPT --apply --yes  # delete everything');
-    console.log('  node scripts/deleteSayaratJiraIssues.js -p QPT --only-epic 5 --apply --yes');
+    console.log('  node code/devscripts/deleteSayaratJiraIssues.js -p QPT                # dry run of all');
+    console.log('  node code/devscripts/deleteSayaratJiraIssues.js -p QPT --apply --yes  # delete everything');
+    console.log('  node code/devscripts/deleteSayaratJiraIssues.js -p QPT --only-epic 5 --apply --yes');
 }
 
 // ---------------------------------------------------------------------------

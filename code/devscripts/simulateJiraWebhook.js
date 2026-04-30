@@ -1,4 +1,5 @@
-require('dotenv').config();
+const { loadBackendEnv } = require('./_paths');
+loadBackendEnv();
 
 async function main() {
   const issueKey = process.argv[2] || 'TEST-42';

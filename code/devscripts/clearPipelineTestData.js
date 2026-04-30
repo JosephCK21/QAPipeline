@@ -2,13 +2,14 @@
  * Wipe all test cases, pipeline run history, DLQ rows, and scenario run metadata.
  * Scenarios (Jira-linked rows) and story_sync_log are kept.
  *
- * Usage (from code/backend):
- *   node scripts/clearPipelineTestData.js
+ * Usage:
+ *   node code/devscripts/clearPipelineTestData.js   (from repo root)
  */
 
-require('dotenv').config();
 const path = require('path');
-const { initDb, clearAllPipelineExecutionData } = require(path.join(__dirname, '..', 'db'));
+const { backendRoot, loadBackendEnv } = require('./_paths');
+loadBackendEnv();
+const { initDb, clearAllPipelineExecutionData } = require(path.join(backendRoot, 'db'));
 
 initDb();
 clearAllPipelineExecutionData();

@@ -98,10 +98,6 @@ function saveRTMBaselines(map) {
     fs.writeFileSync(rtmBaselinesPath, JSON.stringify(map, null, 2), 'utf8');
 }
 
-// Import services (to be implemented)
-// const { fetchPRDetails } = require('./services/githubService');
-// const { runPipeline } = require('./pipeline');
-
 const http = require('http');
 const { Server } = require('socket.io');
 const SmeeClient = require('smee-client');
@@ -699,7 +695,6 @@ app.post('/api/webhooks/github', validateBody(githubWebhookSchema), (req, res) =
             runPipeline(runId, prUrl, repoFullName)
                 .catch(err => {
                     console.error(`[Pipeline Error] Run ${runId}:`, err);
-                    const { publishToDLQ } = require('./db');
                     publishToDLQ('github_webhook', { runId, prUrl, repoFullName }, err.message);
                 })
                 .finally(() => {
@@ -817,8 +812,9 @@ app.post('/api/webhooks/jira', verifyJiraWebhookSignature, validateBody(jiraWebh
             queue: getJiraWebhookQueueStatus()
         });
         } catch (error) {
-            console.error('[Jira Webhook] Failed to process payload:', error.message);            const { publishToDLQ } = require('./db');
-            publishToDLQ('jira_webhook', body, error.message);            jiraWebhookState.lastTriggeredAt = new Date().toISOString();
+            console.error('[Jira Webhook] Failed to process payload:', error.message);
+            publishToDLQ('jira_webhook', body, error.message);
+            jiraWebhookState.lastTriggeredAt = new Date().toISOString();
             jiraWebhookState.lastAccepted = false;
             jiraWebhookState.lastError = error.message;
             return res.status(200).json({ received: false, error: error.message });
@@ -868,6 +864,31 @@ app.get('/api/jira/health', async (req, res) => {
     } catch (error) {
         console.error('[Jira Health] Failed:', error.message);
         res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/runs/:runId/artifacts/:testCaseKey/:artifactFile', (req, res) => {
+    try {
+        const ARTIFACT_NAME_RE = /^[a-zA-Z0-9._-]+\.(png|zip)$/;
+        const { runId, testCaseKey, artifactFile } = req.params;
+        if (!ARTIFACT_NAME_RE.test(artifactFile)) {
+            return res.status(400).json({ error: 'Invalid artifact name' });
+        }
+        const artifactsBase = path.resolve(path.join(__dirname, 'data', 'artifacts'));
+        const resolved = path.resolve(path.join(artifactsBase, runId, testCaseKey, artifactFile));
+        if (!resolved.startsWith(artifactsBase)) {
+            return res.status(400).json({ error: 'Bad path' });
+        }
+        if (!fs.existsSync(resolved)) {
+            return res.status(404).json({ error: 'Not found' });
+        }
+        const ext = path.extname(artifactFile).toLowerCase();
+        const ct = ext === '.png' ? 'image/png' : ext === '.zip' ? 'application/zip' : 'application/octet-stream';
+        res.setHeader('Content-Type', ct);
+        fs.createReadStream(resolved).pipe(res);
+    } catch (err) {
+        console.error('[Artifacts] Serve failed:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 

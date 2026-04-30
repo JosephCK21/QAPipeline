@@ -8,6 +8,8 @@
 code/backend/data/*.json
 !code/backend/data/.gitkeep
 code/backend/uploads/
+code/backend/data/artifacts/
+
 code/backend/.env
 node_modules
 
@@ -17,4 +19,4 @@ code/backend/data/autoqa.db-wal
 
 # Frontend build output
 code/frontend/dist/
-code/backend/scripts/seedSayaratJiraIssues.js
+code/devscripts/seedSayaratJiraIssues.js

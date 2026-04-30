@@ -2,9 +2,9 @@
  * Delete the Pro To-Do FRD Epics (and their Stories) that were seeded into Jira.
  *
  * Usage:
- *   node scripts/deleteTodoJiraIssues.js -p TODO                  # dry run (default)
- *   node scripts/deleteTodoJiraIssues.js -p TODO --apply --yes    # actually delete
- *   node scripts/deleteTodoJiraIssues.js --only-epic 2 --apply --yes
+ *   node code/devscripts/deleteTodoJiraIssues.js -p TODO                  # dry run (default)
+ *   node code/devscripts/deleteTodoJiraIssues.js -p TODO --apply --yes    # actually delete
+ *   node code/devscripts/deleteTodoJiraIssues.js --only-epic 2 --apply --yes
  *
  * Behaviour:
  *  - Dry-run by default. Requires BOTH --apply AND --yes to actually delete.
@@ -17,8 +17,9 @@
  *   JIRA_BASE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY (or -p)
  */
 
-require('dotenv').config();
 const axios = require('axios');
+const { loadBackendEnv } = require('./_paths');
+loadBackendEnv();
 const { EPICS } = require('./seedTodoJiraIssues');
 
 // ---------------------------------------------------------------------------
@@ -64,7 +65,7 @@ function parseArgs(argv) {
 
 function printUsage() {
     console.log('Usage:');
-    console.log('  node scripts/deleteTodoJiraIssues.js --project <PROJECT_KEY> [--apply --yes]');
+    console.log('  node code/devscripts/deleteTodoJiraIssues.js --project <PROJECT_KEY> [--apply --yes]');
     console.log('');
     console.log('Options:');
     console.log('  --project, -p <key>   Jira project key (default: JIRA_PROJECT_KEY)');
@@ -74,9 +75,9 @@ function printUsage() {
     console.log('  --delay-ms <n>        Delay between deletes in ms (default: 150)');
     console.log('');
     console.log('Examples:');
-    console.log('  node scripts/deleteTodoJiraIssues.js -p TODO                # dry run of all');
-    console.log('  node scripts/deleteTodoJiraIssues.js -p TODO --apply --yes  # delete everything');
-    console.log('  node scripts/deleteTodoJiraIssues.js -p TODO --only-epic 3 --apply --yes');
+    console.log('  node code/devscripts/deleteTodoJiraIssues.js -p TODO                # dry run of all');
+    console.log('  node code/devscripts/deleteTodoJiraIssues.js -p TODO --apply --yes  # delete everything');
+    console.log('  node code/devscripts/deleteTodoJiraIssues.js -p TODO --only-epic 3 --apply --yes');
 }
 
 // ---------------------------------------------------------------------------

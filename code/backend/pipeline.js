@@ -249,7 +249,9 @@ async function executeTestCaseWithRetries({
             sandboxResult = {
                 success: false,
                 output: `[Syntax validation] ${syntaxCheck.error}`,
-                error: syntaxCheck.error
+                error: syntaxCheck.error,
+                failureScreenshots: [],
+                traces: []
             };
         } else {
             sandboxResult = await executeTest(
@@ -258,7 +260,12 @@ async function executeTestCaseWithRetries({
                 testCase.language || 'javascript',
                 currentScript,
                 `test_${testCase.testCaseId}_attempt${attempt}.spec.${testCase.language === 'python' ? 'py' : 'js'}`,
-                testCase.testData || {}
+                testCase.testData || {},
+                {
+                    runId,
+                    testCaseId: testCase.testCaseId,
+                    attempt
+                }
             );
         }
 
@@ -302,6 +309,8 @@ async function executeTestCaseWithRetries({
                 attempt,
                 status: 'pass',
                 output: sandboxResult.output,
+                failureScreenshots: sandboxResult.failureScreenshots || [],
+                traces: sandboxResult.traces || [],
                 regression: regressionStamp,
                 startedAt: attemptStartedAt,
                 endedAt: attemptEndedAt
@@ -340,6 +349,8 @@ async function executeTestCaseWithRetries({
             status: 'fail',
             failureOutput,
             scriptSnapshot: currentScript,
+            failureScreenshots: sandboxResult.failureScreenshots || [],
+            traces: sandboxResult.traces || [],
             regression: regressionMode ? 'pending' : null,
             startedAt: attemptStartedAt,
             endedAt: attemptEndedAt

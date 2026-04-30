@@ -17,6 +17,9 @@ function initDb() {
     if (!fs.existsSync(path.join(__dirname, 'data'))) {
         fs.mkdirSync(path.join(__dirname, 'data'));
     }
+    if (!fs.existsSync(path.join(__dirname, 'data', 'artifacts'))) {
+        fs.mkdirSync(path.join(__dirname, 'data', 'artifacts'));
+    }
 
     db = new Database(dbPath);
     
@@ -541,6 +544,12 @@ function deleteRunData(runId) {
         db.prepare('DELETE FROM test_cases WHERE runId = ?').run(runId);
         db.prepare('DELETE FROM run_history WHERE runId = ?').run(runId);
     })();
+    try {
+        const artDir = path.join(__dirname, 'data', 'artifacts', runId);
+        fs.rmSync(artDir, { recursive: true, force: true });
+    } catch (e) {
+        console.warn(`[DB] Artifact cleanup warning for ${runId}: ${e.message}`);
+    }
 }
 
 /**
@@ -560,6 +569,13 @@ function clearAllPipelineExecutionData() {
                 lastRunDate = NULL
         `).run();
     })();
+    try {
+        const artifactsRoot = path.join(__dirname, 'data', 'artifacts');
+        fs.rmSync(artifactsRoot, { recursive: true, force: true });
+        fs.mkdirSync(artifactsRoot, { recursive: true });
+    } catch (e) {
+        console.warn(`[DB] Artifact dir clear warning: ${e.message}`);
+    }
 }
 
 module.exports = {

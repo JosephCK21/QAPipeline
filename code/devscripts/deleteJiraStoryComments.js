@@ -1,6 +1,8 @@
-require('dotenv').config();
+const path = require('path');
+const { backendRoot, loadBackendEnv } = require('./_paths');
+loadBackendEnv();
 const axios = require('axios');
-const { adfToPlainText } = require('../services/jiraService');
+const { adfToPlainText } = require(path.join(backendRoot, 'services', 'jiraService'));
 
 function parseArgs(argv) {
     const args = {
@@ -142,7 +144,7 @@ async function deleteComment(baseUrl, headers, issueKey, commentId) {
 
 function printUsage() {
     console.log('Usage:');
-    console.log('  node scripts/deleteJiraStoryComments.js --project <PROJECT_KEY> [--apply]');
+    console.log('  node code/devscripts/deleteJiraStoryComments.js --project <PROJECT_KEY> [--apply]');
     console.log('');
     console.log('Options:');
     console.log('  --project, -p <key>     Jira project key (defaults to JIRA_PROJECT_KEY)');
@@ -154,9 +156,9 @@ function printUsage() {
     console.log('  --max-issues <n>        Max issues to scan (default: 500)');
     console.log('');
     console.log('Examples:');
-    console.log('  node scripts/deleteJiraStoryComments.js -p QPT');
-    console.log('  node scripts/deleteJiraStoryComments.js -p QPT --apply');
-    console.log('  node scripts/deleteJiraStoryComments.js -p QPT --apply --marker "AUTOQA_MANAGED_SCENARIOS:"');
+    console.log('  node code/devscripts/deleteJiraStoryComments.js -p QPT');
+    console.log('  node code/devscripts/deleteJiraStoryComments.js -p QPT --apply');
+    console.log('  node code/devscripts/deleteJiraStoryComments.js -p QPT --apply --marker "AUTOQA_MANAGED_SCENARIOS:"');
 }
 
 async function main() {

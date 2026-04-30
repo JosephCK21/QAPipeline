@@ -1,10 +1,12 @@
-require('dotenv').config();
-const { fetchIssue } = require('../services/jiraService');
+const path = require('path');
+const { backendRoot, loadBackendEnv } = require('./_paths');
+loadBackendEnv();
+const { fetchIssue } = require(path.join(backendRoot, 'services', 'jiraService'));
 
 async function main() {
   const issueKey = process.argv[2];
   if (!issueKey) {
-    console.error('Usage: node scripts/checkJiraApi.js <ISSUE_KEY>');
+    console.error('Usage: node code/devscripts/checkJiraApi.js <ISSUE_KEY>');
     process.exit(1);
   }
 

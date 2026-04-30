@@ -2,10 +2,10 @@
  * Seed the Pro To-Do FRD Epics (and their Stories) into Jira.
  *
  * Usage:
- *   node scripts/seedTodoJiraIssues.js -p TODO             # dry run (default)
- *   node scripts/seedTodoJiraIssues.js -p TODO --apply     # actually create
- *   node scripts/seedTodoJiraIssues.js --only-epic 2 --apply
- *   node scripts/seedTodoJiraIssues.js --force --apply     # skip idempotency
+ *   node code/devscripts/seedTodoJiraIssues.js -p TODO             # dry run (default)
+ *   node code/devscripts/seedTodoJiraIssues.js -p TODO --apply     # actually create
+ *   node code/devscripts/seedTodoJiraIssues.js --only-epic 2 --apply
+ *   node code/devscripts/seedTodoJiraIssues.js --force --apply     # skip idempotency
  *
  * Behaviour:
  *  - Dry-run by default; add --apply to actually write to Jira.
@@ -19,8 +19,9 @@
  *   JIRA_BASE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY (or -p)
  */
 
-require('dotenv').config();
 const axios = require('axios');
+const { loadBackendEnv } = require('./_paths');
+loadBackendEnv();
 
 // ---------------------------------------------------------------------------
 // Epic + Story data
@@ -358,7 +359,7 @@ function parseArgs(argv) {
 
 function printUsage() {
     console.log('Usage:');
-    console.log('  node scripts/seedTodoJiraIssues.js --project <PROJECT_KEY> [--apply]');
+    console.log('  node code/devscripts/seedTodoJiraIssues.js --project <PROJECT_KEY> [--apply]');
     console.log('');
     console.log('Options:');
     console.log('  --project, -p <key>   Jira project key (default: JIRA_PROJECT_KEY)');
@@ -368,9 +369,9 @@ function printUsage() {
     console.log('  --delay-ms <n>        Delay between creates in ms (default: 150)');
     console.log('');
     console.log('Examples:');
-    console.log('  node scripts/seedTodoJiraIssues.js -p TODO');
-    console.log('  node scripts/seedTodoJiraIssues.js -p TODO --apply');
-    console.log('  node scripts/seedTodoJiraIssues.js -p TODO --only-epic 2 --apply');
+    console.log('  node code/devscripts/seedTodoJiraIssues.js -p TODO');
+    console.log('  node code/devscripts/seedTodoJiraIssues.js -p TODO --apply');
+    console.log('  node code/devscripts/seedTodoJiraIssues.js -p TODO --only-epic 2 --apply');
 }
 
 // ---------------------------------------------------------------------------

@@ -625,9 +625,18 @@ SEPARATION OF DATA AND LOGIC (mandatory — strictly enforced):
 
 RULES FOR THE testScript:
 - The script runs inside an isolated Docker container where the full app source code is already present.
-- The app's dependencies (express, etc.) are pre-installed but the server is NOT already running.
-- AVAILABLE TEST PACKAGES (already installed): jest, supertest, jest-environment-node, fs, path, vm, crypto, and Node.js built-ins.
-- DO NOT require or import packages that are not listed above (e.g. jsdom, puppeteer, playwright, cheerio, enzyme, testing-library). If you need DOM testing, use Node.js built-in "vm" module with a manual DOM stub, or test the API layer directly with supertest instead.
+- The app's dependencies (express, etc.) are pre-installed but the server is NOT already running for Jest/API tests.
+- AVAILABLE TEST PACKAGES (already installed): jest, supertest, jest-environment-node, @playwright/test, fs, path, vm, crypto, and Node.js built-ins.
+- DO NOT require or import packages beyond those above and the Playwright E2E exception below (no jsdom, cheerio, enzyme, testing-library, puppeteer).
+
+PLAYWRIGHT BROWSER E2E (use only when the scenario requires exercising the real UI in a browser — not for HTTP-only APIs):
+- Use CommonJS: const { test, expect } = require('@playwright/test');
+- Prefer a single test('...', async ({ page }) => { ... }) inside one test.describe block for this file so failure screenshots map cleanly to one test case.
+- The sandbox starts the app dev server (npm run dev or npm start) and runs Playwright against it; navigate with page.goto using the real base URL (infer port from codeContext: Vite 5173, Next/react-scripts often 3000).
+- On failure, screenshots are captured automatically by the test runner — do not add page.screenshot() solely for failure diagnostics unless you need an extra mid-test capture.
+- Use accessibility-driven selectors (getByRole, getByLabel) when possible.
+
+Jest + supertest (default for HTTP APIs):
 - For Node.js Express (and other HTTP frameworks exposed as an app or server): you MUST use "supertest" only — require the server module, pass it to supertest, and do NOT call app.listen() yourself.
   Example: const request = require('supertest'); const app = require('./todoServer'); const res = await request(app).post('/todos').send(testData.todo);
 - FORBIDDEN for Express HTTP APIs: reaching into Express internals (e.g. app._router, layer.route, walking middleware stacks, invokeRoute helpers, or hand-rolled req/res mocks). Supertest is the only allowed way to hit HTTP routes unless the app is genuinely non-HTTP.
@@ -659,6 +668,7 @@ const HEAL_INSTRUCTIONS = `You are an expert test engineer fixing a failing test
 The testData variable is already injected as the first line at runtime — do NOT redeclare it.
 Do not hardcode any values that exist in testData — always reference them as testData.<group>.<key>.
 Fix any SyntaxError or duplicate identifier (e.g. a helper function name reused as const) — rename variables so every binding is unique.
+If the script uses @playwright/test, fix selectors, timeouts, and page.goto URLs to match the dev server port from the repo; do not add page.screenshot() only for failure dumps — failure screenshots are automatic.
 If the script uses app._router, manual middleware walking, or fake req/res mocks for an Express app, rewrite it to use supertest against the exported app with async/await and describe/it.
 If the app uses file-based storage (JSON files), the data files are reset to empty ([] or {}) before each test run. The test must create all data it needs (signup, login, create records) — never assume pre-existing data.
 Ensure no open handles (servers, intervals, sockets) remain after tests — add afterAll cleanup if needed.

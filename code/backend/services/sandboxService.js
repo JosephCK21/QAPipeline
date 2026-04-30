@@ -119,15 +119,137 @@ function extractDependencies(code, language) {
 // DOCKER HELPERS — use execFile to avoid shell quoting issues on Windows
 // ---------------------------------------------------------------------------
 
-function dockerArgs(...args) {
-    return args;
-}
-
 async function dockerRun(args, timeoutMs = 120000) {
     return execFilePromise('docker', args, { timeout: timeoutMs });
 }
 
 const PLAYWRIGHT_WAIT_ON_MS = 30000;
+
+/** Playwright traces allowed by env AUTOQA_PLAYWRIGHT_TRACE */
+const PLAYWRIGHT_TRACE_MODES = new Set(['on', 'retain-on-failure', 'on-first-retry']);
+
+/** @returns {string} */
+function sanitizeArtifactSegment(id) {
+    return String(id || 'unknown').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 160);
+}
+
+/**
+ * @returns {string}
+ */
+function buildPlaywrightAutoqaConfigSource() {
+    return `'use strict';
+const { defineConfig, devices } = require('@playwright/test');
+const TRACE = process.env.AUTOQA_PLAYWRIGHT_TRACE || 'off';
+const TRACE_OK = new Set(${JSON.stringify([...PLAYWRIGHT_TRACE_MODES])});
+const HEADED = process.env.AUTOQA_PLAYWRIGHT_HEADED === '1' || process.env.AUTOQA_PLAYWRIGHT_HEADED === 'true';
+const SLOWMO = parseInt(process.env.AUTOQA_PLAYWRIGHT_SLOWMO_MS || '0', 10) || 0;
+module.exports = defineConfig({
+    testDir: '.',
+    testMatch: /autoqa\\.spec\\.js$/,
+    forbidOnly: true,
+    fullyParallel: false,
+    workers: 1,
+    reporter: process.env.AUTOQA_PLAYWRIGHT_HTML_REPORT === '1'
+        ? [['list'], ['html', { outputFolder: 'test-results/playwright-html', open: 'never' }]]
+        : [['list']],
+    outputDir: 'test-results/playwright-autoqa',
+    use: {
+        ...devices['Desktop Chrome'],
+        headless: !HEADED,
+        screenshot: 'only-on-failure',
+        trace: TRACE_OK.has(TRACE) ? TRACE : 'off',
+        ...(SLOWMO > 0 ? { launchOptions: { slowMo: SLOWMO } } : {})
+    }
+});
+`;
+}
+
+/**
+ * @param {string} dir
+ * @param {{ ext: Set<string>, out: string[] }} acc
+ */
+async function collectFilesByExtension(dir, acc) {
+    let entries = [];
+    try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+        return;
+    }
+    for (const ent of entries) {
+        const p = path.join(dir, ent.name);
+        if (ent.isDirectory()) {
+            await collectFilesByExtension(p, acc);
+        } else {
+            const ext = path.extname(ent.name).toLowerCase();
+            if (acc.ext.has(ext)) acc.out.push(p);
+        }
+    }
+}
+
+/**
+ * Copy Playwright output (screenshots, traces) into backend data/artifacts for the UI.
+ * @param {string} sandboxDir
+ * @param {{ runId: string, testCaseId: string, attempt: number }} ctx
+ */
+async function persistPlaywrightArtifacts(sandboxDir, ctx) {
+    const empty = { failureScreenshots: [], traces: [] };
+    if (!ctx?.runId || !ctx.testCaseId) return empty;
+
+    const pwRoot = path.join(sandboxDir, 'test-results', 'playwright-autoqa');
+    const acc = { ext: new Set(['.png', '.zip']), out: [] };
+    await collectFilesByExtension(pwRoot, acc);
+
+    /** @type {string[]} */
+    const pngFiles = acc.out.filter(f => f.endsWith('.png')).sort();
+    /** @type {string[]} */
+    const zipFiles = acc.out.filter(f => f.endsWith('.zip')).sort();
+
+    if (pngFiles.length === 0 && zipFiles.length === 0) return empty;
+
+    const safeTc = sanitizeArtifactSegment(ctx.testCaseId);
+    const artifactsRoot = path.join(__dirname, '..', 'data', 'artifacts');
+    const destDir = path.join(artifactsRoot, ctx.runId, safeTc);
+
+    await fs.mkdir(destDir, { recursive: true });
+
+    const encodeSeg = (s) => encodeURIComponent(String(s));
+
+    /** @type {{ url: string, fileName: string }[]} */
+    const failureScreenshots = [];
+    pngFiles.forEach((src, idx) => {
+        const destName = `attempt-${ctx.attempt}-screenshot-${idx}.png`;
+        const destAbs = path.join(destDir, destName);
+        try {
+            require('fs').copyFileSync(src, destAbs);
+        } catch (e) {
+            console.warn(`[Sandbox] Copy screenshot failed ${src}: ${e.message}`);
+            return;
+        }
+        failureScreenshots.push({
+            fileName: destName,
+            url: `/api/runs/${encodeSeg(ctx.runId)}/artifacts/${encodeSeg(safeTc)}/${encodeSeg(destName)}`
+        });
+    });
+
+    /** @type {{ url: string, fileName: string }[]} */
+    const traces = [];
+    zipFiles.forEach((src, idx) => {
+        const destName = `attempt-${ctx.attempt}-trace-${idx}.zip`;
+        const destAbs = path.join(destDir, destName);
+        try {
+            require('fs').copyFileSync(src, destAbs);
+        } catch (e) {
+            console.warn(`[Sandbox] Copy trace failed ${src}: ${e.message}`);
+            return;
+        }
+        traces.push({
+            fileName: destName,
+            url: `/api/runs/${encodeSeg(ctx.runId)}/artifacts/${encodeSeg(safeTc)}/${encodeSeg(destName)}`
+        });
+    });
+
+    return { failureScreenshots, traces };
+}
 
 /**
  * @param {string} sandboxDir
@@ -294,7 +416,7 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
  * reliably capturing the full Jest/Playwright/pytest output even on failure — which is
  * critical for the healer to see what went wrong.
  */
-async function executeTest(containerName, sandboxDir, testLanguage, testContent, testFilename, testData = {}) {
+async function executeTest(containerName, sandboxDir, testLanguage, testContent, testFilename, testData = {}, artifactContext = null) {
     const isPlaywrightTest = testLanguage === 'javascript'
         && typeof testContent === 'string'
         && testContent.includes('@playwright/test');
@@ -341,6 +463,14 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
             }
 
             if (isPlaywrightTest) {
+                const playwrightConfigPath = path.join(sandboxDir, 'playwright.autoqa.config.cjs');
+                await fs.writeFile(playwrightConfigPath, buildPlaywrightAutoqaConfigSource(), 'utf8');
+
+                const pwOut = path.join(sandboxDir, 'test-results', 'playwright-autoqa');
+                const pwHtml = path.join(sandboxDir, 'test-results', 'playwright-html');
+                await fs.rm(pwOut, { recursive: true, force: true }).catch(() => {});
+                await fs.rm(pwHtml, { recursive: true, force: true }).catch(() => {});
+
                 const pkg = await loadPackageJsonForPlaywright(sandboxDir);
                 const { devShellCmd, targetUrl } = resolveDevCommandAndPort(pkg);
                 if (!devShellCmd) {
@@ -374,12 +504,56 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                         throw new Error(`Dev server failed to start: ${detail}`);
                     }
 
-                    const runCmd = 'npx playwright test autoqa.spec.js --workers=1 2>&1';
-                    const { stdout, stderr } = await spawnCapture(
-                        'docker', ['exec', containerName, 'sh', '-c', runCmd],
-                        { timeout: testTimeout }
-                    );
-                    return { success: true, output: (stdout + '\n' + stderr).trim() };
+                    const execEnvArgs = ['exec', '-w', '/app'];
+                    const forwardKeys = ['AUTOQA_PLAYWRIGHT_TRACE', 'AUTOQA_PLAYWRIGHT_HEADED', 'AUTOQA_PLAYWRIGHT_SLOWMO_MS', 'AUTOQA_PLAYWRIGHT_HTML_REPORT'];
+                    for (const key of forwardKeys) {
+                        if (process.env[key] !== undefined && process.env[key] !== '') {
+                            execEnvArgs.push('-e', `${key}=${process.env[key]}`);
+                        }
+                    }
+                    const runCmd = 'npx playwright test autoqa.spec.js --workers=1 --config=playwright.autoqa.config.cjs 2>&1';
+                    execEnvArgs.push(containerName, 'sh', '-c', runCmd);
+
+                    /** @type {{ url: string, fileName: string }[]} */
+                    let failureScreenshots = [];
+                    /** @type {{ url: string, fileName: string }[]} */
+                    let traces = [];
+
+                    const mergeArtifacts = async () => {
+                        if (!artifactContext) return { failureScreenshots: [], traces: [] };
+                        return persistPlaywrightArtifacts(sandboxDir, artifactContext);
+                    };
+
+                    try {
+                        const { stdout, stderr } = await spawnCapture(
+                            'docker', execEnvArgs,
+                            { timeout: testTimeout }
+                        );
+                        const merged = await mergeArtifacts();
+                        failureScreenshots = merged.failureScreenshots;
+                        traces = merged.traces;
+                        return {
+                            success: true,
+                            output: (stdout + '\n' + stderr).trim(),
+                            failureScreenshots,
+                            traces
+                        };
+                    } catch (spawnErr) {
+                        const mergedArt = await mergeArtifacts();
+                        failureScreenshots = mergedArt.failureScreenshots;
+                        traces = mergedArt.traces;
+                        const stdout = spawnErr.stdout || '';
+                        const stderr = spawnErr.stderr || '';
+                        const combined = (stdout + '\n' + stderr).trim();
+                        const output = combined || spawnErr.message;
+                        return {
+                            success: false,
+                            output,
+                            error: spawnErr.message,
+                            failureScreenshots,
+                            traces
+                        };
+                    }
                 } finally {
                     if (didStartDevServer) {
                         await killPlaywrightBackgroundProcesses(containerName);
@@ -395,7 +569,7 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                 'docker', ['exec', containerName, 'sh', '-c', runCmd],
                 { timeout: testTimeout }
             );
-            return { success: true, output: (stdout + '\n' + stderr).trim() };
+            return { success: true, output: (stdout + '\n' + stderr).trim(), failureScreenshots: [], traces: [] };
 
         } else if (testLanguage === 'python') {
             const PYTHON_BUILTINS = new Set(['json', 'os', 'sys', 'math', 're', 'datetime', 'time', 'random']);
@@ -413,7 +587,7 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                 'docker', ['exec', containerName, 'sh', '-c', pytestCmd],
                 { timeout: testTimeout }
             );
-            return { success: true, output: (stdout + '\n' + stderr).trim() };
+            return { success: true, output: (stdout + '\n' + stderr).trim(), failureScreenshots: [], traces: [] };
 
         } else {
             throw new Error(`Language ${testLanguage} not supported by Sandbox.`);
@@ -425,7 +599,7 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
         const stderr = error.stderr || '';
         const combined = (stdout + '\n' + stderr).trim();
         const output = combined || error.message;
-        return { success: false, output, error: error.message };
+        return { success: false, output, error: error.message, failureScreenshots: [], traces: [] };
     }
 }
 
@@ -544,4 +718,5 @@ module.exports = {
     executeTest,
     validateSyntaxLocal,
     cleanupSandboxPool,
+    sanitizeArtifactSegment
 };

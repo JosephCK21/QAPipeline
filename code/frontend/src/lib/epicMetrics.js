@@ -59,7 +59,7 @@ export function computeEpicMetrics(epicKey, reqs, allScenarios) {
   const reqIds = new Set((reqs || []).map((r) => r.reqId));
 
   (allScenarios || []).forEach((scenario) => {
-    // Support both parentReq (dashboard data shape) and relatedReq (RTMMatrix shape)
+    // Support parentReq (dashboard) vs relatedReq (alternate RTM payloads)
     const linkedReq = scenario.parentReq || scenario.relatedReq;
     if (!reqIds.has(linkedReq)) return;
 
