@@ -193,7 +193,7 @@ ${JSON.stringify(documentTexts.slice(0, 5), null, 2)}`;
 
     try {
         const _prStartMs = Date.now();
-        emitLlmTrace({ caller: 'mapPrChangesToScenarios', model, phase: 'request', prompt });
+        emitLlmTrace({ caller: 'mapPrChangesToScenarios', model, phase: 'request', prompt, correlationKey: 'pr_mapping' });
         const response = await client.responses.create({
             model,
             instructions: PR_MAPPING_INSTRUCTIONS,
@@ -223,7 +223,8 @@ ${JSON.stringify(documentTexts.slice(0, 5), null, 2)}`;
             reasoningSummary,
             durationMs: Date.now() - _prStartMs,
             responseId: response.id,
-            usage
+            usage,
+            correlationKey: 'pr_mapping'
         });
         console.log(`[prScenarioMappingService] Raw LLM response (first 500 chars): ${rawText.slice(0, 500)}`);
         const parsed = safeParseJSON(rawText);

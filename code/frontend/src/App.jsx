@@ -71,6 +71,10 @@ function App() {
       setRefreshKey((prev) => prev + 1);
     });
 
+    socket.on('jira_queue_updated', () => {
+      setRefreshKey((prev) => prev + 1);
+    });
+
     socket.on('jira_run_updated', (data) => {
       if (data.status === 'completed') {
         setToast({ message: `Jira run completed for ${data.issueKey}`, type: 'success' });

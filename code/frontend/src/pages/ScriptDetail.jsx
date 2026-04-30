@@ -198,7 +198,20 @@ function TestCasePanel({ testCase, attempts }) {
               <RefreshCw className="w-3 h-3" />{testCase.healAttempts} heal{testCase.healAttempts !== 1 ? 's' : ''}
             </span>
           )}
+          {Number(testCase.heal_exhausted) === 1 && testCase.status === 'fail' && (
+            <span className="text-[10px] px-2 py-0.5 rounded border border-red-500/45 bg-red-500/15 text-[#C9372C] font-semibold uppercase tracking-wide">
+              Heal exhausted
+            </span>
+          )}
           <RegressionPill regression={testCase.regression} />
+          {(testCase.source === 'fallback' || testCase.scenarioId === 'FALLBACK') && (
+            <span
+              title="Auto-generated smoke test for files without Jira scenario coverage"
+              className="text-[10px] px-2 py-0.5 rounded-full border font-medium bg-[#EBECF0] border-[#C1C7D0] text-[#5E6C84]"
+            >
+              smoke
+            </span>
+          )}
         </div>
         <p className="text-xs font-mono text-indigo-400">{testCase.testCaseId}</p>
         <p className="text-sm font-semibold text-[#172B4D] mt-0.5 leading-tight">{testCase.title}</p>

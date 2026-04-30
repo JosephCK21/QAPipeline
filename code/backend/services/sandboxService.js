@@ -400,7 +400,7 @@ async function killPlaywrightBackgroundProcesses(containerName) {
     try {
         await execFilePromise(
             'docker',
-            ['exec', containerName, 'sh', '-c', 'pkill -f node || true'],
+            ['exec', containerName, 'sh', '-c', '[ -s /tmp/autoqa-dev.pid ] && kill "$(cat /tmp/autoqa-dev.pid)" 2>/dev/null || true; pkill -f node || true; rm -f /tmp/autoqa-dev.pid'],
             { timeout: 30000 }
         );
     } catch (e) {
@@ -412,17 +412,66 @@ async function killPlaywrightBackgroundProcesses(containerName) {
 // SANDBOX LIFECYCLE
 // ---------------------------------------------------------------------------
 
+const SANDBOX_MAX_CONCURRENT = Math.max(1, parseInt(process.env.SANDBOX_MAX_CONCURRENT || '3', 10));
+
+let _sandboxActiveCreations = 0;
+const _sandboxCreationWaiters = [];
+
+function acquireSandboxCreationSlot() {
+    if (_sandboxActiveCreations < SANDBOX_MAX_CONCURRENT) {
+        _sandboxActiveCreations++;
+        return Promise.resolve();
+    }
+    return new Promise((resolve) => _sandboxCreationWaiters.push(resolve));
+}
+
+function releaseSandboxCreationSlot() {
+    _sandboxActiveCreations = Math.max(0, _sandboxActiveCreations - 1);
+    const next = _sandboxCreationWaiters.shift();
+    if (next) {
+        _sandboxActiveCreations++;
+        next();
+    }
+}
+
 /**
  * Creates a pool of sandbox directories, clones the repo into each, starts
  * multiple persistent Docker containers for the run, and pre-installs dependencies.
  *
  * Returns an array of { sandboxDir, containerName } objects.
  */
+async function clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs) {
+    if (!prDetails.headRepoFullName || !prDetails.headRef) {
+        throw new Error('clonePrRepoToSandbox: missing headRepoFullName/headRef');
+    }
+    const token = process.env.GITHUB_TOKEN;
+    const shallowUrl = `https://github.com/${prDetails.headRepoFullName}.git`;
+    if (token) {
+        const b64 = Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64');
+        await spawnCapture(
+            'git',
+            [
+                '-c', `http.extraHeader=AUTHORIZATION: basic ${b64}`,
+                'clone', '--depth', '1',
+                '-b', prDetails.headRef,
+                shallowUrl,
+                sandboxDir
+            ],
+            { timeout: timeoutMs }
+        );
+    } else {
+        await execPromise(`git clone --depth 1 -b ${prDetails.headRef} "${shallowUrl}" "${sandboxDir}"`, { timeout: timeoutMs });
+    }
+}
+
 async function createSandboxPool(runId, prDetails, concurrency = 2) {
     const createPromises = [];
 
     for (let i = 1; i <= concurrency; i++) {
         createPromises.push((async () => {
+            await acquireSandboxCreationSlot();
+            try {
+
             const baseTmp = process.platform === 'win32' ? 'C:\\tmp' : '/tmp';
             const sandboxDir = path.join(baseTmp, 'autoqa-sandbox', `${runId}-${i}`);
             const containerName = `autoqa-sandbox-${runId}-${i}`;
@@ -432,15 +481,8 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
             // -- Clone or flat-drop ------------------------------------------------
             try {
                 if (prDetails.headRepoFullName && prDetails.headRef) {
-                    let repoUrl = `https://github.com/${prDetails.headRepoFullName}.git`;
-                    if (process.env.GITHUB_TOKEN) {
-                        repoUrl = `https://${process.env.GITHUB_TOKEN}@github.com/${prDetails.headRepoFullName}.git`;
-                    }
                     const timeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
-                    await execPromise(
-                        `git clone --depth 1 -b ${prDetails.headRef} "${repoUrl}" "${sandboxDir}"`,
-                        { timeout: timeoutMs }
-                    );
+                    await clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs);
                     console.log(`[Sandbox] Cloned repo into pool ${i}`);
 
                     // Overlay mock data if present
@@ -503,6 +545,9 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
             }
 
             return { sandboxDir, containerName };
+            } finally {
+                releaseSandboxCreationSlot();
+            }
         })());
     }
 
@@ -583,9 +628,11 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
 
                 let didStartDevServer = false;
                 try {
+                    const startCmd =
+                        '(' + devShellCmd + ') > /tmp/autoqa-dev.log 2>&1 & echo $! > /tmp/autoqa-dev.pid';
                     await execFilePromise(
                         'docker',
-                        ['exec', '-d', '-w', '/app', containerName, 'sh', '-c', devShellCmd],
+                        ['exec', '-d', '-w', '/app', containerName, 'sh', '-c', startCmd],
                         { timeout: testTimeout }
                     );
                     didStartDevServer = true;

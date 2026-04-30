@@ -8,7 +8,15 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const { runJiraPipeline } = require('./jiraPipeline');
-const { deleteProjectData, initDb, publishToDLQ, getDLQEvents, upsertScenario, getScenariosByProject, markScenariosObsolete, createRun, updateRun, getRun, listRuns, computeStoryHash, getStorySyncRecord, upsertStorySyncRecord, getStorySyncRecordsByProject, getTestCasesByScenario } = require('./db');
+const {
+    deleteProjectData, initDb, publishToDLQ, getDLQEvents,
+    upsertScenario, getScenariosByProject, markScenariosObsolete,
+    createRun, updateRun, getRun, listRuns, computeStoryHash,
+    getStorySyncRecord, upsertStorySyncRecord, getStorySyncRecordsByProject,
+    getTestCasesByScenario, insertWebhookDelivery, getActiveRunByPrUrl,
+    listLlmTracesByRun, listDlqEvents, getDlqEvent, updateDlqStatus,
+    getHealExhaustedByProject
+} = require('./db');
 const { githubWebhookSchema, jiraWebhookSchema, projectCreateSchema, validateBody } = require('./schemas');
 
 initDb();
@@ -603,11 +611,6 @@ function getRunHistory() {
     }
 }
 
-// In-memory lock to prevent duplicate pipeline runs for the same PR URL.
-// When a PR event arrives while a run for that URL is already in flight,
-// we skip the duplicate to avoid wasting Docker/LLM resources.
-const _activePipelineRuns = new Map();
-
 function verifyGitHubSignature(req) {
     const secret = process.env.GITHUB_WEBHOOK_SECRET;
     if (!secret) return true; // no secret configured — skip verification
@@ -626,13 +629,68 @@ app.post('/api/webhooks/github', validateBody(githubWebhookSchema), (req, res) =
         return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    // Respond immediately with 202 Accepted
+    const event = req.headers['x-github-event'];
+
+    if (event === 'pull_request') {
+        const { action, pull_request, repository } = req.body || {};
+
+        if (action === 'opened' || action === 'synchronize' || action === 'reopened') {
+            const deliveryId = req.headers['x-github-delivery'];
+            if (deliveryId) {
+                const { inserted } = insertWebhookDelivery(String(deliveryId), 'github');
+                if (!inserted) {
+                    return res.status(200).json({ duplicateDelivery: true, source: 'github' });
+                }
+            }
+
+            const prUrl = pull_request?.html_url;
+            const repoFullName = repository?.full_name;
+            const linkedProject = findProjectByGithubRepo(repoFullName);
+
+            if (!linkedProject || !linkedProject.jiraProjectKey) {
+                console.log(`[Webhook] Ignored PR for ${repoFullName}: repo is not linked to a complete local project (Jira + GitHub).`);
+                res.status(202).json({ accepted: true, ignored: true, reason: 'not_linked' });
+                if (global.io) global.io.emit('refresh_data');
+                return;
+            }
+
+            const active = getActiveRunByPrUrl(prUrl);
+            if (active?.runId) {
+                console.log(`[Webhook] Active run exists for PR ${prUrl}: ${active.runId}`);
+                return res.status(200).json({ duplicateRun: true, runId: active.runId });
+            }
+
+            const runId = uuidv4();
+            console.log(`[Webhook] PR ${action}: ${prUrl} in ${repoFullName}. Starting run ${runId}`);
+
+            res.status(202).json({ accepted: true, runId });
+
+            process.nextTick(() => {
+                if (global.io) {
+                    global.io.emit('pr_opened', {
+                        runId,
+                        repoFullName,
+                        prUrl,
+                        action,
+                        localProjectId: linkedProject.id,
+                        localProjectName: linkedProject.name
+                    });
+                    global.io.emit('refresh_data');
+                }
+                const { runPipeline } = require('./pipeline');
+                runPipeline(runId, prUrl, repoFullName).catch(err => {
+                    console.error(`[Pipeline Error] Run ${runId}:`, err);
+                    publishToDLQ('github_webhook', { runId, prUrl, repoFullName }, err.message);
+                });
+            });
+            return;
+        }
+    }
+
     res.status(202).send('Accepted');
 
-    const event = req.headers['x-github-event'];
-    
     if (event === 'repository') {
-        const { action, repository } = req.body;
+        const { action, repository } = req.body || {};
         if (action === 'created' || action === 'publicized') {
             console.log(`[Webhook] Repository ${action}: ${repository.full_name}`);
             if (global.io) {
@@ -641,65 +699,13 @@ app.post('/api/webhooks/github', validateBody(githubWebhookSchema), (req, res) =
             }
         }
     } else if (event === 'create') {
-        const { ref_type, ref, repository } = req.body;
+        const { ref_type, ref, repository } = req.body || {};
         if (ref_type === 'branch') {
             console.log(`[Webhook] Branch created: ${ref} in ${repository.full_name}`);
             if (global.io) {
                 global.io.emit('branch_created', { branchName: ref, repoFullName: repository.full_name });
                 global.io.emit('refresh_data');
             }
-        }
-    } else if (event === 'pull_request') {
-        const { action, pull_request, repository } = req.body;
-        
-        if (action === 'opened' || action === 'synchronize' || action === 'reopened') {
-            const prUrl = pull_request.html_url;
-            const repoFullName = repository.full_name;
-            const linkedProject = findProjectByGithubRepo(repoFullName);
-
-            if (!linkedProject || !linkedProject.jiraProjectKey) {
-                console.log(`[Webhook] Ignored PR for ${repoFullName}: repo is not linked to a complete local project (Jira + GitHub).`);
-                if (global.io) {
-                    global.io.emit('refresh_data');
-                }
-                return;
-            }
-
-            // Deduplication: skip if a pipeline is already running for this PR.
-            if (_activePipelineRuns.has(prUrl)) {
-                const existingRunId = _activePipelineRuns.get(prUrl);
-                console.log(`[Webhook] Skipping duplicate PR event for ${prUrl} — run ${existingRunId} is already in flight.`);
-                return;
-            }
-
-            const runId = uuidv4();
-            _activePipelineRuns.set(prUrl, runId);
-            
-            console.log(`[Webhook] PR ${action}: ${prUrl} in ${repoFullName}. Starting run ${runId}`);
-            
-            // Emit a new PR event to React frontend immediately
-            if (global.io) {
-                global.io.emit('pr_opened', {
-                    runId,
-                    repoFullName,
-                    prUrl,
-                    action,
-                    localProjectId: linkedProject.id,
-                    localProjectName: linkedProject.name
-                });
-                global.io.emit('refresh_data');
-            }
-            
-            // Kick off the pipeline asynchronously
-            const { runPipeline } = require('./pipeline');
-            runPipeline(runId, prUrl, repoFullName)
-                .catch(err => {
-                    console.error(`[Pipeline Error] Run ${runId}:`, err);
-                    publishToDLQ('github_webhook', { runId, prUrl, repoFullName }, err.message);
-                })
-                .finally(() => {
-                    _activePipelineRuns.delete(prUrl);
-                });
         }
     }
 });
@@ -791,6 +797,26 @@ app.post('/api/webhooks/jira', verifyJiraWebhookSignature, validateBody(jiraWebh
         }
         if (!isEpic && !isStory) {
             return respondIgnored(`Unsupported issue type: ${issueType || 'unknown'} - only Stories or Epics are processed for scenarios`, issueKey);
+        }
+
+        const jiraDelId =
+            `jira:` +
+            crypto
+                .createHash('sha256')
+                .update(`${issueKey}|${dedupeBase}|${body?.webhookEvent || ''}`)
+                .digest('hex');
+        const { inserted: webhookInserted } = insertWebhookDelivery(jiraDelId, 'jira');
+        if (!webhookInserted) {
+            jiraWebhookState.lastTriggeredAt = new Date().toISOString();
+            jiraWebhookState.lastAccepted = false;
+            jiraWebhookState.lastIssueKey = issueKey;
+            jiraWebhookState.lastIgnoredReason = 'Duplicate webhook delivery (DB idempotency)';
+            return res.status(200).json({
+                received: true,
+                queued: false,
+                duplicateDelivery: true,
+                queue: getJiraWebhookQueueStatus()
+            });
         }
 
         const enqueueResult = enqueueStory(linkedProject, payloadProjectKey, issueKey, `${dedupeBase}:${issueKey}`);
@@ -889,6 +915,76 @@ app.get('/api/runs/:runId/artifacts/:testCaseKey/:artifactFile', (req, res) => {
     } catch (err) {
         console.error('[Artifacts] Serve failed:', err.message);
         res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/runs/:runId/llm-traces', (req, res) => {
+    try {
+        const rows = listLlmTracesByRun(req.params.runId, {
+            limit: Math.min(Number(req.query.limit) || 500, 2000),
+            offset: Number(req.query.offset) || 0
+        });
+        res.json(rows);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/dlq', (req, res) => {
+    try {
+        const rows = listDlqEvents({
+            status: req.query.status || undefined,
+            source: req.query.source || undefined,
+            limit: Number(req.query.limit) || 50,
+            offset: Number(req.query.offset) || 0
+        });
+        res.json(rows);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/dlq/:id/replay', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        const evt = getDlqEvent(id);
+        if (!evt) return res.status(404).json({ error: 'DLQ row not found' });
+
+        updateDlqStatus(id, 'replayed');
+
+        if (evt.source === 'jira_webhook' && evt.payload && typeof evt.payload.issue === 'object') {
+            process.nextTick(() => {
+                const body = evt.payload;
+                const issueKey = String(body?.issue?.key || '').trim();
+                const payloadProjectKey = String(body?.issue?.fields?.project?.key || '').trim();
+                const linkedProject = findProjectByJiraProjectKey(payloadProjectKey);
+                if (linkedProject && issueKey) {
+                    enqueueJiraWebhookJob({
+                        projectId: linkedProject.id,
+                        projectName: linkedProject.name,
+                        issueKey,
+                        jiraProjectKey: linkedProject.jiraProjectKey || payloadProjectKey,
+                        githubRepoFullName: linkedProject.githubRepoFullName || '',
+                        source: 'jira_dlq_replay',
+                        idempotencyKey: `replay:${id}:${issueKey}:${Date.now()}`
+                    });
+                }
+            });
+        }
+
+        res.json({ success: true, id });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/projects/:projectKey/heal-exhausted', (req, res) => {
+    try {
+        const projectKey = String(req.params.projectKey || '').trim();
+        if (!projectKey) return res.status(400).json({ error: 'projectKey required' });
+        res.json(getHealExhaustedByProject(projectKey));
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 

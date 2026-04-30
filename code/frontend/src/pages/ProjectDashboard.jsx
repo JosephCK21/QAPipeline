@@ -798,6 +798,20 @@ function ProjectDashboard() {
                                                   <div className={`w-2 h-2 rounded-full mr-1 ${scenDot.cls}`} title={scenDot.label} />
                                               </div>
                                           </div>
+                                          {(Number(scen.map_attempts) > 0 || Number(scen.test_pass_count) > 0 || Number(scen.test_fail_count) > 0) && (
+                                            <div className={`text-[9px] mb-1 flex flex-wrap gap-2 ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}>
+                                              {Number(scen.map_attempts) > 0 && (
+                                                <span title="Scenario appeared in PR map attempts vs hits">
+                                                  PR map hits {Number(scen.map_hits || 0)}/{Number(scen.map_attempts || 0)}
+                                                </span>
+                                              )}
+                                              {(Number(scen.test_pass_count) > 0 || Number(scen.test_fail_count) > 0) && (
+                                                <span title="Historical sandbox verdict counts stored on scenario row">
+                                                  tests ✓{Number(scen.test_pass_count || 0)} ✗{Number(scen.test_fail_count || 0)}
+                                                </span>
+                                              )}
+                                            </div>
+                                          )}
                                           <span className={`self-start text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border mb-1.5 ${typeBadge}`}>
                                             {scen.type || 'Scenario'}
                                           </span>

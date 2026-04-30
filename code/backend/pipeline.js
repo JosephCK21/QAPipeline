@@ -6,15 +6,79 @@ const { extractTextFromFiles } = require('./services/documentParserService');
 const { mapPrChangesToScenarios } = require('./services/prScenarioMappingService');
 const { classifyPrAsBugFix } = require('./services/prClassificationService');
 const { pruneFileContentForContext } = require('./services/astPrunerService');
-const { generateTestCasesForScenario, repairTestCaseScript } = require('./services/llmService');
+const { generateTestCasesForScenario, generateFallbackSmokeTests, repairTestCaseScript, setLlmRunContext } = require('./services/llmService');
+const { CURRENT_SCHEMA_VERSION } = require('./schemas');
 
+const crypto = require('crypto');
 const {
     updateRun, createRun, getScenariosByProject,
     getTestCasesByProject, getTestCasesByScenario, markTestCaseSuperseded,
-    upsertTestCase, updateTestCaseStatus
+    upsertTestCase, updateTestCaseStatus,
+    incrementScenarioMappingStats,
+    incrementScenarioTestOutcome,
+    upsertHealPattern,
+    bumpReferenceExample
 } = require('./db');
 
 const MAX_HEAL_ATTEMPTS = 3;
+const FALLBACK_SCENARIO_ID = 'FALLBACK';
+
+// ---------------------------------------------------------------------------
+// PR file classification for fallback smoke tests (unmapped files)
+// ---------------------------------------------------------------------------
+function shouldSkipFileForFallback(filename) {
+    const n = String(filename || '').replace(/\\/g, '/');
+    if (!n.trim()) return true;
+    const lower = n.toLowerCase();
+    const ext = lower.includes('.') ? lower.slice(lower.lastIndexOf('.')) : '';
+    const skipExts = new Set(['.md', '.json', '.lock', '.yaml', '.yml', '.env', '.gitignore', '.css', '.scss', '.svg', '.png', '.jpg', '.jpeg', '.ico']);
+    if (skipExts.has(ext) || lower.endsWith('.gitignore')) return true;
+    if (lower.endsWith('.d.ts')) return true;
+    if (lower.endsWith('.config.js') || lower.endsWith('.config.ts') || lower.endsWith('.config.cjs')) return true;
+    const skipPathBits = ['/node_modules/', '/__tests__/', '/test/', '/spec/', '/dist/', '/build/', '/migrations/', '/devscripts/'];
+    if (skipPathBits.some(b => lower.includes(b))) return true;
+    return false;
+}
+
+function isFrontendPathForFallback(filename) {
+    const n = String(filename || '').replace(/\\/g, '/');
+    const lower = n.toLowerCase();
+    if (/\.(jsx|tsx|vue|svelte)$/i.test(lower)) return true;
+    if (/\/src\/(components|pages|views|screens|ui)\//i.test(n)) return true;
+    const inClientArea = /\/(frontend|client|web)\//i.test(lower) && !lower.includes('/node_modules/');
+    if (inClientArea) return true;
+    return false;
+}
+
+function isBackendPathForFallback(filename) {
+    const n = String(filename || '').replace(/\\/g, '/');
+    const lower = n.toLowerCase();
+    if (/\.(js|ts)$/i.test(lower) && !lower.endsWith('.d.ts')) return true;
+    if (/\/(api|routes|services|controllers|middleware|backend)\//i.test(lower)) return true;
+    return false;
+}
+
+/**
+ * GitHub PR file list → entries with fileType backend|frontend; non-code paths dropped.
+ * @param {Array<{ filename: string, patch?: string }>} prFiles
+ */
+function classifyChangedFiles(prFiles) {
+    const out = [];
+    for (const f of prFiles || []) {
+        const filename = f.filename;
+        if (!filename || shouldSkipFileForFallback(filename)) continue;
+        let fileType = null;
+        if (isFrontendPathForFallback(filename)) fileType = 'frontend';
+        else if (isBackendPathForFallback(filename)) fileType = 'backend';
+        else continue;
+        out.push({
+            filename,
+            patch: typeof f.patch === 'string' ? f.patch : '',
+            fileType
+        });
+    }
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // Event logger: writes to DB and broadcasts via Socket.IO
@@ -37,6 +101,7 @@ function createEventLogger(runId) {
         } else if (type === 'complete') {
             updateParams.status = data.success ? 'completed' : 'failed';
             updateParams.completedAt = new Date().toISOString();
+            updateParams.overall_success = data.success ? 1 : 0;
         } else if (type === 'error') {
             updateParams.status = 'failed';
             logsMsg = `[ERROR] ${data.message}`;
@@ -95,6 +160,15 @@ async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent) {
         const mapping = await mapPrChangesToScenarios({ prDetails, jiraRtmEntry, documentTexts });
         sendEvent('pr_scenario_mapping', { mappings: mapping.mappings });
         sendEvent('log', { level: 'INFO', message: `PR mapping complete: ${mapping.mappings?.length || 0} scenario links found.` });
+
+        try {
+            const pk = linkedProject.jiraProjectKey || linkedProject.id;
+            const mappedIds = (mapping.mappings || []).map((m) => m.scenarioId || m.id).filter(Boolean);
+            const allIds = projectScenarios.map((s) => s.scenarioId).filter(Boolean);
+            incrementScenarioMappingStats(pk, allIds, mappedIds);
+        } catch (mapStatErr) {
+            sendEvent('log', { level: 'WARN', message: `PR mapping stats update skipped: ${mapStatErr.message}` });
+        }
 
         return { ...mapping, _prDetails: prDetails };
     } catch (error) {
@@ -295,6 +369,7 @@ async function executeTestCaseWithRetries({
                 testScript: currentScript,
                 status: 'pass',
                 healAttempts,
+                heal_exhausted: 0,
                 conversationId,
                 latestResponseId: currentInteractionId,
                 regression:            regressionStamp,
@@ -321,6 +396,23 @@ async function executeTestCaseWithRetries({
                     ? `[Sandbox] ${testCase.testCaseId}: PASS on attempt ${attempt} (adapted — original failure retained as potential regression)`
                     : `[Sandbox] ${testCase.testCaseId}: PASS on attempt ${attempt}`
             });
+            try {
+                if (healAttempts > 0 && attemptHistory.length > 0 && testCase.scenarioId !== FALLBACK_SCENARIO_ID) {
+                    const lastFail = String(attemptHistory[attemptHistory.length - 1]?.failureOutput || '').slice(-2400);
+                    const failureSignature = crypto.createHash('sha256').update(lastFail).digest('hex').slice(0, 48);
+                    upsertHealPattern({
+                        scenarioId: testCase.scenarioId,
+                        failureSignature,
+                        workingFixSummary: `Recovered after ${healAttempts} heal(s)`
+                    });
+                }
+                if (testCase.scenarioId !== FALLBACK_SCENARIO_ID) {
+                    const fw = testCase.language === 'python' ? 'pytest' : 'jest';
+                    bumpReferenceExample(fw, '', currentScript);
+                }
+            } catch (persistErr) {
+                sendEvent('log', { level: 'WARN', message: `[Pipeline] Pattern/reference promotion skipped: ${persistErr.message}` });
+            }
             break;
         }
 
@@ -424,6 +516,7 @@ async function executeTestCaseWithRetries({
             testScript: currentScript,
             status: 'fail',
             healAttempts,
+            heal_exhausted: 1,
             conversationId,
             latestResponseId: currentInteractionId,
             regression:            regressionStamp,
@@ -449,6 +542,13 @@ async function executeTestCaseWithRetries({
     }
 
     updateTestCaseStatus(testCase.testCaseId, finalStatus);
+    try {
+        if (testCase.scenarioId !== FALLBACK_SCENARIO_ID) {
+            incrementScenarioTestOutcome(testCase.scenarioId, finalStatus === 'pass');
+        }
+    } catch (e) {
+        console.warn('[Pipeline] incrementScenarioTestOutcome skipped:', e.message);
+    }
     return finalStatus;
 }
 
@@ -541,7 +641,6 @@ async function runEpicRegression({
     });
 
     // 4. Execute every test case against the PR's code concurrently in pool
-    let overallSuccess = false;
     sendEvent('phase_update', { phase: 'Regression Execution', status: 'running' });
 
     const scenarioResults = {};
@@ -582,7 +681,6 @@ async function runEpicRegression({
 
         if (tcStatus === 'pass') {
             scenarioResults[scenario.scenarioId].passed++;
-            overallSuccess = true;
         } else {
             scenarioResults[scenario.scenarioId].failed++;
         }
@@ -610,18 +708,46 @@ async function runEpicRegression({
     }
 
     sendEvent('phase_update', { phase: 'Regression Execution', status: 'completed' });
+
+    const overallSuccess = scenarioPlans.every((p) => {
+        const r = scenarioResults[p.scenario.scenarioId];
+        return r && r.failed === 0 && r.passed > 0;
+    });
+
     return { success: overallSuccess, scenarios: scenarioPlans.map((p) => p.scenario.scenarioId) };
 }
 
 // ---------------------------------------------------------------------------
 // Main pipeline entry point
 // ---------------------------------------------------------------------------
+
 async function runPipeline(runId, prUrl, repoFullName) {
+    setLlmRunContext(runId);
+
+    let sendEvent;
+    try {
+        try {
+            const linkedProjectEarly = findProjectByGithubRepo(repoFullName);
+            const localEarly = linkedProjectEarly?.id || null;
+            createRun(runId, { status: 'running', repoFullName, localProjectId: localEarly, prUrl });
+        } catch (createErr) {
+            if (createErr && createErr.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+                console.warn('[Pipeline] Duplicate active run for same PR skipped:', prUrl);
+                setLlmRunContext(null);
+                return;
+            }
+            throw createErr;
+        }
+
+        sendEvent = createEventLogger(runId);
+        sendEvent('init', { repoFullName });
+    } catch (outer) {
+        setLlmRunContext(null);
+        throw outer;
+    }
+
     const linkedProject = findProjectByGithubRepo(repoFullName);
     const localProjectId = linkedProject?.id || null;
-    createRun(runId, { status: 'running', repoFullName, localProjectId });
-    const sendEvent = createEventLogger(runId);
-    sendEvent('init', { repoFullName });
 
     // Shared counters emitted to UI as compact summary on each row
     const runSummary = {
@@ -650,11 +776,43 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('phase_update', { phase: 'PR Mapping', status: 'completed' });
 
         const mappedScenarios = prMapping?.mappings || [];
+        const hasMappedScenarios = mappedScenarios.length > 0;
         runSummary.scenarioCount = mappedScenarios.length;
         emitSummary();
 
-        if (mappedScenarios.length === 0) {
-            sendEvent('log', { level: 'WARN', message: 'No scenarios mapped to this PR — nothing to test.' });
+        let prDetails = prMapping?._prDetails || null;
+        if (!prDetails) {
+            prDetails = await fetchPRDetails(prUrl);
+        }
+
+        const classifiedAll = classifyChangedFiles(prDetails.files || []);
+        const coveredFilenames = new Set(
+            mappedScenarios.flatMap((m) =>
+                (Array.isArray(m.impactedFiles) ? m.impactedFiles : [])
+                    .map((x) => String(x || '').trim())
+                    .filter(Boolean)
+            )
+        );
+        const fallbackAlways = String(process.env.AUTOQA_FALLBACK_ALWAYS || '').toLowerCase() === 'true';
+        const maxFbRaw = parseInt(process.env.AUTOQA_FALLBACK_MAX_FILES || '10', 10);
+        const maxFallbackFiles = Number.isFinite(maxFbRaw) && maxFbRaw > 0 ? Math.min(maxFbRaw, 100) : 10;
+
+        let uncoveredForFallback = fallbackAlways
+            ? [...classifiedAll]
+            : classifiedAll.filter((f) => !coveredFilenames.has(f.filename));
+
+        uncoveredForFallback.sort((a, b) => {
+            const af = a.fileType === 'frontend' ? 0 : 1;
+            const bf = b.fileType === 'frontend' ? 0 : 1;
+            if (af !== bf) return af - bf;
+            return String(a.filename).localeCompare(String(b.filename));
+        });
+        uncoveredForFallback = uncoveredForFallback.slice(0, maxFallbackFiles);
+
+        const requireFallbackSmoke = uncoveredForFallback.length > 0;
+
+        if (!hasMappedScenarios && classifiedAll.length === 0) {
+            sendEvent('log', { level: 'WARN', message: 'No scenarios mapped and no testable PR files — nothing to run.' });
             sendEvent('complete', { success: true });
             return;
         }
@@ -668,14 +826,16 @@ async function runPipeline(runId, prUrl, repoFullName) {
         const rtmRows = rtmProjectKey ? (getScenariosByProject(rtmProjectKey) || []) : [];
         const rtmById = new Map(rtmRows.map(r => [r.scenarioId, r]));
         const enrichedCount = mappedScenarios.reduce((acc, m) => acc + (rtmById.has(m.scenarioId || m.id) ? 1 : 0), 0);
-        sendEvent('log', { level: 'INFO', message: `[Enrichment] Resolved ${enrichedCount}/${mappedScenarios.length} mapped scenarios against RTM rows (project "${rtmProjectKey || 'n/a'}").` });
+        sendEvent('log', {
+            level: 'INFO',
+            message: `[Enrichment] Resolved ${enrichedCount}/${mappedScenarios.length} mapped scenario(s) against RTM rows (project "${rtmProjectKey || 'n/a'}").${requireFallbackSmoke ? ` Fallback smoke queued for ${uncoveredForFallback.length} file(s).` : ''}`
+        });
 
         // Phase 2.5 + 3 + Sandbox — run in parallel.
         // Classification, code context fetch, and sandbox creation are all
         // independent and only need prDetails. Running them concurrently
         // saves 15-30 seconds per run (Docker clone + npm install overlaps
         // with LLM classification + GitHub file fetches).
-        const prDetails = prMapping?._prDetails || await fetchPRDetails(prUrl);
         const regressionFeatureEnabled = String(process.env.REGRESSION_ENABLED || 'true').toLowerCase() !== 'false';
 
         // --- Classification task (async) ---
@@ -746,6 +906,12 @@ async function runPipeline(runId, prUrl, repoFullName) {
             })
         ].join('\n\n');
 
+        const contentByPath = new Map((codeContext.fullFiles || []).map((f) => [f.path, f.content]));
+        const uncoveredWithContent = uncoveredForFallback.map((u) => ({
+            ...u,
+            fullContent: contentByPath.get(u.filename) || ''
+        }));
+
         const prDiffSection = (prDetails.files || [])
             .map(f => `--- ${f.filename} ---\n${f.patch || '(no patch)'}`)
             .join('\n\n');
@@ -767,7 +933,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // cases for every scenario in every epic the PR touches. Skip the
         // normal generation loop.
         // ------------------------------------------------------------------
-        if (regressionFeatureEnabled && classification.isBugFix) {
+        if (regressionFeatureEnabled && classification.isBugFix && mappedScenarios.length > 0) {
             sendEvent('log', { level: 'INFO', message: '[Pipeline] Entering epic-wide regression path (bug fix PR). Waiting for sandbox pool...' });
             sendEvent('phase_update', { phase: 'Test Generation', status: 'skipped' });
             runSummary.scenariosGeneratingLeft = 0;
@@ -809,16 +975,87 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('phase_update', { phase: 'Test Generation', status: 'running' });
         sendEvent('phase_update', { phase: 'Sandbox Testing', status: 'running' });
 
-        runSummary.scenariosGeneratingLeft = mappedScenarios.length;
+        runSummary.scenariosGeneratingLeft = mappedScenarios.length + (requireFallbackSmoke ? 1 : 0);
         emitSummary();
 
         const executionQueue = [];
         let isGenerationFinished = false;
+        let fallbackTestsQueued = 0;
         const scenarioResults = {};
-        
+
         for (const m of mappedScenarios) {
             scenarioResults[m.id || m.scenarioId] = { passed: 0, failed: 0 };
         }
+        if (requireFallbackSmoke) {
+            scenarioResults[FALLBACK_SCENARIO_ID] = { passed: 0, failed: 0 };
+        }
+
+        const fallbackPromise = (async () => {
+            if (!requireFallbackSmoke) return;
+            sendEvent('scenario_execution_updated', {
+                scenarioId: FALLBACK_SCENARIO_ID,
+                status: 'generating',
+                totals: { passed: 0, failed: 0, running: 0 }
+            });
+            try {
+                const { smokeTests } = await generateFallbackSmokeTests(
+                    uncoveredWithContent,
+                    codeContextSection,
+                    { title: prDetails.title, branch: prDetails.headRef, repoFullName }
+                );
+                const persistedFallback = [];
+                for (const row of smokeTests || []) {
+                    const script = row.testScript != null ? String(row.testScript).trim() : '';
+                    if (!script) continue;
+                    fallbackTestsQueued++;
+                    const saved = {
+                        testCaseId: crypto.randomUUID(),
+                        scenarioId: FALLBACK_SCENARIO_ID,
+                        source: 'fallback',
+                        projectKey: linkedProject?.jiraProjectKey || '',
+                        runId,
+                        prUrl,
+                        title: `Smoke: ${row.filename}`,
+                        steps: [],
+                        testData: {},
+                        testScript: script,
+                        language: 'javascript',
+                        status: 'pending',
+                        version: 1,
+                        previousVersionId: null,
+                        codeFiles: [row.filename],
+                        healAttempts: 0,
+                        conversationId: null,
+                        latestResponseId: null,
+                        createdAt: new Date().toISOString(),
+                        schema_version: CURRENT_SCHEMA_VERSION
+                    };
+                    upsertTestCase(saved);
+                    persistedFallback.push(saved);
+                    executionQueue.push({
+                        scenarioId: FALLBACK_SCENARIO_ID,
+                        scenarioDescription: row.reason || 'Fallback smoke test',
+                        tc: saved
+                    });
+                    runSummary.testCaseCount++;
+                    runSummary.runningCount++;
+                }
+                sendEvent('test_cases_saved', {
+                    scenarioId: FALLBACK_SCENARIO_ID,
+                    count: persistedFallback.length,
+                    isRefinement: false,
+                    source: 'fallback'
+                });
+            } catch (fbErr) {
+                sendEvent('log', { level: 'ERROR', message: `[Fallback smoke] LLM or persist failed: ${fbErr.message}` });
+                if (scenarioResults[FALLBACK_SCENARIO_ID]) {
+                    scenarioResults[FALLBACK_SCENARIO_ID].failed++;
+                }
+            } finally {
+                runSummary.scenariosGeneratingLeft = Math.max(0, runSummary.scenariosGeneratingLeft - 1);
+                emitSummary();
+            }
+        })();
 
         // ------------------------------------------------------------------
         // Background Executor: Pulls generated test cases from the queue as 
@@ -858,7 +1095,6 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
                         if (tcStatus === 'pass') {
                             scenarioResults[scenarioId].passed++;
-                            overallSuccess = true;
                         } else {
                             scenarioResults[scenarioId].failed++;
                         }
@@ -885,7 +1121,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
         })();
 
         // Map over all scenarios and run LLM generation in parallel
-        const generationPromises = mappedScenarios.map(async (scenarioMapping) => {
+        const generationPromises = [fallbackPromise, ...mappedScenarios.map(async (scenarioMapping) => {
             try {
             const scenarioId = scenarioMapping.id || scenarioMapping.scenarioId;
             // Merge RTM row (authoritative for description, type, priority,
@@ -943,12 +1179,20 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 scenarioConversationId = genResult.conversationId || scenarioConversationId;
                 sendEvent('log', { level: 'INFO', message: `[Generation] conversation=${scenarioConversationId || 'n/a'} response=${generationInteractionId || 'unavailable'} (stateful chain anchors)` });
             } catch (genErr) {
+                scenarioResults[scenarioId].failed++;
                 sendEvent('log', { level: 'ERROR', message: `Test case generation failed for ${scenarioId}: ${genErr.message}` });
                 sendEvent('scenario_execution_updated', { scenarioId, status: 'error', totals: { passed: 0, failed: 0, running: 0 } });
                 return null;
             }
 
             sendEvent('log', { level: 'INFO', message: `Generated ${generatedTestCases.length} test case(s) for ${scenarioId}` });
+
+            if (generatedTestCases.length === 0) {
+                scenarioResults[scenarioId].failed++;
+                sendEvent('log', { level: 'WARN', message: `[Generation] Scenario ${scenarioId}: model returned zero test cases — counted as failure for run success rollup.` });
+                sendEvent('scenario_execution_updated', { scenarioId, status: 'fail', totals: { passed: 0, failed: 0, running: 0 } });
+                return { scenarioId, persistedCases: [], scenarioDescription };
+            }
             runSummary.testCaseCount += generatedTestCases.length;
             runSummary.runningCount += generatedTestCases.length;
             emitSummary();
@@ -978,7 +1222,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
                     conversationId:          scenarioConversationId,
                     latestResponseId:        generationInteractionId,
                     generationInteractionId,
-                    createdAt:               new Date().toISOString()
+                    createdAt:               new Date().toISOString(),
+                    schema_version:          CURRENT_SCHEMA_VERSION
                 };
                 upsertTestCase(saved);
                 persistedCases.push(saved);
@@ -999,10 +1244,15 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 runSummary.scenariosGeneratingLeft = Math.max(0, runSummary.scenariosGeneratingLeft - 1);
                 emitSummary();
             }
-        });
+        })];
 
         // Wait for all scenarios to finish generating in parallel
         const generatedResults = (await Promise.all(generationPromises)).filter(Boolean);
+
+        if (requireFallbackSmoke && fallbackTestsQueued === 0 && scenarioResults[FALLBACK_SCENARIO_ID]) {
+            scenarioResults[FALLBACK_SCENARIO_ID].failed = Math.max(1, scenarioResults[FALLBACK_SCENARIO_ID].failed);
+            sendEvent('log', { level: 'WARN', message: '[Fallback smoke] No executable tests were produced — counted as failure for run rollup.' });
+        }
         
         // Signal that no more test cases will be queued
         isGenerationFinished = true;
@@ -1011,16 +1261,41 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // Wait for the background executor to finish the remaining queue and all active executions
         await executionTaskPromise;
 
+        const scenarioRollupOk = mappedScenarios.every((m) => {
+            const sid = m.id || m.scenarioId;
+            const r = scenarioResults[sid];
+            return r && r.failed === 0 && r.passed > 0;
+        });
+        const fbAgg = scenarioResults[FALLBACK_SCENARIO_ID];
+        const fallbackRollupOk = !requireFallbackSmoke
+            ? true
+            : !!(fbAgg && fbAgg.failed === 0 && fbAgg.passed > 0);
+
+        overallSuccess = scenarioRollupOk && fallbackRollupOk;
+
         // Finalize statuses for Phase 5
-        for (const result of generatedResults) {
-            const { passed, failed } = scenarioResults[result.scenarioId];
+        for (const m of mappedScenarios) {
+            const scenarioId = m.id || m.scenarioId;
+            const { passed, failed } = scenarioResults[scenarioId];
             const scenarioStatus = failed === 0 && passed > 0 ? 'pass'
                 : passed === 0 ? 'fail'
                 : 'partial';
 
             sendEvent('scenario_execution_updated', {
-                scenarioId: result.scenarioId,
+                scenarioId,
                 status: scenarioStatus,
+                totals: { passed, failed, running: 0 }
+            });
+        }
+
+        if (requireFallbackSmoke && scenarioResults[FALLBACK_SCENARIO_ID]) {
+            const { passed, failed } = scenarioResults[FALLBACK_SCENARIO_ID];
+            const fbStatus = failed === 0 && passed > 0 ? 'pass'
+                : passed === 0 ? 'fail'
+                : 'partial';
+            sendEvent('scenario_execution_updated', {
+                scenarioId: FALLBACK_SCENARIO_ID,
+                status: fbStatus,
                 totals: { passed, failed, running: 0 }
             });
         }
@@ -1053,6 +1328,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
         if (_sandboxPool) {
             cleanupSandboxPool(runId, _sandboxPool);
         }
+    } finally {
+        setLlmRunContext(null);
     }
 }
 

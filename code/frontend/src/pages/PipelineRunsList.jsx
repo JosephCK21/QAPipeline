@@ -162,6 +162,13 @@ function PipelineRunsList() {
                         {new Date(run.createdAt || run.startedAt || Date.now()).toLocaleString()}
                       </td>
                       <td className="p-4 text-sm max-w-xs">
+                          <div className="space-y-1">
+                          {(Number(run.input_tokens_total) > 0 || Number(run.output_tokens_total) > 0) && (
+                            <div className="text-[10px] text-[#172B4D] bg-[#DEEBFF]/40 border border-[#B3D4FF]/50 rounded px-1.5 py-0.5" title="Rolled up from persisted LLM usage">
+                              Tokens in {run.input_tokens_total ?? 0} · out {run.output_tokens_total ?? 0}
+                              {Number(run.cached_tokens_total) > 0 ? ` · cached ${run.cached_tokens_total}` : ''}
+                            </div>
+                          )}
                           {displayError ? (
                               <div className="flex items-start gap-1 text-[#C9372C] bg-[#C9372C]/10 p-1.5 rounded">
                                   <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
@@ -172,6 +179,7 @@ function PipelineRunsList() {
                                   {run.events?.length || 0} events recorded
                               </span>
                           )}
+                          </div>
                       </td>
                     </tr>
                   )})}

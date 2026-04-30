@@ -1,5 +1,8 @@
 const { z } = require('zod');
 
+/** Stored on `test_cases.schema_version` / `rtm_scenarios.schema_version` when generating or syncing. */
+const CURRENT_SCHEMA_VERSION = 2;
+
 const githubWebhookSchema = z.object({
     action: z.string().optional(),
     repository: z.object({
@@ -47,6 +50,7 @@ const validateBody = (schema) => (req, res, next) => {
 };
 
 module.exports = {
+    CURRENT_SCHEMA_VERSION,
     githubWebhookSchema,
     jiraWebhookSchema,
     projectCreateSchema,

@@ -29,6 +29,13 @@ function getConfidenceThreshold() {
     return raw;
 }
 
+/** 0–1 weight on LLM evidence when blending with linked Jira Bug issues; 0 = pure Jira. */
+function getJiraLlmBlendWeight() {
+    const raw = Number(process.env.REGRESSION_CLASSIFIER_JIRA_LLM_BLEND);
+    if (!Number.isFinite(raw) || raw <= 0) return 0;
+    return Math.max(0, Math.min(1, raw));
+}
+
 // Match Jira-style keys like ABC-123 or QPT-4. Case-sensitive to avoid false positives.
 const JIRA_KEY_PATTERN = /\b([A-Z][A-Z0-9]+-\d+)\b/g;
 
@@ -147,7 +154,8 @@ async function classifyPrAsBugFix({ prDetails }) {
     // REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG=true to always ask the LLM for
     // a rationale regardless (useful during debugging / observability work).
     const alwaysRunLLM = String(process.env.REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG || '').toLowerCase() === 'true';
-    if (jiraBugKeys.length > 0 && !alwaysRunLLM) {
+    const blendW = getJiraLlmBlendWeight();
+    if (jiraBugKeys.length > 0 && !alwaysRunLLM && blendW === 0) {
         console.log(`[prClassificationService] Jira Bug short-circuit (${jiraBugKeys.join(', ')}) — skipping LLM classifier.`);
         return {
             isBugFix:      true,
@@ -179,7 +187,7 @@ Classify this PR per the instructions. Return JSON only.`;
     let llmVerdict = null;
     try {
         const _start = Date.now();
-        emitLlmTrace({ caller: 'classifyPrAsBugFix', model: DEFAULT_MODEL, phase: 'request', prompt });
+        emitLlmTrace({ caller: 'classifyPrAsBugFix', model: DEFAULT_MODEL, phase: 'request', prompt, correlationKey: 'pr_classification' });
         const response = await client.responses.create({
             model: DEFAULT_MODEL,
             instructions: CLASSIFIER_INSTRUCTIONS,
@@ -209,7 +217,8 @@ Classify this PR per the instructions. Return JSON only.`;
             reasoningSummary,
             durationMs: Date.now() - _start,
             responseId: response.id,
-            usage
+            usage,
+            correlationKey: 'pr_classification'
         });
 
         const parsed = safeParseJSON(rawText);
@@ -224,15 +233,40 @@ Classify this PR per the instructions. Return JSON only.`;
         console.error(`[prClassificationService] LLM classification failed: ${err.message}`);
     }
 
-    // 3. Combine
+    // 3. Combine (Jira Bug + optional blended LLM)
     if (jiraBugKeys.length > 0) {
+        const thr = getConfidenceThreshold();
+
+        if (!llmVerdict) {
+            return {
+                isBugFix:      true,
+                confidence:    1,
+                rationale:     `Linked Jira Bug issue(s) ${jiraBugKeys.join(', ')}.`,
+                source:        'jira',
+                jiraIssueKeys: jiraKeys,
+                jiraBugKeys
+            };
+        }
+
+        if (blendW > 0) {
+            const llmNumerical = llmVerdict.isBugFix ? llmVerdict.confidence : (1 - llmVerdict.confidence);
+            const combined = (1 - blendW) * 1 + blendW * llmNumerical;
+            const passes = combined >= thr;
+            return {
+                isBugFix:      passes,
+                confidence:    combined,
+                rationale:     `[blend=${blendW.toFixed(2)} vs thr=${thr}] Jira Bugs ${jiraBugKeys.join(', ')}; LLM says ${llmVerdict.isBugFix ? `bug-fix (${llmVerdict.confidence.toFixed(2)})` : `not bug-fix (${llmVerdict.confidence.toFixed(2)})`} — ${llmVerdict.rationale}`,
+                source:        'both',
+                jiraIssueKeys: jiraKeys,
+                jiraBugKeys
+            };
+        }
+
         return {
             isBugFix:      true,
             confidence:    1,
-            rationale:     llmVerdict?.rationale
-                ? `Linked Jira Bug issue(s) ${jiraBugKeys.join(', ')} — LLM note: ${llmVerdict.rationale}`
-                : `Linked Jira Bug issue(s) ${jiraBugKeys.join(', ')}`,
-            source:        llmVerdict ? 'both' : 'jira',
+            rationale:     `Linked Jira Bug issue(s) ${jiraBugKeys.join(', ')} — LLM note: ${llmVerdict.rationale}`,
+            source:        alwaysRunLLM ? 'both' : 'jira',
             jiraIssueKeys: jiraKeys,
             jiraBugKeys
         };

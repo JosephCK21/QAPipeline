@@ -60,6 +60,10 @@ function enqueueJiraWebhookJob(job) {
 
     schedule();
 
+    if (typeof global !== 'undefined' && global.io) {
+        global.io.emit('jira_queue_updated', getJiraWebhookQueueStatus());
+    }
+
     return { queued: true, duplicate: false, jobId: queuedJob.id };
 }
 

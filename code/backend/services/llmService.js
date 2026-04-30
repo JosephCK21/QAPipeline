@@ -1,8 +1,27 @@
 const OpenAI = require('openai');
 const crypto = require('crypto');
 const dotenv = require('dotenv');
+const db = require('../db');
 
 dotenv.config();
+
+/** Per-pipeline run id for persisted LLM traces + token rollups (null = don't persist). */
+let _llmTraceRunId = null;
+
+function setLlmRunContext(runId) {
+    _llmTraceRunId = runId || null;
+}
+
+function getLlmRunContext() {
+    return _llmTraceRunId;
+}
+
+/** Request half of a trace, keyed for pairing with the response phase. */
+const _llmPendingRequest = new Map();
+
+function _pendingTraceKey(caller, correlationKey) {
+    return `${caller}::${correlationKey || '__default__'}`;
+}
 
 // ---------------------------------------------------------------------------
 // Client + config
@@ -52,7 +71,8 @@ const CACHE_KEYS = {
     TESTCASE_GEN:      'qa:testcases:generate',
     TESTCASE_HEAL:     'qa:testcases:heal',
     PR_MAPPING:        'qa:pr:mapping',
-    PR_CLASSIFICATION: 'qa:pr:classification'
+    PR_CLASSIFICATION: 'qa:pr:classification',
+    FALLBACK_SMOKE:    'qa:fallback:generate'
 };
 
 /**
@@ -79,8 +99,19 @@ function buildCacheParams(cacheKey) {
 function emitLlmTrace({
     caller, model, phase, prompt, response, reasoningSummary,
     durationMs, error, conversationId, responseId,
-    usage
+    usage,
+    correlationKey
 }) {
+    const runId = _llmTraceRunId;
+    const traceKey = _pendingTraceKey(caller, correlationKey);
+
+    if (phase === 'request' && caller) {
+        _llmPendingRequest.set(traceKey, {
+            prompt: (prompt || '').slice(0, 120000),
+            model: model || DEFAULT_MODEL
+        });
+    }
+
     if (global.io) {
         global.io.emit('llm_trace', {
             id: crypto.randomUUID(),
@@ -95,8 +126,38 @@ function emitLlmTrace({
             responseId:         responseId || undefined,
             usage:              phase === 'response' ? (usage || undefined) : undefined,
             error,
+            correlationKey:     correlationKey || undefined,
             timestamp: new Date().toISOString()
         });
+    }
+
+    if (phase === 'response' && runId && runId !== '__jira_sync__' && caller) {
+        const pending = _llmPendingRequest.get(traceKey);
+        _llmPendingRequest.delete(traceKey);
+        try {
+            db.insertLlmTraceRow({
+                runId,
+                traceLabel: caller,
+                phase: 'response',
+                requestPayload: pending?.prompt != null ? pending.prompt : null,
+                responsePayload: [
+                    response != null ? String(response).slice(0, 120000) : '',
+                    reasoningSummary ? `\n--- reasoning ---\n${reasoningSummary}` : '',
+                    error ? `\n--- error ---\n${error}` : ''
+                ].join(''),
+                tokenUsage: usage || null,
+                createdAt: new Date().toISOString()
+            });
+            if (usage && typeof usage.inputTokens === 'number') {
+                db.addRunTokenUsage(runId, {
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens || 0,
+                    cachedTokens: usage.cachedTokens || 0
+                });
+            }
+        } catch (e) {
+            console.warn('[LLM] Failed to persist llm_trace_row:', e.message);
+        }
     }
 
     // Console log cache-hit telemetry so operators can verify that caching is
@@ -567,6 +628,32 @@ const SCENARIO_RESPONSE_SCHEMA = {
 // free-form object (keys are arbitrary fixture group names), so this schema
 // is used in non-strict mode — it enforces the SHAPE of every other field
 // while leaving testData flexible. enforceTestData() remains the safety net.
+/** Fallback smoke tests — one row per changed file; testScript null when file is not testable. */
+const FALLBACK_SMOKE_RESPONSE_SCHEMA = {
+    type: 'object',
+    properties: {
+        smokeTests: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    filename:   { type: 'string' },
+                    fileType:   { type: 'string', enum: ['backend', 'frontend'] },
+                    testScript: {
+                        anyOf: [{ type: 'string' }, { type: 'null' }]
+                    },
+                    framework:  { type: 'string', enum: ['jest', 'playwright'] },
+                    reason:     { type: 'string' }
+                },
+                required: ['filename', 'fileType', 'testScript', 'framework', 'reason'],
+                additionalProperties: false
+            }
+        }
+    },
+    required: ['smokeTests'],
+    additionalProperties: false
+};
+
 const TESTCASE_RESPONSE_SCHEMA = {
     type: 'object',
     properties: {
@@ -665,6 +752,22 @@ OUTPUT FORMAT:
 Return a JSON object with a single top-level key "testCases" whose value is an array of 2-4 test case objects.
 Each test case object must have: testCaseId, title, steps, testData, testScript, language, codeFiles, isRefinement.`;
 
+const FALLBACK_SMOKE_INSTRUCTIONS = `You are an expert QA engineer generating lightweight smoke tests for code changes that have no requirements traceability coverage.
+
+For each changed file provided, generate exactly one test that:
+- For BACKEND files (.js/.ts API routes, services, utilities): uses Jest + supertest or plain Jest unit test style. Test the primary export or the most changed function. If it is an Express route handler, test that the route responds with the correct HTTP status for a happy-path call. If it is a utility or service, test the primary function with representative inputs.
+- For FRONTEND files (.jsx/.tsx/.vue, components, pages): uses Playwright Test (CommonJS require style). Navigate to the page or render the component if a URL can be inferred from the filename (e.g. pages/Login.jsx → baseURL + /login). Assert that key elements are visible: headings, form fields, primary buttons. Use getByRole and getByLabel locators. Always use the baseURL from the Playwright config — never hardcode a port.
+
+Rules:
+- One test file per changed file. Keep it short: one describe block, two to three it/test cases maximum.
+- Do not import from paths you cannot verify exist. Stick to the file being tested and standard library imports.
+- Do not use test.only or describe.only.
+- Backend tests: use jest, jest-environment-node, supertest — all are preinstalled.
+- Frontend tests: use @playwright/test CommonJS require — it is preinstalled. The baseURL is set in the Playwright config.
+- If the file is a config file, migration, or type definition with no testable logic, return null for that file's script and explain why in the reason field.
+
+Return a JSON object with key "smokeTests" whose value is an array of objects with: filename, fileType ('backend' | 'frontend'), testScript (string or null), framework ('jest' | 'playwright'), reason (one sentence).`;
+
 const HEAL_INSTRUCTIONS = `You are an expert test engineer fixing a failing test script for an isolated Docker sandbox.
 The testData variable is already injected as the first line at runtime — do NOT redeclare it.
 Do not hardcode any values that exist in testData — always reference them as testData.<group>.<key>.
@@ -753,6 +856,7 @@ async function generateTestCasesForScenario({
     if (!scenario?.id) {
         throw new Error('generateTestCasesForScenario: scenario.id is required');
     }
+    const traceCorrelationKey = scenario.id;
 
     // Lazily create a conversation for this scenario if we don't already have one.
     let activeConversationId = conversationId;
@@ -806,6 +910,21 @@ ${FEW_SHOT_EXAMPLES.javascript}
 
 --- Python structural example ---
 ${FEW_SHOT_EXAMPLES.python}
+${(() => {
+        try {
+            const rows = [
+                ...db.getTopReferenceExamples('jest', 2),
+                ...db.getTopReferenceExamples('pytest', 1)
+            ];
+            if (!rows.length) return '';
+            return (
+                '\n[REPOSITORY-STYLE EXAMPLES — from prior passing runs, formatting only]\n' +
+                rows.map((r) => `--- ${r.framework} (uses ~${r.useCount || 1}×) ---\n${String(r.scriptBody || '').slice(0, 3500)}`).join('\n\n')
+            );
+        } catch {
+            return '';
+        }
+    })()}
 
 Generate 2-4 concrete test cases for this scenario. Each test case must:
 - Have a unique testCaseId in format: TCN-${scenario.id}-<index>
@@ -832,7 +951,8 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
         model: DEFAULT_MODEL,
         phase: 'request',
         prompt,
-        conversationId: activeConversationId
+        conversationId: activeConversationId,
+        correlationKey: traceCorrelationKey
     });
 
     // Retry loop for transient "conversation busy" errors from the Conversations API.
@@ -884,7 +1004,8 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
         durationMs: Date.now() - _tcStartMs,
         conversationId: activeConversationId,
         responseId: response.id,
-        usage
+        usage,
+        correlationKey: traceCorrelationKey
     });
 
     const parsed = safeParseJSON(text);
@@ -903,6 +1024,96 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
         reasoningItems,
         usage
     };
+}
+
+const FALLBACK_TRUNC = 4000;
+
+/**
+ * Lightweight smoke tests for PR files without Jira scenario coverage.
+ *
+ * @param {Array<{ filename: string, patch?: string, fullContent?: string, fileType: 'backend'|'frontend' }>} changedFiles
+ * @param {string} codeContextSection
+ * @param {{ title?: string, branch?: string, repoFullName?: string }} prMeta
+ * @returns {Promise<{ smokeTests: Array<{ filename, fileType, testScript: string|null, framework, reason }> }>}
+ */
+async function generateFallbackSmokeTests(changedFiles, codeContextSection, prMeta = {}) {
+    const traceCorrelationKey = 'fallback-smoke-batch';
+    const filesBlock = (changedFiles || []).map((f) => {
+        const patch = typeof f.patch === 'string'
+            ? f.patch.slice(0, FALLBACK_TRUNC)
+            : '';
+        const full = typeof f.fullContent === 'string'
+            ? f.fullContent.slice(0, FALLBACK_TRUNC)
+            : '';
+        return `FILE: ${f.filename}
+TYPE: ${f.fileType || 'backend'}
+PATCH (truncated):\n${patch || '(none)'}
+FULL CONTENT (truncated):\n${full || '(none)'}`;
+    }).join('\n---\n');
+
+    const rawPrompt = `PR title: ${prMeta.title || '(unknown)'}
+PR branch: ${prMeta.branch || '(unknown)'}
+Repository: ${prMeta.repoFullName || '(unknown)'}
+
+CHANGED FILES (generate one smokeTests entry per file below):
+${filesBlock}
+
+[FULL FILE CONTENTS / REPO CONTEXT]:
+${codeContextSection || 'No additional context.'}
+
+Return JSON only: { "smokeTests": [ ... ] } with one object per input file (same filename), following the schema in your instructions.`;
+
+    const prompt = ensureWithinBudget(rawPrompt, PROMPT_TOKEN_BUDGET, 'generateFallbackSmokeTests');
+    await assertTokenLimit(prompt, DEFAULT_MODEL);
+
+    const stateful = buildStatefulParams({});
+    const finalInput = applyStatefulInput(prompt, stateful);
+
+    const _fbStartMs = Date.now();
+    emitLlmTrace({
+        caller: 'generateFallbackSmokeTests',
+        model: DEFAULT_MODEL,
+        phase: 'request',
+        prompt,
+        correlationKey: traceCorrelationKey
+    });
+
+    const response = await client.responses.create({
+        model: DEFAULT_MODEL,
+        instructions: FALLBACK_SMOKE_INSTRUCTIONS,
+        input: finalInput,
+        text: {
+            format: {
+                type: 'json_schema',
+                name: 'FallbackSmokeTests',
+                schema: FALLBACK_SMOKE_RESPONSE_SCHEMA,
+                strict: false
+            },
+            verbosity: OUTPUT_VERBOSITY
+        },
+        reasoning: { effort: TESTCASE_EFFORT, summary: REASONING_SUMMARY },
+        ...buildCacheParams(CACHE_KEYS.FALLBACK_SMOKE),
+        ...stripInternalParams(stateful)
+    });
+
+    const text = extractResponseText(response);
+    const reasoningSummary = extractReasoningSummary(response);
+    const usage = extractUsage(response);
+    emitLlmTrace({
+        caller: 'generateFallbackSmokeTests',
+        model: DEFAULT_MODEL,
+        phase: 'response',
+        response: text,
+        reasoningSummary,
+        durationMs: Date.now() - _fbStartMs,
+        responseId: response.id,
+        usage,
+        correlationKey: traceCorrelationKey
+    });
+
+    const parsed = safeParseJSON(text);
+    const smokeTests = Array.isArray(parsed?.smokeTests) ? parsed.smokeTests : [];
+    return { smokeTests };
 }
 
 /**
@@ -939,6 +1150,21 @@ async function repairTestCaseScript({
         throw new Error('repairTestCaseScript: testCase.testCaseId is required');
     }
 
+    let healPatternSection = '';
+    try {
+        if (testCase?.scenarioId) {
+            const rows = db.findHealPatternsForScenario(testCase.scenarioId);
+            if (rows?.length) {
+                healPatternSection =
+                    `\n[PAST SUCCESSFUL FIXES ON THIS SCENARIO — use as strategy hints only]:\n` +
+                    rows.map((r) => `- ${String(r.workingFixSummary || '').trim() || '(no summary)'}`).join('\n') +
+                    '\n';
+            }
+        }
+    } catch {
+        healPatternSection = '';
+    }
+
     let input;
     const hasState = Boolean(conversationId) || Boolean(previousInteractionId);
 
@@ -953,7 +1179,7 @@ ${failureOutput}
 The failed script that produced this output:
 ${testCase.testScript}
 
-Fix the script.`;
+Fix the script.${healPatternSection}`;
     } else {
         // Stateless fallback — self-contained prompt with manual history injection.
         const historySection = attemptHistory.length > 0
@@ -973,7 +1199,7 @@ Test Case: ${testCase.testCaseId}
 Title: ${testCase.title}
 Language: ${testCase.language}
 Attempt number: ${attemptNumber} of 3
-${intentSection}${historySection}
+${intentSection}${healPatternSection}${historySection}
 [CURRENT FAILED SCRIPT]:
 ${testCase.testScript}
 
@@ -1007,7 +1233,8 @@ If you already tried an approach in a previous attempt and it failed, use a diff
         model: DEFAULT_MODEL,
         phase: 'request',
         prompt: input,
-        conversationId
+        conversationId,
+        correlationKey: testCase.testCaseId
     });
 
     const callOpenAI = (statefulParams, inputPayload) => client.responses.create({
@@ -1076,7 +1303,8 @@ If you already tried an approach in a previous attempt and it failed, use a diff
         durationMs: Date.now() - _healStartMs,
         conversationId,
         responseId: response.id,
-        usage
+        usage,
+        correlationKey: testCase.testCaseId
     });
 
     const repairedScript = text.replace(/^```(?:\w+)?\n?/gm, '').replace(/^```$/gm, '').trim();
@@ -1247,6 +1475,8 @@ Cover all four types (happy_path, edge_case, negative, boundary) per acceptance 
 
 module.exports = {
     client,
+    setLlmRunContext,
+    getLlmRunContext,
     DEFAULT_MODEL,
     SCENARIO_EFFORT,
     TESTCASE_EFFORT,
@@ -1275,5 +1505,6 @@ module.exports = {
     generateTestScenarios,
     generateTestScenariosForEpic,
     generateTestCasesForScenario,
+    generateFallbackSmokeTests,
     repairTestCaseScript
 };
