@@ -530,7 +530,7 @@ async function clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs) {
     }
 }
 
-async function createSandboxPool(runId, prDetails, concurrency = 2) {
+async function createSandboxPool(runId, prDetails, concurrency = 2, options = {}) {
     const createPromises = [];
 
     for (let i = 1; i <= concurrency; i++) {
@@ -595,6 +595,15 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
                     dockerRunArgs.push('-e', 'DISPLAY=:99');
                     dockerRunArgs.push('-e', 'AUTOQA_LIVE_BROWSER=true');
                     dockerRunArgs.push('-e', `AUTOQA_LIVE_SLOWMO_MS=${LIVE_SLOWMO_MS}`);
+                }
+
+                const sandboxEnv =
+                    options.sandboxEnv && typeof options.sandboxEnv === 'object' && !Array.isArray(options.sandboxEnv)
+                        ? options.sandboxEnv
+                        : {};
+                for (const [envKey, envVal] of Object.entries(sandboxEnv)) {
+                    if (envVal == null) continue;
+                    dockerRunArgs.push('-e', `${envKey}=${String(envVal)}`);
                 }
 
                 dockerRunArgs.push(

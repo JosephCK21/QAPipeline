@@ -31,6 +31,27 @@ function mergeVideosByUrl(fromAttempts, fromDisk) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** When `scenario_execution_updated` was overwritten in run events, fall back to DB test-case rows. */
+function deriveScenarioRowStatus(sStatus, tcs, isRunActive) {
+  if (sStatus?.status != null && String(sStatus.status).trim() !== '') {
+    return String(sStatus.status).toLowerCase();
+  }
+  const list = Array.isArray(tcs) ? tcs : [];
+  if (list.length === 0) {
+    return isRunActive ? 'running' : 'pending';
+  }
+  const normalized = list.map((t) => String(t?.status || '').toLowerCase());
+  if (normalized.some((x) => x === 'healing')) return 'healing';
+  if (normalized.some((x) => x === 'running' || x === 'generating')) return 'running';
+  if (normalized.length > 0 && normalized.every((x) => x === 'pass')) return 'pass';
+  const hasFail = normalized.some((x) => x === 'fail' || x === 'final_fail');
+  const hasPass = normalized.some((x) => x === 'pass');
+  if (hasFail && hasPass) return 'partial';
+  if (hasFail) return 'fail';
+  return 'pending';
+}
+
 function statusColor(status, darkMode = false) {
   const s = String(status || '').toLowerCase();
   if (darkMode) {
@@ -53,22 +74,23 @@ function statusColor(status, darkMode = false) {
 
 function statusIcon(status, size = 'w-4 h-4', darkMode = false) {
   const s = String(status || '').toLowerCase();
+  const sc = `${size} shrink-0`.trim();
   if (darkMode) {
-    if (s === 'pass') return <CheckCircle2 className={`${size} text-[#3FB950]`} />;
-    if (s === 'fail' || s === 'final_fail') return <XCircle className={`${size} text-[#F85149]`} />;
-    if (s === 'healing') return <RefreshCw className={`${size} text-[#58A6FF] animate-pulse`} />;
-    if (s === 'running') return <Loader className={`${size} text-[#D29922] animate-spin`} />;
-    if (s === 'generating') return <Loader className={`${size} text-[#58A6FF] animate-spin`} />;
-    if (s === 'partial') return <AlertTriangle className={`${size} text-orange-400`} />;
-    return <Clock className={`${size} text-[#6E7681]`} />;
+    if (s === 'pass') return <CheckCircle2 className={`${sc} text-[#3FB950]`} />;
+    if (s === 'fail' || s === 'final_fail') return <XCircle className={`${sc} text-[#F85149]`} />;
+    if (s === 'healing') return <RefreshCw className={`${sc} text-[#58A6FF] animate-pulse`} />;
+    if (s === 'running') return <Loader className={`${sc} text-[#D29922] animate-spin`} />;
+    if (s === 'generating') return <Loader className={`${sc} text-[#58A6FF] animate-spin`} />;
+    if (s === 'partial') return <AlertTriangle className={`${sc} text-orange-400`} />;
+    return <Clock className={`${sc} text-[#6E7681]`} />;
   }
-  if (s === 'pass') return <CheckCircle2 className={`${size} text-[#00875A]`} />;
-  if (s === 'fail' || s === 'final_fail') return <XCircle className={`${size} text-[#C9372C]`} />;
-  if (s === 'healing') return <RefreshCw className={`${size} text-[#0C66E4] animate-pulse`} />;
-  if (s === 'running') return <Loader className={`${size} text-[#B65C00] animate-spin`} />;
-  if (s === 'generating') return <Loader className={`${size} text-indigo-400 animate-spin`} />;
-  if (s === 'partial') return <AlertTriangle className={`${size} text-orange-400`} />;
-  return <Clock className={`${size} text-[#8993A4]`} />;
+  if (s === 'pass') return <CheckCircle2 className={`${sc} text-[#00875A]`} />;
+  if (s === 'fail' || s === 'final_fail') return <XCircle className={`${sc} text-[#C9372C]`} />;
+  if (s === 'healing') return <RefreshCw className={`${sc} text-[#0C66E4] animate-pulse`} />;
+  if (s === 'running') return <Loader className={`${sc} text-[#B65C00] animate-spin`} />;
+  if (s === 'generating') return <Loader className={`${sc} text-indigo-400 animate-spin`} />;
+  if (s === 'partial') return <AlertTriangle className={`${sc} text-orange-400`} />;
+  return <Clock className={`${sc} text-[#8993A4]`} />;
 }
 
 function statusBadge(status, darkMode = false) {
@@ -329,8 +351,12 @@ function TestCasePanel({ testCase, attempts, darkMode = false }) {
             <span className="text-[9px] px-1.5 bg-blue-500/20 text-blue-300 rounded border border-blue-500/30">v{testCase.version}</span>
           )}
           {testCase.healAttempts > 0 && (
-            <span className="text-[9px] flex items-center gap-0.5 text-orange-400">
-              <RefreshCw className="w-3 h-3" />{testCase.healAttempts} heal{testCase.healAttempts !== 1 ? 's' : ''}
+            <span
+              title={`${testCase.healAttempts} heal attempt(s) (completed)`}
+              className="text-[9px] flex items-center gap-0.5 text-orange-400"
+            >
+              <Wrench className="w-3.5 h-3.5 shrink-0" />
+              {testCase.healAttempts} heal{testCase.healAttempts !== 1 ? 's' : ''}
             </span>
           )}
           {Number(testCase.heal_exhausted) === 1 && testCase.status === 'fail' && (
@@ -687,6 +713,7 @@ function ScriptDetail() {
                 const sStatus = scenarioStatuses[scenarioId];
                 const isExpanded = !!expandedScenarios[scenarioId];
                 const tcs = tcByScenario[scenarioId] || [];
+                const scenarioRowStatus = deriveScenarioRowStatus(sStatus, tcs, isRunning);
 
                 return (
                   <div key={scenarioId}>
@@ -698,7 +725,7 @@ function ScriptDetail() {
                       }`}
                     >
                       <div className="flex items-center gap-2 min-w-0">
-                        {statusIcon(sStatus?.status || (isRunning ? 'running' : 'pending'), 'w-3.5 h-3.5', darkMode)}
+                        {statusIcon(scenarioRowStatus, 'w-3.5 h-3.5', darkMode)}
                         <span className={`text-xs font-mono truncate ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-300'}`}>{scenarioId}</span>
                       </div>
                       <div className="flex items-center gap-2 flex-shrink-0">
@@ -730,7 +757,7 @@ function ScriptDetail() {
                                 }`}
                               >
                                 <div className="flex items-center gap-2 min-w-0">
-                                  {statusIcon(tc.status, 'w-3 h-3', darkMode)}
+                                  {statusIcon(tc.status, 'w-3.5 h-3.5', darkMode)}
                                   <div className="min-w-0">
                                     <p className={`text-[10px] font-mono truncate ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>{tc.testCaseId}</p>
                                     <p className={`text-[10px] truncate ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>{tc.title}</p>
@@ -738,7 +765,13 @@ function ScriptDetail() {
                                 </div>
                                 <div className="flex-shrink-0 flex items-center gap-1">
                                   {tc.version > 1 && <span className="text-[9px] px-1 bg-blue-500/20 text-blue-300 rounded border border-blue-500/30">v{tc.version}</span>}
-                                  {tc.healAttempts > 0 && <RefreshCw className="w-3 h-3 text-orange-400" />}
+                                  {tc.healAttempts > 0 && (
+                                    <Wrench
+                                      className="w-3.5 h-3.5 shrink-0 text-orange-400"
+                                      title={`${tc.healAttempts} heal attempt(s) (completed)`}
+                                      aria-label={`${tc.healAttempts} heal attempt(s) (completed)`}
+                                    />
+                                  )}
                                 </div>
                               </button>
                             );

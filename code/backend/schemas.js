@@ -39,6 +39,30 @@ const projectCreateSchema = z.object({
     jiraProjectKey: z.string().optional()
 }).passthrough();
 
+const SANDBOX_ENV_KEY_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+const sandboxEnvPutSchema = z.object({
+    env: z.record(z.string(), z.string())
+}).superRefine((data, ctx) => {
+    for (const key of Object.keys(data.env)) {
+        if (!SANDBOX_ENV_KEY_REGEX.test(key)) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `Invalid env key "${key}": use ASCII letters, digits, underscore; first character must be letter or underscore.`,
+                path: ['env', key]
+            });
+        }
+        if (key.startsWith('AUTOQA_')) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message:
+                    'Keys prefixed with AUTOQA_ are reserved for the AutoQA harness and must not be set as project sandbox env (they would override Playwright/base URL and other behavior inside the container).',
+                path: ['env', key]
+            });
+        }
+    }
+});
+
 const validateBody = (schema) => (req, res, next) => {
     try {
         schema.parse(req.body);
@@ -54,5 +78,6 @@ module.exports = {
     githubWebhookSchema,
     jiraWebhookSchema,
     projectCreateSchema,
+    sandboxEnvPutSchema,
     validateBody
 };

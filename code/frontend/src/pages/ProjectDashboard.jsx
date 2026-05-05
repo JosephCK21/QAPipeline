@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
-import { Activity, ShieldCheck, Bug, Clock, GitCommit, Search, ChevronRight, ChevronDown, X, AlertTriangle, Settings, CheckCircle2, XCircle, Loader, PlayCircle, FileText, Upload, Trash2, Code2, Database, ListChecks, RefreshCw, GitBranch, ExternalLink, TrendingUp, Zap, BarChart2, Film, ImageIcon } from 'lucide-react';
+import { Activity, ShieldCheck, Bug, Clock, GitCommit, Search, ChevronRight, ChevronDown, X, AlertTriangle, Settings, CheckCircle2, XCircle, Loader, PlayCircle, FileText, Upload, Trash2, Code2, Database, ListChecks, RefreshCw, GitBranch, ExternalLink, TrendingUp, Zap, BarChart2, Film, ImageIcon, Terminal } from 'lucide-react';
 import { useAppContext } from '../App';
 import { computeAllEpicMetrics } from '../lib/epicMetrics';
 import { deriveRunDisplayStatus, buildRunHistoryDetailLine } from '../lib/runDisplayStatus';
@@ -12,6 +12,59 @@ import VideoPlayer from '../components/VideoPlayer';
 const API_BASE = typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL
   ? String(import.meta.env.VITE_API_BASE_URL).replace(/\/$/, '')
   : 'http://localhost:3001';
+
+const SANDBOX_ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Parse dotenv-style text into entries with 1-based line numbers (for error display). */
+function parseEnvFileText(text) {
+  const entries = [];
+  const lines = String(text || '').split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    entries.push({ line: i + 1, key, value });
+  }
+  return entries;
+}
+
+function envEntriesToMap(entries) {
+  const out = {};
+  for (const { key, value } of entries) {
+    if (!key) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+function validateSandboxEnvMap(env) {
+  const errors = [];
+  for (const k of Object.keys(env)) {
+    if (!SANDBOX_ENV_KEY_RE.test(k)) {
+      errors.push(`Invalid key "${k}": use ASCII letters, digits, underscore; first character letter or underscore.`);
+    }
+    if (k.startsWith('AUTOQA_')) {
+      errors.push(
+        `Key "${k}": Keys prefixed with AUTOQA_ are reserved for the AutoQA harness and must not be set as project sandbox env (they would override Playwright/base URL and other behavior inside the container).`
+      );
+    }
+  }
+  return errors;
+}
+
+function maskEnvValue(v) {
+  if (v == null || v === '') return '(empty)';
+  return '•'.repeat(Math.min(12, Math.max(4, String(v).length)));
+}
 
 function normTcStatus(s) {
   return String(s || '').toLowerCase();
@@ -71,7 +124,14 @@ function ProjectDashboard() {
   const [projectRuns, setProjectRuns] = useState([]);
   const [documents, setDocuments] = useState([]);
   const [uploadingDocs, setUploadingDocs] = useState(false);
-  
+
+  const [sandboxStoredEnv, setSandboxStoredEnv] = useState({});
+  const [sandboxEnvLoading, setSandboxEnvLoading] = useState(false);
+  const [sandboxEnvSaving, setSandboxEnvSaving] = useState(false);
+  const [sandboxPreviewEntries, setSandboxPreviewEntries] = useState([]);
+  const [sandboxPreviewFileName, setSandboxPreviewFileName] = useState('');
+  const [sandboxPreviewErrors, setSandboxPreviewErrors] = useState([]);
+
   // Slide-in panel state
   const [selectedItem, setSelectedItem] = useState(null);
   const [selectedTestCase, setSelectedTestCase] = useState(null);
@@ -128,6 +188,97 @@ function ProjectDashboard() {
       });
     return () => { cancelled = true; };
   }, [isPanelOpen, panelMode, selectedTestCase, tcPanelTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'sandbox-env' || !projectId) return;
+    let cancelled = false;
+    (async () => {
+      setSandboxEnvLoading(true);
+      try {
+        const res = await fetch(`${API_BASE}/api/projects/${projectId}/sandbox-env`);
+        if (!res.ok) throw new Error('Failed to load sandbox env');
+        const data = await res.json();
+        if (!cancelled) {
+          setSandboxStoredEnv(data.env && typeof data.env === 'object' && !Array.isArray(data.env) ? data.env : {});
+        }
+      } catch (e) {
+        console.error(e);
+        if (!cancelled) {
+          showToast('Could not load sandbox environment', 'error');
+          setSandboxStoredEnv({});
+        }
+      } finally {
+        if (!cancelled) setSandboxEnvLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeTab, projectId, refreshKey, showToast]);
+
+  const clearSandboxPreview = () => {
+    setSandboxPreviewEntries([]);
+    setSandboxPreviewFileName('');
+    setSandboxPreviewErrors([]);
+  };
+
+  const handleSandboxEnvFile = (e) => {
+    const file = e.target.files?.[0];
+    if (e.target) e.target.value = '';
+    if (!file) return;
+    setSandboxPreviewFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result || '');
+      const entries = parseEnvFileText(text);
+      const env = envEntriesToMap(entries);
+      setSandboxPreviewEntries(entries.filter((ent) => ent.key));
+      setSandboxPreviewErrors(validateSandboxEnvMap(env));
+    };
+    reader.onerror = () => {
+      showToast('Could not read file', 'error');
+      clearSandboxPreview();
+    };
+    reader.readAsText(file);
+  };
+
+  const handleSandboxEnvImportReplace = async () => {
+    const env = envEntriesToMap(sandboxPreviewEntries);
+    const errs = validateSandboxEnvMap(env);
+    if (errs.length) {
+      setSandboxPreviewErrors(errs);
+      showToast('Fix validation errors before importing.', 'error');
+      return;
+    }
+    if (Object.keys(env).length === 0) {
+      showToast('Nothing to import. Choose a .env file with at least one KEY=value line.', 'error');
+      return;
+    }
+    if (
+      !window.confirm(
+        'Replace all sandbox environment variables for this project with the imported file? Keys not in the file will be removed from the server (same as Project Settings save).'
+      )
+    ) {
+      return;
+    }
+    setSandboxEnvSaving(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/${projectId}/sandbox-env`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ env })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || data.details?.[0]?.message || 'Import failed');
+      }
+      setSandboxStoredEnv(data.env && typeof data.env === 'object' ? data.env : env);
+      clearSandboxPreview();
+      showToast('Sandbox environment imported', 'success');
+    } catch (err) {
+      showToast(err.message || 'Import failed', 'error');
+    } finally {
+      setSandboxEnvSaving(false);
+    }
+  };
 
   const fetchDocuments = async () => {
     try {
@@ -375,6 +526,7 @@ function ProjectDashboard() {
             { key: 'overview', label: 'Overview' },
             { key: 'rtm', label: 'Traceability Matrix' },
             { key: 'runs', label: 'Pipeline Runs' },
+            { key: 'sandbox-env', label: 'Sandbox env' },
             { key: 'docs', label: 'Context Documents' },
           ].map(tab => (
             <button key={tab.key} onClick={() => setActiveTab(tab.key)} className={`${
@@ -1042,13 +1194,151 @@ function ProjectDashboard() {
         </div>
       )}
 
+      {/* Sandbox env — .env file import (same store as Project Settings) */}
+      {activeTab === 'sandbox-env' && (
+        <div className={`rounded-lg p-6 border ${darkMode ? 'bg-[#161B22] border-[#30363D]' : 'bg-[#F4F5F7] border-[#DFE1E6]'}`}>
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+            <div className="flex items-center gap-2">
+              <Terminal className={`w-5 h-5 ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-400'}`} />
+              <h3 className={`text-lg font-bold ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>Sandbox environment</h3>
+            </div>
+            <Link
+              to={`/projects/${projectId}/settings`}
+              className={`text-sm font-medium ${darkMode ? 'text-[#58A6FF] hover:text-[#79B8FF]' : 'text-indigo-600 hover:text-indigo-800'}`}
+            >
+              Edit manually in Project Settings
+            </Link>
+          </div>
+
+          <div className={`mb-4 text-sm ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>
+            Variables are passed to PR sandbox containers at <code className={`text-xs px-1 rounded ${darkMode ? 'bg-[#21262D]' : 'bg-[#EBECF0]'}`}>docker run</code> (dev server, Jest, Playwright, pytest). Same storage as Project Settings. Keys starting with{' '}
+            <code className={`text-xs px-1 rounded ${darkMode ? 'bg-[#21262D]' : 'bg-[#EBECF0]'}`}>AUTOQA_</code> are not allowed. Do not commit secrets to git.
+          </div>
+
+          <div className={`mb-6 rounded-lg border p-4 ${darkMode ? 'border-[#30363D] bg-[#0D1117]' : 'border-[#DFE1E6] bg-white'}`}>
+            <h4 className={`text-sm font-semibold mb-2 ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>Currently stored</h4>
+            {sandboxEnvLoading ? (
+              <div className={`flex items-center gap-2 text-sm ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>
+                <Loader className="w-4 h-4 animate-spin shrink-0" /> Loading…
+              </div>
+            ) : Object.keys(sandboxStoredEnv).length === 0 ? (
+              <p className={`text-sm italic ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>No variables saved yet.</p>
+            ) : (
+              <div className="overflow-x-auto max-h-48 overflow-y-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className={darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}>
+                      <th className="py-1.5 pr-3">Key</th>
+                      <th className="py-1.5">Value</th>
+                    </tr>
+                  </thead>
+                  <tbody className={`divide-y ${darkMode ? 'divide-[#30363D]' : 'divide-[#DFE1E6]'}`}>
+                    {Object.entries(sandboxStoredEnv).map(([k, v]) => (
+                      <tr key={k}>
+                        <td className={`py-1.5 pr-3 font-mono ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-600'}`}>{k}</td>
+                        <td className={`py-1.5 font-mono ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>{maskEnvValue(v)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div className={`rounded-lg border p-4 ${darkMode ? 'border-[#30363D] bg-[#21262D]' : 'border-[#DFE1E6] bg-[#FFFFFF]'}`}>
+            <h4 className={`text-sm font-semibold mb-3 ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>Import from .env file</h4>
+            <div className="flex flex-wrap items-center gap-3 mb-3">
+              <input
+                type="file"
+                id="sandbox-env-upload"
+                accept=".env,.txt,text/plain"
+                className="hidden"
+                onChange={handleSandboxEnvFile}
+                disabled={sandboxEnvSaving}
+              />
+              <label
+                htmlFor="sandbox-env-upload"
+                className={`inline-flex items-center px-4 py-2 rounded cursor-pointer text-sm font-medium transition-colors ${
+                  sandboxEnvSaving
+                    ? 'opacity-50 cursor-not-allowed bg-indigo-600 text-white'
+                    : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                }`}
+              >
+                <Upload className="w-4 h-4 mr-2 shrink-0" />
+                Choose .env file
+              </label>
+              {sandboxPreviewFileName ? (
+                <span className={`text-sm ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>{sandboxPreviewFileName}</span>
+              ) : null}
+              {(sandboxPreviewEntries.length > 0 || sandboxPreviewFileName) && (
+                <button
+                  type="button"
+                  onClick={clearSandboxPreview}
+                  disabled={sandboxEnvSaving}
+                  className={`text-sm ${darkMode ? 'text-[#8B949E] hover:text-[#E6EDF3]' : 'text-[#5E6C84] hover:text-[#172B4D]'}`}
+                >
+                  Clear preview
+                </button>
+              )}
+            </div>
+
+            {sandboxPreviewErrors.length > 0 && (
+              <ul className={`mb-3 text-sm list-disc pl-5 space-y-1 ${darkMode ? 'text-[#F85149]' : 'text-[#C9372C]'}`}>
+                {sandboxPreviewErrors.map((msg, i) => (
+                  <li key={i}>{msg}</li>
+                ))}
+              </ul>
+            )}
+
+            {sandboxPreviewEntries.length > 0 && (
+              <>
+                <p className={`text-xs mb-2 ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>
+                  Preview ({sandboxPreviewEntries.length} entr{sandboxPreviewEntries.length === 1 ? 'y' : 'ies'}). Import replaces the full map on the server.
+                </p>
+                <div className={`overflow-x-auto max-h-48 overflow-y-auto mb-4 rounded border ${darkMode ? 'border-[#30363D]' : 'border-[#DFE1E6]'}`}>
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className={darkMode ? 'text-[#8B949E] bg-[#161B22]' : 'text-[#5E6C84] bg-[#F4F5F7]'}>
+                        <th className="p-2">Line</th>
+                        <th className="p-2">Key</th>
+                        <th className="p-2">Value</th>
+                      </tr>
+                    </thead>
+                    <tbody className={`divide-y ${darkMode ? 'divide-[#30363D]' : 'divide-[#DFE1E6]'}`}>
+                      {sandboxPreviewEntries.map((ent, i) => (
+                        <tr key={i}>
+                          <td className={`p-2 font-mono ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>{ent.line}</td>
+                          <td className={`p-2 font-mono ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-600'}`}>{ent.key}</td>
+                          <td className={`p-2 font-mono max-w-xs truncate ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`} title={ent.value}>
+                            {ent.value}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleSandboxEnvImportReplace}
+                  disabled={sandboxEnvSaving || sandboxPreviewErrors.length > 0}
+                  className="inline-flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white rounded text-sm font-medium transition-colors"
+                >
+                  {sandboxEnvSaving ? <Loader className="w-4 h-4 animate-spin" /> : null}
+                  Import and replace
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Documents View */}
       {activeTab === 'docs' && (
-        <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg p-6">
+        <div className={`rounded-lg p-6 border ${darkMode ? 'bg-[#161B22] border-[#30363D]' : 'bg-[#F4F5F7] border-[#DFE1E6]'}`}>
           <div className="flex items-center justify-between mb-6">
             <div className="flex items-center gap-2">
-              <FileText className="w-5 h-5 text-indigo-400" />
-              <h3 className="text-lg font-bold text-[#172B4D]">Context Documents</h3>
+              <FileText className={`w-5 h-5 ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-400'}`} />
+              <h3 className={`text-lg font-bold ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>Context Documents</h3>
             </div>
             <div>
               <input
@@ -1070,31 +1360,40 @@ function ProjectDashboard() {
             </div>
           </div>
           
-          <div className="mb-4 text-sm text-[#5E6C84]">
+          <div className={`mb-4 text-sm ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>
             Upload PDF, DOCX, or TXT files. The text will be extracted and passed to the LLM during Test Scenario generation to provide additional context.
           </div>
 
           {documents.length === 0 ? (
-            <div className="text-center py-12 bg-[#F1F2F4]/30 rounded border border-dashed border-[#C1C7D0]">
-              <FileText className="w-8 h-8 text-[#8993A4] mx-auto mb-3" />
-              <p className="text-[#5E6C84]">No context documents uploaded for this project yet.</p>
+            <div className={`text-center py-12 rounded border border-dashed ${darkMode ? 'bg-[#0D1117] border-[#484F58]' : 'bg-[#F1F2F4]/30 border-[#C1C7D0]'}`}>
+              <FileText className={`w-8 h-8 mx-auto mb-3 ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`} />
+              <p className={darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}>No context documents uploaded for this project yet.</p>
             </div>
           ) : (
             <div className="space-y-3">
               {documents.map((doc, idx) => (
-                <div key={idx} className="bg-[#FFFFFF] border border-[#DFE1E6] rounded p-4 flex items-center justify-between">
+                <div
+                  key={idx}
+                  className={`rounded p-4 flex items-center justify-between border ${
+                    darkMode ? 'bg-[#21262D] border-[#30363D]' : 'bg-[#FFFFFF] border-[#DFE1E6]'
+                  }`}
+                >
                   <div className="flex items-center gap-3">
-                    <div className="p-2 bg-indigo-500/10 rounded">
-                      <FileText className="w-5 h-5 text-indigo-400" />
+                    <div className={`p-2 rounded ${darkMode ? 'bg-[#30363D]' : 'bg-indigo-500/10'}`}>
+                      <FileText className={`w-5 h-5 ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-400'}`} />
                     </div>
                     <div>
-                      <p className="text-sm font-medium text-[#172B4D]">{doc.originalName || doc.path.split(/[\\/]/).pop()}</p>
-                      <p className="text-xs text-[#8993A4] mt-1">Uploaded {new Date(doc.uploadedAt).toLocaleString()}</p>
+                      <p className={`text-sm font-medium ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>{doc.originalName || doc.path.split(/[\\/]/).pop()}</p>
+                      <p className={`text-xs mt-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}>Uploaded {new Date(doc.uploadedAt).toLocaleString()}</p>
                     </div>
                   </div>
                   <button 
                     onClick={() => handleDeleteDocument(doc.path)}
-                    className="p-2 text-[#5E6C84] hover:text-[#C9372C] hover:bg-red-400/10 rounded transition-colors"
+                    className={`p-2 rounded transition-colors ${
+                      darkMode
+                        ? 'text-[#8B949E] hover:text-[#F85149] hover:bg-[rgba(248,81,73,0.12)]'
+                        : 'text-[#5E6C84] hover:text-[#C9372C] hover:bg-red-400/10'
+                    }`}
                     title="Remove document"
                   >
                     <Trash2 className="w-4 h-4" />

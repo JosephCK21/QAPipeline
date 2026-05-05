@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const { deleteSandboxEnv } = require('./sandboxEnvStore');
 
 const projectsStorePath = path.join(__dirname, '..', 'data', 'projects.json');
 
@@ -125,7 +126,9 @@ function deleteProject(projectId) {
     const deletedProject = store.projects[index];
     store.projects.splice(index, 1);
     writeProjectsStore(store);
-    
+
+    deleteSandboxEnv(projectId);
+
     return deletedProject;
 }
 

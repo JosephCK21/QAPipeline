@@ -7,6 +7,8 @@
 # AutoQA Dynamic Data & Artifacts
 code/backend/data/*.json
 !code/backend/data/.gitkeep
+code/backend/data/sandbox-env/*
+!code/backend/data/sandbox-env/.gitkeep
 code/backend/uploads/
 code/backend/data/artifacts/
 

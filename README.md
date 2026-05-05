@@ -504,8 +504,8 @@ Numbers map **path → responsibility** (production code and tooling).
 | [`src/index.css`](code/frontend/src/index.css) | Tailwind directives + app-wide styles / dark tokens. |
 | [`src/App.jsx`](code/frontend/src/App.jsx) | Router, **`AppContext`** (`activeRuns`, `settings`, `toast`, `sidebarCollapsed`, `refreshKey`, `llmTraces`, `darkMode`, …), Socket.IO wiring, route table, toast UI. |
 | [`src/pages/ProjectsHub.jsx`](code/frontend/src/pages/ProjectsHub.jsx) | `/` — list/create projects (`GET/POST /api/projects`). |
-| [`src/pages/ProjectDashboard.jsx`](code/frontend/src/pages/ProjectDashboard.jsx) | `/projects/:projectId` — RTM dashboards, epic metrics, PR run workspace via query params; scenario rows may show mapping / sandbox outcome badges sourced from **`rtm_scenarios`**. |
-| [`src/pages/ProjectSettings.jsx`](code/frontend/src/pages/ProjectSettings.jsx) | `/projects/:projectId/settings` — Jira/GitHub linking, **`BranchPolicyMatrix`**, sync button. |
+| [`src/pages/ProjectDashboard.jsx`](code/frontend/src/pages/ProjectDashboard.jsx) | `/projects/:projectId` — RTM dashboards, epic metrics, PR run workspace via query params, **Sandbox env** tab (.env import into `sandbox-env` store), scenario rows may show mapping / sandbox outcome badges sourced from **`rtm_scenarios`**. |
+| [`src/pages/ProjectSettings.jsx`](code/frontend/src/pages/ProjectSettings.jsx) | `/projects/:projectId/settings` — Jira/GitHub linking, **per-project sandbox env** (full-map PUT), **`BranchPolicyMatrix`**, sync button. |
 | [`src/pages/PipelineRunsList.jsx`](code/frontend/src/pages/PipelineRunsList.jsx) | `/pipelines` — runs table navigation into dashboard + **`runId`**; renders per-run token totals when present on **`run_history`**. |
 | [`src/pages/ScriptDetail.jsx`](code/frontend/src/pages/ScriptDetail.jsx) | Generated script inspector; **Heal exhausted** when **`heal_exhausted`**; neutral **`smoke`** pill when **`source === 'fallback'`** (legacy **`FALLBACK`** data). |
 | [`src/pages/AgentChatDebug.jsx`](code/frontend/src/pages/AgentChatDebug.jsx) | `/llm-traces` — rolling **`llm_trace`** from context; append **`?run=<runId>`** to load **`GET /api/runs/:runId/llm-traces`**. |
@@ -718,6 +718,9 @@ Base URL **`http://localhost:3001`** unless `PORT` changed.
 | GET | `/api/projects` | List |
 | POST | `/api/projects` | Create |
 | GET | `/api/projects/:projectId` | Fetch |
+| GET | `/api/projects/:projectId/sandbox-env` | Per-project env map injected into PR sandboxes (**not** returned from list projects). Trusted/local operator model — add auth before exposing to tenants. |
+| PUT | `/api/projects/:projectId/sandbox-env` | Replace full map: body `{ "env": { "KEY": "value" } }` (string values only). **`AUTOQA_` prefix keys rejected (400).** |
+| DELETE | `/api/projects/:projectId/sandbox-env` | Remove stored sandbox env file |
 | DELETE | `/api/projects/:projectId` | Delete |
 | PATCH | `/api/projects/:projectId/jira-link` | Attach Jira project |
 | PATCH | `/api/projects/:projectId/github-link` | Attach GitHub slug |
@@ -962,7 +965,7 @@ Jira scenario functions (**`generateTestScenarios*`**) live in the same module b
 
 Pipeline-critical exports:
 
-- **`createSandboxPool`**, **`cleanupSandboxPool`** — **Docker** **`mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-jammy`**, **`git clone`** with optional **`http.extraHeader`** **token**, **`SANDBOX_MAX_CONCURRENT`**, **`npm install`** / harness deps.
+- **`createSandboxPool`**, **`cleanupSandboxPool`** — **Docker** **`mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-jammy`**, **`git clone`** with optional **`http.extraHeader`** **token**, **`SANDBOX_MAX_CONCURRENT`**, **`npm install`** / harness deps. Per-project env from **`readSandboxEnv(projectId)`** is passed as **`docker run -e`** so every **`docker exec`** (including the background dev server) inherits **`DATABASE_URL`**, etc.
 - **`validateSyntaxLocal`** — **`new Function`** (JS) or Python **`ast`** parse before **`executeTest`**.
 - **`executeTest`** — Jest vs **Playwright** branches, **`buildPlaywrightAutoqaConfigSource`**, dev-server **`docker exec -d`**, **`wait-on`**, artifact **`persistPlaywrightArtifacts`**.
 
@@ -974,7 +977,8 @@ Pipeline-critical exports:
 
 | Module | Pipeline use |
 |--------|----------------|
-| [`projectStore.js`](code/backend/services/projectStore.js) | **`findProjectByGithubRepo`** → **`jiraProjectKey`**, **`id`**. |
+| [`projectStore.js`](code/backend/services/projectStore.js) | **`findProjectByGithubRepo`** → **`jiraProjectKey`**, **`id`**. **`deleteProject`** removes **`sandbox-env/<id>.json`**. |
+| [`sandboxEnvStore.js`](code/backend/services/sandboxEnvStore.js) | **`readSandboxEnv`**, **`writeSandboxEnv`**, **`deleteSandboxEnv`** — per-project env files under **`data/sandbox-env/`** (not merged into **`GET /api/projects`**). |
 | [`documentAssociationStore.js`](code/backend/services/documentAssociationStore.js) | **`getDocsForProject`** → **`extractTextFromFiles`**. |
 | [`documentParserService.js`](code/backend/services/documentParserService.js) | **`extractTextFromFiles`** for mapping prompt slices. |
 
@@ -987,7 +991,7 @@ Pipeline-critical exports:
 | File | Role |
 |------|------|
 | [`App.jsx`](code/frontend/src/App.jsx) | **`run_updated`**, **`llm_trace`**, **`pr_opened`**, **`test_execution_started` / `test_execution_ended`** for live run UI. |
-| [`ProjectDashboard.jsx`](code/frontend/src/pages/ProjectDashboard.jsx) | Run/scenario workspace. |
+| [`ProjectDashboard.jsx`](code/frontend/src/pages/ProjectDashboard.jsx) | Run/scenario workspace; **Sandbox env** tab imports `.env` files into the same store as **`GET/PUT /api/projects/:id/sandbox-env`**. |
 | [`PipelineRunsList.jsx`](code/frontend/src/pages/PipelineRunsList.jsx) | Run list + token totals. |
 | [`ScriptDetail.jsx`](code/frontend/src/pages/ScriptDetail.jsx) | Per-test-case script, heal exhaustion, legacy **smoke** pill. |
 | [`AgentChatDebug.jsx`](code/frontend/src/pages/AgentChatDebug.jsx) | **`GET /api/runs/:runId/llm-traces`**. |
@@ -1002,6 +1006,9 @@ Pipeline-critical exports:
 ## Security notes
 
 - Never commit real **`.env`**
+- **Per-project sandbox secrets** are stored as **plain JSON on disk** under **`code/backend/data/sandbox-env/`** with **no encryption at rest**. That is intentional for a typical **single-operator local** deployment; multi-tenant or regulated environments should use a **secrets manager** or **encrypted volume**, not this store alone.
+- **Reserved keys:** environment variable names prefixed with **`AUTOQA_`** are **rejected** for project sandbox env (server-enforced) so they cannot override harness behavior (e.g. Playwright base URL) inside the container.
+- **`GET/PUT /api/projects/:id/sandbox-env`** return the full env map — treat as **trusted-operator / local** only until authentication gates exist; **`GET /api/projects`** does **not** embed these values.
 - Webhook URLs on **smee** are demo-grade—use locked-down endpoints in prod
 - **Avoid logging** authenticated git clone URLs with embedded **`GITHUB_TOKEN`**
 

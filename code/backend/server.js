@@ -17,7 +17,7 @@ const {
     listLlmTracesByRun, listDlqEvents, getDlqEvent, updateDlqStatus,
     getHealExhaustedByProject
 } = require('./db');
-const { githubWebhookSchema, jiraWebhookSchema, projectCreateSchema, validateBody } = require('./schemas');
+const { githubWebhookSchema, jiraWebhookSchema, projectCreateSchema, sandboxEnvPutSchema, validateBody } = require('./schemas');
 
 initDb();
 
@@ -38,6 +38,7 @@ const {
     findProjectByGithubRepo,
     findProjectByJiraProjectKey
 } = require('./services/projectStore');
+const { readSandboxEnv, writeSandboxEnv, deleteSandboxEnv } = require('./services/sandboxEnvStore');
 const { sanitizeArtifactSegment } = require('./services/sandboxService');
 
 // Storage for uploaded requirements
@@ -204,6 +205,45 @@ app.get('/api/projects/:projectId', (req, res) => {
         const project = getProjectById(req.params.projectId);
         if (!project) return res.status(404).json({ error: 'Project not found' });
         res.json(project);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/projects/:projectId/sandbox-env', (req, res) => {
+    try {
+        const { projectId } = req.params;
+        const project = getProjectById(projectId);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+        res.json({ env: readSandboxEnv(projectId) });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/projects/:projectId/sandbox-env', validateBody(sandboxEnvPutSchema), (req, res) => {
+    try {
+        const { projectId } = req.params;
+        const project = getProjectById(projectId);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+        writeSandboxEnv(projectId, req.body.env);
+        res.json({ env: readSandboxEnv(projectId) });
+    } catch (error) {
+        if (error.statusCode === 400) {
+            return res.status(400).json({ error: error.message });
+        }
+        console.error('[sandbox-env PUT]', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/projects/:projectId/sandbox-env', (req, res) => {
+    try {
+        const { projectId } = req.params;
+        const project = getProjectById(projectId);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+        deleteSandboxEnv(projectId);
+        res.json({ ok: true, env: {} });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }

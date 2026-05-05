@@ -1,8 +1,25 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Activity, GitCommit, Settings as SettingsIcon, ArrowLeft, AlertTriangle } from 'lucide-react';
+import { Activity, GitCommit, Settings as SettingsIcon, ArrowLeft, AlertTriangle, Plus, Trash2, Loader } from 'lucide-react';
 import { useAppContext } from '../App';
 import BranchPolicyMatrix from '../components/BranchPolicyMatrix';
+
+const SANDBOX_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function envObjectToRows(obj) {
+  const e = obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+  return Object.entries(e).map(([key, value]) => ({ key, value: String(value ?? '') }));
+}
+
+function rowsToEnvObject(rows) {
+  const out = {};
+  for (const r of rows) {
+    const k = String(r.key ?? '').trim();
+    if (!k) continue;
+    out[k] = String(r.value ?? '');
+  }
+  return out;
+}
 
 function ProjectSettings() {
   const { projectId } = useParams();
@@ -22,9 +39,14 @@ function ProjectSettings() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
+  const [sandboxEnvRows, setSandboxEnvRows] = useState([]);
+  const [sandboxEnvLoading, setSandboxEnvLoading] = useState(true);
+  const [sandboxEnvSaving, setSandboxEnvSaving] = useState(false);
+
   useEffect(() => {
     fetchProjectData();
     fetchIntegrations();
+    loadSandboxEnv();
   }, [projectId, refreshKey]);
 
   const fetchProjectData = async () => {
@@ -53,6 +75,80 @@ function ProjectSettings() {
       if (githubRes.ok) setRepos(await githubRes.json());
     } catch (error) {
       console.error('Failed to load integrations lists', error);
+    }
+  };
+
+  const loadSandboxEnv = async () => {
+    setSandboxEnvLoading(true);
+    try {
+      const res = await fetch(`http://localhost:3001/api/projects/${projectId}/sandbox-env`);
+      if (!res.ok) throw new Error('Failed to load sandbox env');
+      const data = await res.json();
+      setSandboxEnvRows(envObjectToRows(data.env));
+    } catch (err) {
+      console.error(err);
+      showToast('Could not load sandbox environment variables', 'error');
+      setSandboxEnvRows([]);
+    } finally {
+      setSandboxEnvLoading(false);
+    }
+  };
+
+  const handleSaveSandboxEnv = async () => {
+    const seen = new Set();
+    for (const r of sandboxEnvRows) {
+      const k = String(r.key ?? '').trim();
+      if (!k) continue;
+      if (seen.has(k)) {
+        showToast(`Duplicate key "${k}"`, 'error');
+        return;
+      }
+      seen.add(k);
+    }
+    const env = rowsToEnvObject(sandboxEnvRows);
+    for (const k of Object.keys(env)) {
+      if (k.startsWith('AUTOQA_')) {
+        showToast('Keys may not start with AUTOQA_ (reserved for the harness).', 'error');
+        return;
+      }
+      if (!SANDBOX_KEY_RE.test(k)) {
+        showToast(`Invalid key "${k}": use letters, digits, underscore; first character letter or underscore.`, 'error');
+        return;
+      }
+    }
+    try {
+      setSandboxEnvSaving(true);
+      const res = await fetch(`http://localhost:3001/api/projects/${projectId}/sandbox-env`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ env })
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.error || errBody.details?.[0]?.message || 'Save failed');
+      }
+      const data = await res.json();
+      setSandboxEnvRows(envObjectToRows(data.env));
+      showToast('Sandbox environment saved', 'success');
+    } catch (err) {
+      showToast(err.message || 'Failed to save sandbox env', 'error');
+    } finally {
+      setSandboxEnvSaving(false);
+    }
+  };
+
+  const handleClearSandboxEnv = async () => {
+    if (!window.confirm('Remove all sandbox environment variables for this project?')) return;
+    try {
+      setSandboxEnvSaving(true);
+      const res = await fetch(`http://localhost:3001/api/projects/${projectId}/sandbox-env`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Clear failed');
+      setSandboxEnvRows([]);
+      showToast('Sandbox environment cleared', 'success');
+    } catch (err) {
+      showToast(err.message || 'Failed to clear sandbox env', 'error');
+    } finally {
+      setSandboxEnvSaving(false);
     }
   };
 
@@ -202,6 +298,90 @@ function ProjectSettings() {
            <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg p-6">
               <h3 className="text-lg font-medium text-[#172B4D] mb-4">Pipeline Execution Behaviors</h3>
               <BranchPolicyMatrix />
+           </div>
+
+           <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg p-6">
+              <h3 className="text-lg font-medium text-[#172B4D] mb-2">Sandbox environment variables</h3>
+              <p className="text-sm text-[#5E6C84] mb-4">
+                Injected into the PR sandbox Docker container at startup (<code className="text-xs bg-[#EBECF0] px-1 rounded">docker run -e</code>
+                ), so the dev server, Jest, Playwright, and pytest all see them. Values are not committed to git; they live on the server under{' '}
+                <code className="text-xs bg-[#EBECF0] px-1 rounded">data/sandbox-env/</code>.
+                Keys starting with <code className="text-xs bg-[#EBECF0] px-1 rounded">AUTOQA_</code> are reserved and cannot be set here.
+              </p>
+              {sandboxEnvLoading ? (
+                <div className="flex items-center gap-2 text-sm text-[#5E6C84] py-4">
+                  <Loader className="w-4 h-4 animate-spin" /> Loading…
+                </div>
+              ) : (
+                <>
+                  <div className="space-y-2 mb-4">
+                    {sandboxEnvRows.length === 0 ? (
+                      <p className="text-sm italic text-[#8993A4] py-2">No variables yet. Add a row or save an empty list to clear the file.</p>
+                    ) : (
+                      sandboxEnvRows.map((row, idx) => (
+                        <div key={idx} className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
+                          <input
+                            type="text"
+                            placeholder="VAR_NAME"
+                            value={row.key}
+                            onChange={(e) => {
+                              const next = sandboxEnvRows.slice();
+                              next[idx] = { ...next[idx], key: e.target.value };
+                              setSandboxEnvRows(next);
+                            }}
+                            className="flex-1 min-w-0 bg-[#FFFFFF] border border-[#C1C7D0] text-[#172B4D] rounded-md py-2 px-3 text-sm font-mono"
+                          />
+                          <input
+                            type="text"
+                            placeholder="value"
+                            value={row.value}
+                            onChange={(e) => {
+                              const next = sandboxEnvRows.slice();
+                              next[idx] = { ...next[idx], value: e.target.value };
+                              setSandboxEnvRows(next);
+                            }}
+                            className="flex-[2] min-w-0 bg-[#FFFFFF] border border-[#C1C7D0] text-[#172B4D] rounded-md py-2 px-3 text-sm font-mono"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setSandboxEnvRows(sandboxEnvRows.filter((_, i) => i !== idx))}
+                            className="p-2 text-[#5E6C84] hover:text-[#C9372C] rounded-md border border-transparent hover:border-[#C9372C]/30 transition-colors shrink-0"
+                            title="Remove row"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSandboxEnvRows([...sandboxEnvRows, { key: '', value: '' }])}
+                      className="inline-flex items-center gap-1 px-3 py-2 bg-[#DFE1E6] hover:bg-[#C1C7D0] text-[#172B4D] rounded-md text-sm font-medium transition-colors"
+                    >
+                      <Plus className="w-4 h-4" /> Add variable
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleSaveSandboxEnv}
+                      disabled={sandboxEnvSaving}
+                      className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-md text-sm font-medium transition-colors"
+                    >
+                      {sandboxEnvSaving ? <Loader className="w-4 h-4 animate-spin" /> : null}
+                      Save sandbox env
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleClearSandboxEnv}
+                      disabled={sandboxEnvSaving || sandboxEnvRows.length === 0}
+                      className="px-3 py-2 text-sm text-[#5E6C84] hover:text-[#C9372C] disabled:opacity-50"
+                    >
+                      Clear all
+                    </button>
+                  </div>
+                </>
+              )}
            </div>
 
            {/* Danger Zone */}

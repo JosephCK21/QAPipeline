@@ -1,6 +1,7 @@
 const { fetchPRDetails, fetchFullFileContents, inferTestFilePaths, fetchPRDependencies } = require('./services/githubService');
 const { cleanupSandboxPool, createSandboxPool, executeTest, validateSyntaxLocal } = require('./services/sandboxService');
 const { findProjectByGithubRepo } = require('./services/projectStore');
+const { readSandboxEnv } = require('./services/sandboxEnvStore');
 const { getDocsForProject } = require('./services/documentAssociationStore');
 const { extractTextFromFiles } = require('./services/documentParserService');
 const { mapPrChangesToScenarios } = require('./services/prScenarioMappingService');
@@ -960,8 +961,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // --- Sandbox task (async) ---
         const sandboxTask = (async () => {
             sendEvent('phase_update', { phase: 'Sandbox Setup', status: 'running' });
-            // Spin up a pool of 2 Docker containers for parallel testing
-            const pool = await createSandboxPool(runId, prDetails, 2);
+            const sandboxEnvForRun = localProjectId ? readSandboxEnv(localProjectId) : {};
+            const pool = await createSandboxPool(runId, prDetails, 2, { sandboxEnv: sandboxEnvForRun });
             sendEvent('log', { level: 'INFO', message: `[Sandbox] Created pool of ${pool.length} containers` });
             sendEvent('phase_update', { phase: 'Sandbox Setup', status: 'completed' });
             return pool;
