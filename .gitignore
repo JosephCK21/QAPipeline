@@ -19,4 +19,11 @@ code/backend/data/autoqa.db-wal
 
 # Frontend build output
 code/frontend/dist/
+
+# Integration test temp DBs (created at runtime by pipeline.integration.test.js)
+code/backend/__tests__/fixture-autoqa-smoke-db-*.db
+
+# Playwright output (e2e helper package)
+code/e2e/test-results/
+
 code/devscripts/seedSayaratJiraIssues.js

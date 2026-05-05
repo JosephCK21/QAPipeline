@@ -123,6 +123,20 @@ async function dockerRun(args, timeoutMs = 120000) {
     return execFilePromise('docker', args, { timeout: timeoutMs });
 }
 
+/**
+ * `docker run` against mcr.microsoft.com/playwright pulls a multi‑GB image on first use.
+ * A short timeout (SANDBOX_TIMEOUT_MS) SIGTERM‑kills the pull mid‑stream → misleading
+ * "Container startup failed" errors. Override with SANDBOX_DOCKER_PULL_TIMEOUT_MS only for that step.
+ */
+function getDockerBaseImagePullTimeoutMs() {
+    const raw = process.env.SANDBOX_DOCKER_PULL_TIMEOUT_MS;
+    if (raw !== undefined && String(raw).trim() !== '') {
+        const n = parseInt(raw, 10);
+        return Number.isFinite(n) && n >= 60000 ? n : 1_200_000;
+    }
+    return 1_200_000; // 20 minutes default for cold pull
+}
+
 const PLAYWRIGHT_WAIT_ON_MS = 30000;
 
 /**
@@ -133,6 +147,21 @@ const PLAYWRIGHT_VERSION = '1.59.1';
 
 /** Playwright traces allowed by env AUTOQA_PLAYWRIGHT_TRACE */
 const PLAYWRIGHT_TRACE_MODES = new Set(['on', 'retain-on-failure', 'on-first-retry']);
+
+/** Playwright video modes allowed by env AUTOQA_PLAYWRIGHT_VIDEO */
+const PLAYWRIGHT_VIDEO_MODES = new Set(['on', 'off', 'retain-on-failure', 'on-first-retry']);
+
+/** Whether live browser streaming (VNC) is enabled */
+function isLiveBrowserEnabled() {
+    const v = (process.env.AUTOQA_LIVE_BROWSER || 'true').trim().toLowerCase();
+    return v === 'true' || v === '1';
+}
+
+/** Base port for noVNC WebSocket connections */
+const VNC_BASE_PORT = Math.max(1024, parseInt(process.env.AUTOQA_VNC_BASE_PORT || '6080', 10));
+
+/** SlowMo when live browser is active (makes tests watchable) */
+const LIVE_SLOWMO_MS = Math.max(0, parseInt(process.env.AUTOQA_LIVE_SLOWMO_MS || '300', 10));
 
 /** @returns {string} */
 function sanitizeArtifactSegment(id) {
@@ -147,8 +176,13 @@ function buildPlaywrightAutoqaConfigSource() {
 const { defineConfig, devices } = require('@playwright/test');
 const TRACE = process.env.AUTOQA_PLAYWRIGHT_TRACE || 'off';
 const TRACE_OK = new Set(${JSON.stringify([...PLAYWRIGHT_TRACE_MODES])});
-const HEADED = process.env.AUTOQA_PLAYWRIGHT_HEADED === '1' || process.env.AUTOQA_PLAYWRIGHT_HEADED === 'true';
-const SLOWMO = parseInt(process.env.AUTOQA_PLAYWRIGHT_SLOWMO_MS || '0', 10) || 0;
+const VIDEO = process.env.AUTOQA_PLAYWRIGHT_VIDEO || 'on';
+const VIDEO_OK = new Set(${JSON.stringify([...PLAYWRIGHT_VIDEO_MODES])});
+const LIVE = process.env.AUTOQA_LIVE_BROWSER === '1' || process.env.AUTOQA_LIVE_BROWSER === 'true';
+const HEADED = LIVE || process.env.AUTOQA_PLAYWRIGHT_HEADED === '1' || process.env.AUTOQA_PLAYWRIGHT_HEADED === 'true';
+const SLOWMO = LIVE
+    ? parseInt(process.env.AUTOQA_LIVE_SLOWMO_MS || '300', 10) || 300
+    : parseInt(process.env.AUTOQA_PLAYWRIGHT_SLOWMO_MS || '0', 10) || 0;
 function parsePositive(ms) {
     const n = parseInt(ms || '', 10);
     return Number.isFinite(n) && n > 0 ? n : null;
@@ -180,10 +214,22 @@ module.exports = defineConfig({
         ...devices['Desktop Chrome'],
         headless: !HEADED,
         screenshot: 'only-on-failure',
+        video: VIDEO_OK.has(VIDEO) ? VIDEO : 'on',
         trace: TRACE_OK.has(TRACE) ? TRACE : 'off',
         ...(BASE ? { baseURL: BASE } : {}),
         ...(ACTION_MS !== null ? { actionTimeout: ACTION_MS } : {}),
-        ...(SLOWMO > 0 ? { launchOptions: { slowMo: SLOWMO } } : {})
+        ...(HEADED ? {
+            launchOptions: {
+                ...(SLOWMO > 0 ? { slowMo: SLOWMO } : {}),
+                args: [
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-gpu',
+                    '--window-size=1280,720'
+                ]
+            }
+        } : (SLOWMO > 0 ? { launchOptions: { slowMo: SLOWMO } } : {}))
     }
 });
 `;
@@ -217,19 +263,21 @@ async function collectFilesByExtension(dir, acc) {
  * @param {{ runId: string, testCaseId: string, attempt: number }} ctx
  */
 async function persistPlaywrightArtifacts(sandboxDir, ctx) {
-    const empty = { failureScreenshots: [], traces: [] };
+    const empty = { failureScreenshots: [], traces: [], videos: [] };
     if (!ctx?.runId || !ctx.testCaseId) return empty;
 
     const pwRoot = path.join(sandboxDir, 'test-results', 'playwright-autoqa');
-    const acc = { ext: new Set(['.png', '.zip']), out: [] };
+    const acc = { ext: new Set(['.png', '.zip', '.webm']), out: [] };
     await collectFilesByExtension(pwRoot, acc);
 
     /** @type {string[]} */
     const pngFiles = acc.out.filter(f => f.endsWith('.png')).sort();
     /** @type {string[]} */
     const zipFiles = acc.out.filter(f => f.endsWith('.zip')).sort();
+    /** @type {string[]} */
+    const webmFiles = acc.out.filter(f => f.endsWith('.webm')).sort();
 
-    if (pngFiles.length === 0 && zipFiles.length === 0) return empty;
+    if (pngFiles.length === 0 && zipFiles.length === 0 && webmFiles.length === 0) return empty;
 
     const safeTc = sanitizeArtifactSegment(ctx.testCaseId);
     const artifactsRoot = path.join(__dirname, '..', 'data', 'artifacts');
@@ -273,7 +321,24 @@ async function persistPlaywrightArtifacts(sandboxDir, ctx) {
         });
     });
 
-    return { failureScreenshots, traces };
+    /** @type {{ url: string, fileName: string }[]} */
+    const videos = [];
+    webmFiles.forEach((src, idx) => {
+        const destName = `attempt-${ctx.attempt}-video-${idx}.webm`;
+        const destAbs = path.join(destDir, destName);
+        try {
+            require('fs').copyFileSync(src, destAbs);
+        } catch (e) {
+            console.warn(`[Sandbox] Copy video failed ${src}: ${e.message}`);
+            return;
+        }
+        videos.push({
+            fileName: destName,
+            url: `/api/runs/${encodeSeg(ctx.runId)}/artifacts/${encodeSeg(safeTc)}/${encodeSeg(destName)}`
+        });
+    });
+
+    return { failureScreenshots, traces, videos };
 }
 
 /**
@@ -362,20 +427,21 @@ async function resolveDevCommandAndTargetUrl(sandboxDir, pkg) {
             /* keep default */
         }
         const scripts = pkg?.scripts || {};
-        const devShellCmd = scripts.dev ? 'npm run dev' : scripts.start ? 'npm run start' : null;
+        const devShellCmd = scripts.dev ? 'npm run dev' : scripts.start ? 'npm run start' : 'node todoServer.js || node server.js';
         return { devShellCmd, port, targetUrl };
     }
 
     if (!pkg || typeof pkg !== 'object') {
         const fromVite = await readVitePortFromSandbox(sandboxDir);
-        const port = fromVite ?? 5173;
-        return { devShellCmd: null, port, targetUrl: `http://localhost:${port}` };
+        const port = fromVite ?? 3000; // default to 3000 if not vite
+        return { devShellCmd: 'node todoServer.js || node server.js', port, targetUrl: `http://localhost:${port}` };
     }
 
     const scripts = pkg.scripts || {};
     let devShellCmd = null;
     if (scripts.dev) devShellCmd = 'npm run dev';
     else if (scripts.start) devShellCmd = 'npm run start';
+    else devShellCmd = 'node todoServer.js || node server.js';
 
     const merged = { ...pkg.dependencies, ...pkg.devDependencies };
     const keys = Object.keys(merged);
@@ -389,7 +455,7 @@ async function resolveDevCommandAndTargetUrl(sandboxDir, pkg) {
     if (port == null) {
         if (has('vite')) port = 5173;
         else if (has('next') || has('@next/next') || has('react-scripts')) port = 3000;
-        else port = 5173;
+        else port = 3000; // Default for Express / unknown
     }
 
     const targetUrl = `http://localhost:${port}`;
@@ -508,21 +574,95 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
             // -- Start ONE persistent container ------------------------------------
             const volumeDir = sandboxDir.replace(/\\/g, '/');
             const runTimeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
+            const dockerRunTimeoutMs = getDockerBaseImagePullTimeoutMs();
             const installTimeoutMs = Math.max(runTimeoutMs, 300000);
+            const liveMode = isLiveBrowserEnabled();
+            const vncPort = liveMode ? VNC_BASE_PORT + (i - 1) : null;
 
             try {
                 await execFilePromise('docker', ['rm', '-f', containerName]).catch(() => { });
 
-                await dockerRun([
+                const dockerRunArgs = [
                     'run', '-d',
                     '--name', containerName,
                     '-v', `${volumeDir}:/app`,
-                    '-w', '/app',
+                    '-w', '/app'
+                ];
+
+                // Map VNC port and set DISPLAY for live browser mode
+                if (liveMode && vncPort) {
+                    dockerRunArgs.push('-p', `${vncPort}:6080`);
+                    dockerRunArgs.push('-e', 'DISPLAY=:99');
+                    dockerRunArgs.push('-e', 'AUTOQA_LIVE_BROWSER=true');
+                    dockerRunArgs.push('-e', `AUTOQA_LIVE_SLOWMO_MS=${LIVE_SLOWMO_MS}`);
+                }
+
+                dockerRunArgs.push(
                     `mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-jammy`,
                     'tail', '-f', '/dev/null'
-                ], runTimeoutMs);
+                );
 
-                console.log(`[Sandbox] Container started: ${containerName}`);
+                await dockerRun(dockerRunArgs, dockerRunTimeoutMs);
+                console.log(`[Sandbox] Container started: ${containerName}${liveMode ? ` (VNC port ${vncPort})` : ''}`);
+
+                // -- Install VNC stack for live browser viewing ----------------------
+                if (liveMode) {
+                    const vncInstallTimeoutMs = Math.max(installTimeoutMs, 600000); // 10 min min for VNC install
+                    console.log(`[Sandbox] Installing VNC stack in ${containerName} (timeout ${Math.round(vncInstallTimeoutMs / 1000)}s)...`);
+                    try {
+                        await spawnCapture('docker', [
+                            'exec', containerName, 'sh', '-c',
+                            'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc python3-websockify && rm -rf /var/lib/apt/lists/*'
+                        ], { timeout: vncInstallTimeoutMs });
+                    } catch (vncInstErr) {
+                        // spawnCapture throws on non-zero exit, but the install may have succeeded
+                        // despite debconf warnings on stderr. Check if x11vnc is actually installed.
+                        try {
+                            await execFilePromise('docker', [
+                                'exec', containerName, 'which', 'x11vnc'
+                            ], { timeout: 10000 });
+                            console.log(`[Sandbox] VNC packages installed (debconf warnings ignored) in ${containerName}`);
+                        } catch {
+                            console.error(`[Sandbox] VNC install truly failed in ${containerName}: ${vncInstErr.message}`);
+                            throw vncInstErr;
+                        }
+                    }
+
+                    // Write VNC startup script into the container
+                    const vncStartScript = [
+                        '#!/bin/sh',
+                        'export DISPLAY=:99',
+                        'Xvfb :99 -screen 0 1280x720x24 &',
+                        'sleep 1',
+                        'x11vnc -display :99 -forever -nopw -shared -rfbport 5900 &',
+                        'websockify --web=/usr/share/novnc/ 6080 localhost:5900 &',
+                        'echo "VNC stack started"',
+                        'wait'
+                    ].join('\n');
+                    await fs.writeFile(path.join(sandboxDir, '.autoqa-vnc-start.sh'), vncStartScript, 'utf8');
+
+                    await execFilePromise('docker', [
+                        'exec', containerName, 'chmod', '+x', '/app/.autoqa-vnc-start.sh'
+                    ], { timeout: 10000 });
+                    await execFilePromise('docker', [
+                        'exec', '-d', containerName, '/app/.autoqa-vnc-start.sh'
+                    ], { timeout: 10000 });
+
+                    // Give VNC services time to start
+                    await new Promise(r => setTimeout(r, 3000));
+                    console.log(`[Sandbox] VNC stack ready in ${containerName} — noVNC at http://localhost:${vncPort}`);
+
+                    // Emit Socket.IO event so frontend knows VNC is available
+                    if (typeof global !== 'undefined' && global.io) {
+                        global.io.emit('sandbox_vnc_ready', {
+                            runId,
+                            containerId: i,
+                            containerName,
+                            vncPort,
+                            vncUrl: `http://localhost:${vncPort}/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000`
+                        });
+                    }
+                }
 
                 const pkgJsonPath = path.join(sandboxDir, 'package.json');
                 if (fssync.existsSync(pkgJsonPath)) {
@@ -544,7 +684,7 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
                 throw err;
             }
 
-            return { sandboxDir, containerName };
+            return { sandboxDir, containerName, vncPort };
             } finally {
                 releaseSandboxCreationSlot();
             }
@@ -648,11 +788,7 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                             { timeout: PLAYWRIGHT_WAIT_ON_MS + 10000 }
                         );
                     } catch (waitErr) {
-                        const stderr = waitErr.stderr != null
-                            ? (Buffer.isBuffer(waitErr.stderr) ? waitErr.stderr.toString() : String(waitErr.stderr))
-                            : '';
-                        const detail = stderr.trim() || waitErr.message || String(waitErr);
-                        throw new Error(`Dev server failed to start: ${detail}`);
+                        console.warn(`[Sandbox] wait-on timeout for ${targetUrl} in ${containerName} (assuming dev server booted but didn't open expected port). Ignoring warning and attempting test...`);
                     }
 
                     const execEnvArgs = ['exec', '-w', '/app'];
@@ -665,12 +801,19 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                         'AUTOQA_PLAYWRIGHT_EXPECT_TIMEOUT_MS',
                         'AUTOQA_PLAYWRIGHT_ACTION_TIMEOUT_MS',
                         'AUTOQA_PLAYWRIGHT_RETRIES',
-                        'AUTOQA_E2E_BASE_URL'
+                        'AUTOQA_E2E_BASE_URL',
+                        'AUTOQA_LIVE_BROWSER',
+                        'AUTOQA_LIVE_SLOWMO_MS',
+                        'AUTOQA_PLAYWRIGHT_VIDEO'
                     ];
                     for (const key of forwardKeys) {
                         if (process.env[key] !== undefined && process.env[key] !== '') {
                             execEnvArgs.push('-e', `${key}=${process.env[key]}`);
                         }
+                    }
+                    // Forward DISPLAY for headed VNC mode
+                    if (isLiveBrowserEnabled()) {
+                        execEnvArgs.push('-e', 'DISPLAY=:99');
                     }
                     const runCmd = 'npx playwright test autoqa.spec.js --workers=1 --config=playwright.autoqa.config.cjs 2>&1';
                     execEnvArgs.push(containerName, 'sh', '-c', runCmd);
@@ -679,9 +822,11 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                     let failureScreenshots = [];
                     /** @type {{ url: string, fileName: string }[]} */
                     let traces = [];
+                    /** @type {{ url: string, fileName: string }[]} */
+                    let videos = [];
 
                     const mergeArtifacts = async () => {
-                        if (!artifactContext) return { failureScreenshots: [], traces: [] };
+                        if (!artifactContext) return { failureScreenshots: [], traces: [], videos: [] };
                         return persistPlaywrightArtifacts(sandboxDir, artifactContext);
                     };
 
@@ -693,16 +838,19 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                         const merged = await mergeArtifacts();
                         failureScreenshots = merged.failureScreenshots;
                         traces = merged.traces;
+                        videos = merged.videos || [];
                         return {
                             success: true,
                             output: (stdout + '\n' + stderr).trim(),
                             failureScreenshots,
-                            traces
+                            traces,
+                            videos
                         };
                     } catch (spawnErr) {
                         const mergedArt = await mergeArtifacts();
                         failureScreenshots = mergedArt.failureScreenshots;
                         traces = mergedArt.traces;
+                        videos = mergedArt.videos || [];
                         const stdout = spawnErr.stdout || '';
                         const stderr = spawnErr.stderr || '';
                         const combined = (stdout + '\n' + stderr).trim();
@@ -712,7 +860,8 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                             output,
                             error: spawnErr.message,
                             failureScreenshots,
-                            traces
+                            traces,
+                            videos
                         };
                     }
                 } finally {

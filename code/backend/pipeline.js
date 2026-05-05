@@ -6,7 +6,7 @@ const { extractTextFromFiles } = require('./services/documentParserService');
 const { mapPrChangesToScenarios } = require('./services/prScenarioMappingService');
 const { classifyPrAsBugFix } = require('./services/prClassificationService');
 const { pruneFileContentForContext } = require('./services/astPrunerService');
-const { generateTestCasesForScenario, generateFallbackSmokeTests, repairTestCaseScript, setLlmRunContext } = require('./services/llmService');
+const { generateTestCasesForScenario, repairTestCaseScript, setLlmRunContext } = require('./services/llmService');
 const { CURRENT_SCHEMA_VERSION } = require('./schemas');
 
 const crypto = require('crypto');
@@ -21,10 +21,9 @@ const {
 } = require('./db');
 
 const MAX_HEAL_ATTEMPTS = 3;
-const FALLBACK_SCENARIO_ID = 'FALLBACK';
 
 // ---------------------------------------------------------------------------
-// PR file classification for fallback smoke tests (unmapped files)
+// PR file classification
 // ---------------------------------------------------------------------------
 function shouldSkipFileForFallback(filename) {
     const n = String(filename || '').replace(/\\/g, '/');
@@ -113,6 +112,12 @@ function createEventLogger(runId) {
             updateParams.events = [{ type: 'test_case_attempt', data, timestamp: new Date().toISOString() }];
         } else if (type === 'scenario_execution_updated') {
             updateParams.events = [{ type: 'scenario_execution_updated', data, timestamp: new Date().toISOString() }];
+        } else if (type === 'test_execution_started' || type === 'test_execution_ended') {
+            // Live browser tracking events — emit via Socket.IO only, no DB persistence needed
+            if (global.io) {
+                global.io.emit(type, { runId, ...data });
+            }
+            return; // Skip DB update for ephemeral execution tracking events
         }
 
         if (logsMsg) {
@@ -325,22 +330,50 @@ async function executeTestCaseWithRetries({
                 output: `[Syntax validation] ${syntaxCheck.error}`,
                 error: syntaxCheck.error,
                 failureScreenshots: [],
-                traces: []
+                traces: [],
+                videos: []
             };
         } else {
-            sandboxResult = await executeTest(
-                containerName,
-                sandboxDir,
-                testCase.language || 'javascript',
-                currentScript,
-                `test_${testCase.testCaseId}_attempt${attempt}.spec.${testCase.language === 'python' ? 'py' : 'js'}`,
-                testCase.testData || {},
-                {
-                    runId,
+            // Emit live execution tracking event for the browser viewer
+            sendEvent('test_execution_started', {
+                testCaseId: testCase.testCaseId,
+                scenarioId: testCase.scenarioId,
+                title: testCase.title,
+                attempt,
+                containerName
+            });
+
+            try {
+                sandboxResult = await executeTest(
+                    containerName,
+                    sandboxDir,
+                    testCase.language || 'javascript',
+                    currentScript,
+                    `test_${testCase.testCaseId}_attempt${attempt}.spec.${testCase.language === 'python' ? 'py' : 'js'}`,
+                    testCase.testData || {},
+                    {
+                        runId,
+                        testCaseId: testCase.testCaseId,
+                        attempt
+                    }
+                );
+            } catch (execErr) {
+                sandboxResult = {
+                    success: false,
+                    output: `[Sandbox executor error] ${execErr.message}`,
+                    error: execErr.message,
+                    failureScreenshots: [],
+                    traces: [],
+                    videos: []
+                };
+            } finally {
+                sendEvent('test_execution_ended', {
                     testCaseId: testCase.testCaseId,
-                    attempt
-                }
-            );
+                    scenarioId: testCase.scenarioId,
+                    status: sandboxResult?.success ? 'pass' : 'fail',
+                    containerName
+                });
+            }
         }
 
         const attemptEndedAt = new Date().toISOString();
@@ -386,6 +419,7 @@ async function executeTestCaseWithRetries({
                 output: sandboxResult.output,
                 failureScreenshots: sandboxResult.failureScreenshots || [],
                 traces: sandboxResult.traces || [],
+                videos: sandboxResult.videos || [],
                 regression: regressionStamp,
                 startedAt: attemptStartedAt,
                 endedAt: attemptEndedAt
@@ -397,7 +431,7 @@ async function executeTestCaseWithRetries({
                     : `[Sandbox] ${testCase.testCaseId}: PASS on attempt ${attempt}`
             });
             try {
-                if (healAttempts > 0 && attemptHistory.length > 0 && testCase.scenarioId !== FALLBACK_SCENARIO_ID) {
+                if (healAttempts > 0 && attemptHistory.length > 0) {
                     const lastFail = String(attemptHistory[attemptHistory.length - 1]?.failureOutput || '').slice(-2400);
                     const failureSignature = crypto.createHash('sha256').update(lastFail).digest('hex').slice(0, 48);
                     upsertHealPattern({
@@ -406,10 +440,8 @@ async function executeTestCaseWithRetries({
                         workingFixSummary: `Recovered after ${healAttempts} heal(s)`
                     });
                 }
-                if (testCase.scenarioId !== FALLBACK_SCENARIO_ID) {
-                    const fw = testCase.language === 'python' ? 'pytest' : 'jest';
-                    bumpReferenceExample(fw, '', currentScript);
-                }
+                const fw = testCase.language === 'python' ? 'pytest' : 'jest';
+                bumpReferenceExample(fw, '', currentScript);
             } catch (persistErr) {
                 sendEvent('log', { level: 'WARN', message: `[Pipeline] Pattern/reference promotion skipped: ${persistErr.message}` });
             }
@@ -443,6 +475,7 @@ async function executeTestCaseWithRetries({
             scriptSnapshot: currentScript,
             failureScreenshots: sandboxResult.failureScreenshots || [],
             traces: sandboxResult.traces || [],
+            videos: sandboxResult.videos || [],
             regression: regressionMode ? 'pending' : null,
             startedAt: attemptStartedAt,
             endedAt: attemptEndedAt
@@ -543,9 +576,7 @@ async function executeTestCaseWithRetries({
 
     updateTestCaseStatus(testCase.testCaseId, finalStatus);
     try {
-        if (testCase.scenarioId !== FALLBACK_SCENARIO_ID) {
-            incrementScenarioTestOutcome(testCase.scenarioId, finalStatus === 'pass');
-        }
+        incrementScenarioTestOutcome(testCase.scenarioId, finalStatus === 'pass');
     } catch (e) {
         console.warn('[Pipeline] incrementScenarioTestOutcome skipped:', e.message);
     }
@@ -793,23 +824,6 @@ async function runPipeline(runId, prUrl, repoFullName) {
                     .filter(Boolean)
             )
         );
-        const fallbackAlways = String(process.env.AUTOQA_FALLBACK_ALWAYS || '').toLowerCase() === 'true';
-        const maxFbRaw = parseInt(process.env.AUTOQA_FALLBACK_MAX_FILES || '10', 10);
-        const maxFallbackFiles = Number.isFinite(maxFbRaw) && maxFbRaw > 0 ? Math.min(maxFbRaw, 100) : 10;
-
-        let uncoveredForFallback = fallbackAlways
-            ? [...classifiedAll]
-            : classifiedAll.filter((f) => !coveredFilenames.has(f.filename));
-
-        uncoveredForFallback.sort((a, b) => {
-            const af = a.fileType === 'frontend' ? 0 : 1;
-            const bf = b.fileType === 'frontend' ? 0 : 1;
-            if (af !== bf) return af - bf;
-            return String(a.filename).localeCompare(String(b.filename));
-        });
-        uncoveredForFallback = uncoveredForFallback.slice(0, maxFallbackFiles);
-
-        const requireFallbackSmoke = uncoveredForFallback.length > 0;
 
         if (!hasMappedScenarios && classifiedAll.length === 0) {
             sendEvent('log', { level: 'WARN', message: 'No scenarios mapped and no testable PR files — nothing to run.' });
@@ -828,7 +842,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
         const enrichedCount = mappedScenarios.reduce((acc, m) => acc + (rtmById.has(m.scenarioId || m.id) ? 1 : 0), 0);
         sendEvent('log', {
             level: 'INFO',
-            message: `[Enrichment] Resolved ${enrichedCount}/${mappedScenarios.length} mapped scenario(s) against RTM rows (project "${rtmProjectKey || 'n/a'}").${requireFallbackSmoke ? ` Fallback smoke queued for ${uncoveredForFallback.length} file(s).` : ''}`
+            message: `[Enrichment] Resolved ${enrichedCount}/${mappedScenarios.length} mapped scenario(s) against RTM rows (project "${rtmProjectKey || 'n/a'}").`
         });
 
         // Phase 2.5 + 3 + Sandbox — run in parallel.
@@ -906,12 +920,6 @@ async function runPipeline(runId, prUrl, repoFullName) {
             })
         ].join('\n\n');
 
-        const contentByPath = new Map((codeContext.fullFiles || []).map((f) => [f.path, f.content]));
-        const uncoveredWithContent = uncoveredForFallback.map((u) => ({
-            ...u,
-            fullContent: contentByPath.get(u.filename) || ''
-        }));
-
         const prDiffSection = (prDetails.files || [])
             .map(f => `--- ${f.filename} ---\n${f.patch || '(no patch)'}`)
             .join('\n\n');
@@ -930,12 +938,14 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
         // ------------------------------------------------------------------
         // Regression path: PR classified as a bug fix — re-run existing test
-        // cases for every scenario in every epic the PR touches. Skip the
-        // normal generation loop.
+        // cases for every scenario in every epic the PR touches. Skip mapped
+        // scenario generation.
         // ------------------------------------------------------------------
         if (regressionFeatureEnabled && classification.isBugFix && mappedScenarios.length > 0) {
             sendEvent('log', { level: 'INFO', message: '[Pipeline] Entering epic-wide regression path (bug fix PR). Waiting for sandbox pool...' });
+            
             sendEvent('phase_update', { phase: 'Test Generation', status: 'skipped' });
+            
             runSummary.scenariosGeneratingLeft = 0;
 
             const sandboxPool = await sandboxTask;
@@ -975,87 +985,16 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('phase_update', { phase: 'Test Generation', status: 'running' });
         sendEvent('phase_update', { phase: 'Sandbox Testing', status: 'running' });
 
-        runSummary.scenariosGeneratingLeft = mappedScenarios.length + (requireFallbackSmoke ? 1 : 0);
+        runSummary.scenariosGeneratingLeft = mappedScenarios.length;
         emitSummary();
 
         const executionQueue = [];
         let isGenerationFinished = false;
-        let fallbackTestsQueued = 0;
         const scenarioResults = {};
 
         for (const m of mappedScenarios) {
             scenarioResults[m.id || m.scenarioId] = { passed: 0, failed: 0 };
         }
-        if (requireFallbackSmoke) {
-            scenarioResults[FALLBACK_SCENARIO_ID] = { passed: 0, failed: 0 };
-        }
-
-        const fallbackPromise = (async () => {
-            if (!requireFallbackSmoke) return;
-            sendEvent('scenario_execution_updated', {
-                scenarioId: FALLBACK_SCENARIO_ID,
-                status: 'generating',
-                totals: { passed: 0, failed: 0, running: 0 }
-            });
-            try {
-                const { smokeTests } = await generateFallbackSmokeTests(
-                    uncoveredWithContent,
-                    codeContextSection,
-                    { title: prDetails.title, branch: prDetails.headRef, repoFullName }
-                );
-                const persistedFallback = [];
-                for (const row of smokeTests || []) {
-                    const script = row.testScript != null ? String(row.testScript).trim() : '';
-                    if (!script) continue;
-                    fallbackTestsQueued++;
-                    const saved = {
-                        testCaseId: crypto.randomUUID(),
-                        scenarioId: FALLBACK_SCENARIO_ID,
-                        source: 'fallback',
-                        projectKey: linkedProject?.jiraProjectKey || '',
-                        runId,
-                        prUrl,
-                        title: `Smoke: ${row.filename}`,
-                        steps: [],
-                        testData: {},
-                        testScript: script,
-                        language: 'javascript',
-                        status: 'pending',
-                        version: 1,
-                        previousVersionId: null,
-                        codeFiles: [row.filename],
-                        healAttempts: 0,
-                        conversationId: null,
-                        latestResponseId: null,
-                        createdAt: new Date().toISOString(),
-                        schema_version: CURRENT_SCHEMA_VERSION
-                    };
-                    upsertTestCase(saved);
-                    persistedFallback.push(saved);
-                    executionQueue.push({
-                        scenarioId: FALLBACK_SCENARIO_ID,
-                        scenarioDescription: row.reason || 'Fallback smoke test',
-                        tc: saved
-                    });
-                    runSummary.testCaseCount++;
-                    runSummary.runningCount++;
-                }
-                sendEvent('test_cases_saved', {
-                    scenarioId: FALLBACK_SCENARIO_ID,
-                    count: persistedFallback.length,
-                    isRefinement: false,
-                    source: 'fallback'
-                });
-            } catch (fbErr) {
-                sendEvent('log', { level: 'ERROR', message: `[Fallback smoke] LLM or persist failed: ${fbErr.message}` });
-                if (scenarioResults[FALLBACK_SCENARIO_ID]) {
-                    scenarioResults[FALLBACK_SCENARIO_ID].failed++;
-                }
-            } finally {
-                runSummary.scenariosGeneratingLeft = Math.max(0, runSummary.scenariosGeneratingLeft - 1);
-                emitSummary();
-            }
-        })();
 
         // ------------------------------------------------------------------
         // Background Executor: Pulls generated test cases from the queue as 
@@ -1121,7 +1060,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
         })();
 
         // Map over all scenarios and run LLM generation in parallel
-        const generationPromises = [fallbackPromise, ...mappedScenarios.map(async (scenarioMapping) => {
+        const generationPromises = mappedScenarios.map(async (scenarioMapping) => {
             try {
             const scenarioId = scenarioMapping.id || scenarioMapping.scenarioId;
             // Merge RTM row (authoritative for description, type, priority,
@@ -1244,16 +1183,11 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 runSummary.scenariosGeneratingLeft = Math.max(0, runSummary.scenariosGeneratingLeft - 1);
                 emitSummary();
             }
-        })];
+        });
 
         // Wait for all scenarios to finish generating in parallel
         const generatedResults = (await Promise.all(generationPromises)).filter(Boolean);
 
-        if (requireFallbackSmoke && fallbackTestsQueued === 0 && scenarioResults[FALLBACK_SCENARIO_ID]) {
-            scenarioResults[FALLBACK_SCENARIO_ID].failed = Math.max(1, scenarioResults[FALLBACK_SCENARIO_ID].failed);
-            sendEvent('log', { level: 'WARN', message: '[Fallback smoke] No executable tests were produced — counted as failure for run rollup.' });
-        }
-        
         // Signal that no more test cases will be queued
         isGenerationFinished = true;
         sendEvent('phase_update', { phase: 'Test Generation', status: 'completed' });
@@ -1266,12 +1200,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
             const r = scenarioResults[sid];
             return r && r.failed === 0 && r.passed > 0;
         });
-        const fbAgg = scenarioResults[FALLBACK_SCENARIO_ID];
-        const fallbackRollupOk = !requireFallbackSmoke
-            ? true
-            : !!(fbAgg && fbAgg.failed === 0 && fbAgg.passed > 0);
 
-        overallSuccess = scenarioRollupOk && fallbackRollupOk;
+        overallSuccess = scenarioRollupOk;
 
         // Finalize statuses for Phase 5
         for (const m of mappedScenarios) {
@@ -1284,18 +1214,6 @@ async function runPipeline(runId, prUrl, repoFullName) {
             sendEvent('scenario_execution_updated', {
                 scenarioId,
                 status: scenarioStatus,
-                totals: { passed, failed, running: 0 }
-            });
-        }
-
-        if (requireFallbackSmoke && scenarioResults[FALLBACK_SCENARIO_ID]) {
-            const { passed, failed } = scenarioResults[FALLBACK_SCENARIO_ID];
-            const fbStatus = failed === 0 && passed > 0 ? 'pass'
-                : passed === 0 ? 'fail'
-                : 'partial';
-            sendEvent('scenario_execution_updated', {
-                scenarioId: FALLBACK_SCENARIO_ID,
-                status: fbStatus,
                 totals: { passed, failed, running: 0 }
             });
         }

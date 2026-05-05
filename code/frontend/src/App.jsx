@@ -17,15 +17,12 @@ export const useAppContext = () => useContext(AppContext);
 
 function App() {
   const [activeRuns, setActiveRuns] = useState([]);
-  const [settings, setSettings] = useState({
-    reasoningModel: 'gpt-5.4',
-    codingModel: 'gpt-5.4-mini',
-    largeContextModel: 'gpt-5.4'
-  });
   const [toast, setToast] = useState(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0); // For forcing child components to re-fetch data
   const [llmTraces, setLlmTraces] = useState([]);
+  const [vncContainers, setVncContainers] = useState([]); // Live browser VNC containers
+  const [liveExecution, setLiveExecution] = useState(null); // Currently executing test case
   const [darkMode, setDarkMode] = useState(() => {
     const stored = localStorage.getItem('darkMode');
     return stored === 'true';
@@ -94,29 +91,33 @@ function App() {
         setLlmTraces(prev => [...prev.slice(-199), trace]); // keep last 200
     });
 
+    // --- Live browser VNC events ---
+    socket.on('sandbox_vnc_ready', (data) => {
+        setVncContainers(prev => {
+            // Avoid duplicates
+            if (prev.some(c => c.containerId === data.containerId && c.runId === data.runId)) return prev;
+            return [...prev, data];
+        });
+    });
+
+    socket.on('run_updated', (updateData) => {
+        // Clear VNC containers when run completes
+        if (updateData.type === 'complete') {
+            setVncContainers([]);
+            setLiveExecution(null);
+        }
+    });
+
+    socket.on('test_execution_started', (data) => {
+        setLiveExecution(data);
+    });
+
+    socket.on('test_execution_ended', () => {
+        setLiveExecution(null);
+    });
+
     return () => socket.disconnect();
   }, []);
-
-  useEffect(() => {
-    const loadData = async () => {
-      try {
-        const storedSettings = localStorage.getItem('settings');
-        
-        if (storedSettings) {
-          setSettings(JSON.parse(storedSettings));
-        }
-      } catch (error) {
-        console.error('Error loading data:', error);
-      }
-    };
-    
-    loadData();
-  }, []);
-
-  // Persist settings to localStorage
-  useEffect(() => {
-    localStorage.setItem('settings', JSON.stringify(settings));
-  }, [settings]);
 
   const showToast = (message, type = 'info') => {
     setToast({ message, type });
@@ -136,22 +137,17 @@ function App() {
 
   const toggleDarkMode = () => setDarkMode(prev => !prev);
 
-  const updateSettings = (newSettings) => {
-    setSettings(newSettings);
-    showToast('Settings updated successfully!', 'success');
-  };
-
   const contextValue = {
     activeRuns,
     setActiveRuns,
-    settings,
-    updateSettings,
     showToast,
     sidebarCollapsed,
     setSidebarCollapsed,
     refreshKey, // Exporting to child components to trigger data refresh automatically
     llmTraces,
     setLlmTraces,
+    vncContainers,
+    liveExecution,
     darkMode,
     toggleDarkMode
   };

@@ -104,7 +104,7 @@ Assume project **P** links `ACME/acme-app` and Jira project **ACME**, with scena
 5. **`setLlmRunContext(runId)`** for the pipeline lifetime wires **SQLite LLM traces** + **per-run token rollups** (see [LLM traces and token rollups](#llm-traces-and-token-rollups)).
 6. **Parallel work:** `classifyPrAsBugFix` (if regression enabled) and **`buildCodeContext`** (full files, inferred tests, **dependency** text). Large files may be **pruned** ([`astPrunerService.js`](code/backend/services/astPrunerService.js)).
 7. **Branch — regression vs generation:**
-   - If **bug-fix** and **`REGRESSION_ENABLED`** **and at least one scenario was mapped:** [`runEpicRegression`](code/backend/pipeline.js) loads **existing** `test_cases` for epic scope, **skips** new LLM generation phase, executes all in sandbox with same heal loop. **Bug-fix PRs with zero mapped scenarios** do **not** take this shortcut (they use standard + fallback path instead of vacuous regression success).
+   - If **bug-fix** and **`REGRESSION_ENABLED`** **and at least one scenario was mapped:** [`runEpicRegression`](code/backend/pipeline.js) loads **existing** `test_cases` for epic scope, **skips per-scenario** LLM generation, executes them in sandbox with the same heal loop; then, when **`requireFallbackSmoke`** applies (**uncovered** files via **`AUTOQA_FALLBACK_*`** / mapping coverage), **`generateFallbackSmokeTests`** runs **after** regression on the **same** pool (**`scenarioId`:** **`FALLBACK`**). **Bug-fix PRs with zero mapped scenarios** do **not** take this shortcut (they use standard + fallback path instead of vacuous regression success).
    - Else: in parallel, optional **`generateFallbackSmokeTests`** ( **`qa:fallback:generate`** cache key) for **uncovered** PR files → **`test_cases`** with **`source: 'fallback'`**, **`scenarioId: 'FALLBACK'`**; then for each **mapped** scenario, **`generateTestCasesForScenario`** — instructions are stable for cache; **variable `input`** bundles scenario row, **diff**, **\[FULL FILE CONTENTS\]**, **deps**, optional **refinement** of prior script, **`[REFERENCE EXAMPLES]`** (non-cached few-shot). Results **upsert** `test_cases` with **conversation / response ids** for stateful heals (**`source: 'scenario'`** by default).
 8. **Syntax check** ([`validateSyntaxLocal`](code/backend/services/sandboxService.js)): cheap `new Function` / Python `ast` parse before Docker.
 9. **Sandbox pool** ([`createSandboxPool`](code/backend/services/sandboxService.js)): **`SANDBOX_MAX_CONCURRENT`** global semaphore; per pool slot, temp dir; **`git clone`** via **`http.extraHeader` Basic auth** (`x-access-token` + `GITHUB_TOKEN`) when configured—clone URL stays **`https://github.com/org/repo.git`** without embedding the secret in the URL string. **`npm install`** for app if `package.json`, preinstall **Jest**, **`@playwright/test@` + `PLAYWRIGHT_VERSION`**, **`wait-on`**, etc.
@@ -130,6 +130,9 @@ sequenceDiagram
       P->>L: generateTestCasesForScenario per mapped scenario
     else regression path
       P->>P: runEpicRegression reuse test_cases
+      opt requireFallbackSmoke
+        P->>L: generateFallbackSmokeTests then heal loop
+      end
     end
     P->>D: createSandboxPool · executeTest · heal loop
     P->>S: complete emit run_updated
@@ -230,7 +233,6 @@ QAPipeline/
     │   ├── SCHEMA_CHANGELOG.md
     │   ├── __tests__/
     │   │   ├── astPrunerService.test.js
-    │   │   ├── promptRankerService.test.js
     │   │   └── pipeline.integration.test.js
     │   ├── db.js
     │   ├── jiraPipeline.js
@@ -247,11 +249,9 @@ QAPipeline/
     │       ├── jiraService.js
     │       ├── jiraWebhookQueueService.js
     │       ├── llmService.js
-    │       ├── pipelineWorkerStub.js
     │       ├── prClassificationService.js
     │       ├── prScenarioMappingService.js
     │       ├── projectStore.js
-    │       ├── promptRankerService.js
     │       └── sandboxService.js
     ├── devscripts/          # operator utilities (see devscripts README)
     ├── e2e/                  # first-party Playwright (package.json, playwright.config.cjs, tests/)
@@ -283,7 +283,8 @@ QAPipeline/
 | `code/backend/uploads/` | Uploaded requirements / Jira docs |
 | `code/backend/data/artifacts/` | Failure screenshots & traces surfaced in UI |
 | OS temp `autoqa-sandbox/` | Ephemeral clone roots for Docker mounts |
-| `code/e2e/playwright-report/`, `code/e2e/test-results/` | Local Playwright output (often gitignored manually) |
+| `code/e2e/playwright-report/`, `code/e2e/test-results/` | Playwright output (**`code/e2e/test-results/`** is listed in **`.gitignore`**) |
+| `code/backend/__tests__/fixture-autoqa-smoke-db-*.db` | Temp SQLite files from **`pipeline.integration.test.js`** (ignored by **`.gitignore`**) |
 | `code/devscripts/seedSayaratJiraIssues.js` | Gitignored seed dataset for Sayarat helpers |
 
 ---
@@ -315,7 +316,7 @@ Numbers map **path → responsibility** (production code and tooling).
 |------|----------|
 | [`server.js`](code/backend/server.js) | Express routes (projects, runs, Jira, GitHub, uploads, webhooks—including **`GET /api/runs/:runId/llm-traces`**, **`GET /api/dlq`**, **`POST /api/dlq/:id/replay`**, **`GET /api/projects/:projectKey/heal-exhausted`**), Socket.IO attachment, smee client wiring, signature verification helpers, DLQ publishes on critical failures, **`webhook_deliveries`** idempotency. |
 | [`db.js`](code/backend/db.js) | SQLite schema/init (**`PRAGMA user_version`** migrations); CRUD for scenarios, runs, test cases, DLQ, story sync log, webhook deliveries, LLM traces, heal patterns, reference examples; **`getActiveRunByPrUrl`**; artifact URL helpers consumed by routes. |
-| [`pipeline.js`](code/backend/pipeline.js) | **`runPipeline`**: **`createRun`** with **`prUrl`**, **`setLlmRunContext`**, PR mapping (**`incrementScenarioMappingStats`**), **`classifyChangedFiles`** + optional **`generateFallbackSmokeTests`** (**`FALLBACK`** bucket), classification, code context, generation vs regression (regression only when **≥1** mapped scenario), sandbox executor + heal (**`upsertHealPattern`** / **`bumpReferenceExample`** skipped for **`scenarioId`** **`FALLBACK`**), **`overall_success`** rollup—event logging via **`createEventLogger`**. **`runEpicRegression`** for regression branch. |
+| [`pipeline.js`](code/backend/pipeline.js) | **`runPipeline`**: **`createRun`** with **`prUrl`**, **`setLlmRunContext`**, PR mapping (**`incrementScenarioMappingStats`**), **`classifyChangedFiles`** + optional **`generateFallbackSmokeTests`** (**`FALLBACK`** bucket) on the standard path—or **`runFallbackSmokeExecutionWithPool`** after **`runEpicRegression`** when applicable—classification, code context, generation vs regression (regression only when **≥1** mapped scenario), sandbox executor + heal (**`upsertHealPattern`** / **`bumpReferenceExample`** skipped for **`scenarioId`** **`FALLBACK`**), **`overall_success`** rollup—event logging via **`createEventLogger`**. **`runEpicRegression`** for regression branch. |
 | [`jiraPipeline.js`](code/backend/jiraPipeline.js) | **`runJiraPipeline`**: fetch issues/docs, call scenario LLM(s), upsert scenarios, Jira comments, emit progress. |
 | [`schemas.js`](code/backend/schemas.js) | Zod schemas validating API bodies (e.g. webhook payloads, project create); exports **`CURRENT_SCHEMA_VERSION`**. |
 | [`SCHEMA_CHANGELOG.md`](code/backend/SCHEMA_CHANGELOG.md) | Human changelog aligned with **`CURRENT_SCHEMA_VERSION`**. |
@@ -328,7 +329,6 @@ Numbers map **path → responsibility** (production code and tooling).
 | Path | Used for |
 |------|----------|
 | [`astPrunerService.test.js`](code/backend/__tests__/astPrunerService.test.js) | **`node --test`** coverage for large-file pruning heuristics. |
-| [`promptRankerService.test.js`](code/backend/__tests__/promptRankerService.test.js) | Ranking helper regression tests. |
 | [`pipeline.integration.test.js`](code/backend/__tests__/pipeline.integration.test.js) | Lightweight integration checks; **skips** on **`better-sqlite3`** NODE_MODULE_VERSION mismatch. |
 
 ### `code/backend/services`
@@ -341,8 +341,6 @@ Numbers map **path → responsibility** (production code and tooling).
 | [`jiraWebhookQueueService.js`](code/backend/services/jiraWebhookQueueService.js) | Serialized async queue for Jira-triggered jobs. |
 | [`prScenarioMappingService.js`](code/backend/services/prScenarioMappingService.js) | **`mapPrChangesToScenarios`**: builds prompts, parses structured mapping JSON. |
 | [`prClassificationService.js`](code/backend/services/prClassificationService.js) | **`classifyPrAsBugFix`** with Jira type short-circuit + LLM; optional **`REGRESSION_CLASSIFIER_JIRA_LLM_BLEND`**. |
-| [`promptRankerService.js`](code/backend/services/promptRankerService.js) | **`rankPromptVariants`** — ranking helper for automated tests (not yet imported by **`pipeline.js`**). |
-| [`pipelineWorkerStub.js`](code/backend/services/pipelineWorkerStub.js) | Stub module reserved for **`worker_threads`** pipeline offload (inactive). |
 | [`sandboxService.js`](code/backend/services/sandboxService.js) | **`createSandboxPool`**, **`executeTest`**, **`validateSyntaxLocal`**, **`cleanupSandboxPool`**, Playwright **`buildPlaywrightAutoqaConfigSource`**, artifact **`persistPlaywrightArtifacts`**, Windows-safe **`spawnCapture`**, Babel-assisted **dependency extraction** from test scripts for extra `npm installs`. **`PLAYWRIGHT_VERSION`** pins Docker + npm. |
 | [`astPrunerService.js`](code/backend/services/astPrunerService.js) | Structural pruning/summarization of large files before **`[FULL FILE CONTENTS]`** prompts. |
 | [`documentParserService.js`](code/backend/services/documentParserService.js) | Text extraction pipeline for PDF/Markdown/Office uploads used in Jira/sync flows. |
@@ -451,7 +449,7 @@ Routes of interest remain: `/api/jira/health`, `/api/jira/spaces`, `/api/project
 ## Workflow: GitHub PR to test run
 
 - **`POST /api/webhooks/github`** validates optional HMAC (**note:** implementation hashes **`JSON.stringify(req.body)`** when secret set—your GitHub configuration must match that behavior).
-- **Fallback smoke:** parallel to per-scenario generation, **`generateFallbackSmokeTests`** may add **`test_cases`** under **`scenarioId: 'FALLBACK'`** ([Run outcome semantics](#run-outcome-semantics)).
+- **Fallback smoke:** parallel to **per-scenario** generation **or** sequentially **after epic regression** when applicable, **`generateFallbackSmokeTests`** may add **`test_cases`** under **`scenarioId: 'FALLBACK'`** ([Run outcome semantics](#run-outcome-semantics)).
 
 | Phase (socket `phase_update`) | Meaning |
 |---------------------------------|--------|
@@ -461,7 +459,7 @@ Routes of interest remain: `/api/jira/health`, `/api/jira/spaces`, `/api/project
 | Code Context | File fetches + prompt assembly |
 | Sandbox Setup | Docker pool provisioning |
 | Syntax Validation | In-process AST/JS parse gate |
-| Test Generation | LLM authoring: **`generateFallbackSmokeTests`** (uncovered files) + **`generateTestCasesForScenario`** per mapped scenario (skipped in **epic regression** path when **≥1** scenario mapped) |
+| Test Generation | LLM authoring: **`generateFallbackSmokeTests`** (uncovered files; **parallel** with per-scenario work on the standard path, **after regression** when on the bug-fix + mapped path if **`requireFallbackSmoke`**) + **`generateTestCasesForScenario`** per mapped scenario (**skipped** on bug-fix regression path for mapped scenarios—not for optional fallback smoke) |
 | Sandbox Testing | `executeTest` iterations |
 | Test Healing | `repairTestCaseScript` cycles |
 | Regression Execution | `runEpicRegression` branch (only when PR is classified bug-fix **and** scenarios were mapped) |
@@ -476,7 +474,7 @@ Unchanged **core behavior**; **`REGRESSION_CLASSIFIER_JIRA_LLM_BLEND`** (see [Co
 
 - **`REGRESSION_ENABLED`** (string check in pipeline), **`REGRESSION_BUGFIX_CONFIDENCE_THRESHOLD`**, **`REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG`**, **`REGRESSION_CLASSIFIER_JIRA_LLM_BLEND`**
 - **`classifyPrAsBugFix`** merges Jira **Bug** shortcut with LLM textual classification (**blend** optional)
-- **`runEpicRegression`** runs only when **`REGRESSION_ENABLED`**, the PR is classified as a **bug-fix**, **and** **at least one** scenario was mapped; it replays existing **`test_cases`** across epic scope under PR head with heal loop; tracks **`clean_pass`**, **`adapted`**, **`regression_fail`** style outcomes internally. Zero mapped scenarios → standard path (including fallback smoke), not vacuum **regression** success.
+- **`runEpicRegression`** runs only when **`REGRESSION_ENABLED`**, the PR is classified as a **bug-fix**, **and** **at least one** scenario was mapped; it replays existing **`test_cases`** across epic scope under PR head with heal loop; tracks **`clean_pass`**, **`adapted`**, **`regression_fail`** style outcomes internally. When **`requireFallbackSmoke`**, the pipeline then runs **`runFallbackSmokeExecutionWithPool`** on the same sandbox pool before **`complete`**. Zero mapped scenarios → standard path (including fallback smoke), not vacuum **regression** success.
 
 Refer to [`prClassificationService.js`](code/backend/services/prClassificationService.js) and **`runEpicRegression`** inside [`pipeline.js`](code/backend/pipeline.js).
 
@@ -528,7 +526,7 @@ Budget trimming via **`ensureWithinBudget`** remains a **secondary** scissors on
 - **`complete.success`** mirrors **`overall_success`** on **`run_history`**: **`true`** only when every **scenario that participated in the rollup** finishes with **`failed === 0`** and **`passed > 0`** for that scenario’s tally. Sticky partial success (“one green anywhere makes the whole run green”) **does not** apply on the standard PR path—that rule is **`every` mapped / regressed scenario must be fully green**.
 - **Standard generation path (`runPipeline`):** rollup keys are **`mappedScenarios`** **plus** an optional **`FALLBACK`** bucket when **`requireFallbackSmoke`**. Each **mapped** scenario must have **at least one passing** sandbox run and **zero failures**. The **`FALLBACK`** bucket (unmapped-file smoke tests) follows the same rule when present. If fallback was required but **no** executable scripts were produced, the run treats that bucket as failed. If generation returns **zero** test cases for a mapped scenario after a successful LLM call, that scenario’s **`failed`** count is incremented and the run **`complete`**s with **`success: false`** unless another path short-circuits earlier.
 - **Zero-map:** if **`mappedScenarios.length === 0`** **and** there are **no** classifiable PR files for fallback smoke (**`classifyChangedFiles`**), the pipeline **`complete`**s **`success: true`** as an intentional noop. If there **are** classifiable files, **fallback smoke tests** run (**`generateFallbackSmokeTests`**, **`scenarioId`:** **`FALLBACK`**, **`source`:** **`fallback`**), and **`overall_success`** requires that bucket to have **`passed > 0`** with **`failed === 0`** (see standard path rollup below).
-- **Epic regression (`runEpicRegression`):** rollup is **per epic scenario that had runnable `test_cases`**. If **no epic** resolves from mappings, **no** stored tests exist, or the epic set yields **zero** runnable cases, the regression helper returns **`success: true`** (nothing to regress—distinct from “tests ran and failed”).
+- **Epic regression (`runEpicRegression`):** rollup is **per epic scenario that had runnable `test_cases`**. If **no epic** resolves from mappings, **no** stored tests exist, or the epic set yields **zero** runnable cases, the regression helper returns **`success: true`** (nothing to regress—distinct from “tests ran and failed”). When **`requireFallbackSmoke`** is also true, the **pipeline** `complete.success` is **`regressionResult.success` AND** the same **`FALLBACK`** bucket rules as the standard path (after fallback runs on the shared sandbox pool).
 - Interpret UI **`scenario_execution_updated`** “partial” statuses as **inter-run** aggregates (passed/failed counts), not **`overall_success`**.
 
 ---
@@ -589,11 +587,7 @@ Playwright / dev-server teardown: launcher writes **`/tmp/autoqa-dev.pid`** and 
 
 ### Backend tests (`npm test`)
 
-From **`code/backend`**, **`npm test`** runs **`node --test`** on **`__tests__/astPrunerService.test.js`**, **`promptRankerService.test.js`**, **`pipeline.integration.test.js`**. The integration suite **skips** when **`better-sqlite3`** native ABI mismatches **`process.versions.modules`** (`t.skip`), which often happens immediately after changing Node majors—run **`npm rebuild better-sqlite3`** locally.
-
-### `promptRankerService` and worker stub
-
-**`promptRankerService.js`** ranks file/diff snippets for hypothetical prompt budgeting via **`rankPromptVariants`**; it is covered by tests but **not** wired into **`pipeline.js`** context assembly yet. **`services/pipelineWorkerStub.js`** is a **placeholder** for a future **`worker_threads`** bridge (no concurrent pipeline isolation today).
+From **`code/backend`**, **`npm test`** runs **`node --test`** on **`__tests__/astPrunerService.test.js`** and **`__tests__/pipeline.integration.test.js`**. The integration suite **skips** when **`better-sqlite3`** native ABI mismatches **`process.versions.modules`** (`t.skip`), which often happens immediately after changing Node majors—run **`npm rebuild better-sqlite3`** locally.
 
 ---
 
@@ -751,7 +745,7 @@ Everything you run manually for setup / resets / integrations should assume path
 
 | npm script | Target file |
 |-----------|-------------|
-| `test` | **`node --test`** on **`__tests__/astPrunerService.test.js`**, **`__tests__/promptRankerService.test.js`**, **`__tests__/pipeline.integration.test.js`** |
+| `test` | **`node --test`** on **`__tests__/astPrunerService.test.js`**, **`__tests__/pipeline.integration.test.js`** |
 | `jira:check` | [`../devscripts/checkJiraApi.js`](code/devscripts/checkJiraApi.js) |
 | `jira:simulate-webhook` | [`../devscripts/simulateJiraWebhook.js`](code/devscripts/simulateJiraWebhook.js) |
 | `jira:delete-story-comments` | [`../devscripts/deleteJiraStoryComments.js`](code/devscripts/deleteJiraStoryComments.js) |

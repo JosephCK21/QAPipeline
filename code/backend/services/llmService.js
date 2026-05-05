@@ -76,6 +76,21 @@ const CACHE_KEYS = {
 };
 
 /**
+ * OpenAI Conversations API rejects concurrent requests on the same conversation id.
+ * All test cases under one scenario share one conversation anchor; parallel sandbox
+ * workers must not heal at the same time.
+ */
+const _healQueueTailByConversation = new Map();
+
+function runHealQueued(conversationId, fn) {
+    if (!conversationId) return fn();
+    const prev = _healQueueTailByConversation.get(conversationId) || Promise.resolve();
+    const next = prev.catch(() => {}).then(fn);
+    _healQueueTailByConversation.set(conversationId, next);
+    return next;
+}
+
+/**
  * Build the prompt-cache params to spread into a responses.create() call.
  * Always attaches a prompt_cache_key; includes prompt_cache_retention when a
  * non-default policy is configured.
@@ -628,32 +643,6 @@ const SCENARIO_RESPONSE_SCHEMA = {
 // free-form object (keys are arbitrary fixture group names), so this schema
 // is used in non-strict mode — it enforces the SHAPE of every other field
 // while leaving testData flexible. enforceTestData() remains the safety net.
-/** Fallback smoke tests — one row per changed file; testScript null when file is not testable. */
-const FALLBACK_SMOKE_RESPONSE_SCHEMA = {
-    type: 'object',
-    properties: {
-        smokeTests: {
-            type: 'array',
-            items: {
-                type: 'object',
-                properties: {
-                    filename:   { type: 'string' },
-                    fileType:   { type: 'string', enum: ['backend', 'frontend'] },
-                    testScript: {
-                        anyOf: [{ type: 'string' }, { type: 'null' }]
-                    },
-                    framework:  { type: 'string', enum: ['jest', 'playwright'] },
-                    reason:     { type: 'string' }
-                },
-                required: ['filename', 'fileType', 'testScript', 'framework', 'reason'],
-                additionalProperties: false
-            }
-        }
-    },
-    required: ['smokeTests'],
-    additionalProperties: false
-};
-
 const TESTCASE_RESPONSE_SCHEMA = {
     type: 'object',
     properties: {
@@ -662,14 +651,15 @@ const TESTCASE_RESPONSE_SCHEMA = {
             items: {
                 type: 'object',
                 properties: {
-                    testCaseId:   { type: 'string' },
-                    title:        { type: 'string' },
-                    steps:        { type: 'array', items: { type: 'string' } },
-                    testData:     { type: 'object', additionalProperties: true },
-                    testScript:   { type: 'string' },
-                    language:     { type: 'string', enum: ['javascript', 'python'] },
-                    codeFiles:    { type: 'array', items: { type: 'string' } },
-                    isRefinement: { type: 'boolean' }
+                    testCaseId:    { type: 'string' },
+                    title:         { type: 'string' },
+                    steps:         { type: 'array', items: { type: 'string' } },
+                    testData:      { type: 'object', additionalProperties: true },
+                    testScript:    { type: 'string' },
+                    language:      { type: 'string', enum: ['javascript', 'python'] },
+                    codeFiles:     { type: 'array', items: { type: 'string' } },
+                    isRefinement:  { type: 'boolean' },
+                    testStrategy:  { type: 'string', enum: ['e2e', 'api', 'linked'] }
                 },
                 required: ['testCaseId', 'title', 'steps', 'testData', 'testScript', 'language', 'codeFiles', 'isRefinement']
             }
@@ -701,12 +691,27 @@ Rules:
 
 const TESTCASE_GENERATION_INSTRUCTIONS = `You are an expert QA engineer generating concrete, executable test cases for an isolated Docker sandbox.
 
+TESTING STRATEGY — FRONTEND-FIRST (strictly enforced):
+- DEFAULT: Generate Playwright E2E tests that exercise the REAL UI in a headed browser.
+  Every scenario that involves user-visible behavior (forms, navigation, data display,
+  CRUD operations, authentication flows, page rendering) MUST be tested via Playwright.
+- LINKED FRONTEND+API: When a scenario involves both frontend UI and backend API calls
+  (e.g. form submission → POST /api/todos → result appears in list), the test MUST verify
+  the full round-trip through the UI. Do NOT test the API in isolation — interact with the
+  frontend that calls it and verify the result is visible on the page.
+- API-ONLY FALLBACK: Use Jest+supertest ONLY for pure backend endpoints with NO frontend
+  representation (e.g. webhook handlers, cron jobs, internal microservice APIs, CLI tools).
+  If the API has ANY frontend page that calls it, use Playwright instead.
+- NEVER generate both a Playwright test AND a Jest test for the same scenario.
+- Set testStrategy to "e2e" for Playwright tests, "linked" for Playwright tests that verify
+  API side-effects through the UI, or "api" for Jest+supertest API-only tests.
+
 SEPARATION OF DATA AND LOGIC (mandatory — strictly enforced):
 - Every concrete input value (emails, passwords, names, titles, IDs, amounts, priorities, etc.) MUST go into testData as named keys grouped by entity.
   Example testData: { "user": { "name": "Alice", "email": "alice@test.com", "password": "Pass123!" }, "todo": { "title": "Buy milk", "priority": "high" } }
 - testData must NEVER be empty {}. If the test uses any inputs at all, they belong in testData.
 - The testScript must NEVER hardcode these values inline. Always reference them via the testData variable.
-  Example script usage: request(app).post('/signup').send(testData.user)
+  Example: await page.getByLabel('Email').fill(testData.user.email);
 - The testData variable is injected automatically as the first line of the script at runtime: const testData = <your testData JSON>;
   Do NOT declare const testData = ... yourself in the testScript.
 
@@ -714,59 +719,42 @@ RULES FOR THE testScript:
 - The script runs inside an isolated Docker container where the full app source code is already present.
 - The app's dependencies (express, etc.) are pre-installed but the server is NOT already running for Jest/API tests.
 - AVAILABLE TEST PACKAGES (already installed): jest, supertest, jest-environment-node, @playwright/test, fs, path, vm, crypto, and Node.js built-ins.
-- DO NOT require or import packages beyond those above and the Playwright E2E exception below (no jsdom, cheerio, enzyme, testing-library, puppeteer).
+- DO NOT require or import packages beyond those above (no jsdom, cheerio, enzyme, testing-library, puppeteer).
 
-PLAYWRIGHT BROWSER E2E (use only when the scenario requires exercising the real UI in a browser — not for HTTP-only APIs):
+PLAYWRIGHT BROWSER E2E (primary — use for ALL UI-testable scenarios):
 - Use CommonJS: const { test, expect } = require('@playwright/test');
-- Prefer a single test('...', async ({ page }) => { ... }) inside one test.describe block for this file so failure screenshots map cleanly to one test case.
-- The sandbox starts the app dev server (npm run dev or npm start) and runs Playwright against it. Base URL: if process.env.AUTOQA_E2E_BASE_URL is set in the sandbox, use that (trimmed, no trailing slash) as the origin for page.goto; otherwise infer from codeContext (Vite 5173, Next/react-scripts often 3000).
-- Prefer web-first assertions on locators — e.g. await expect(page.getByRole('button', { name: /submit/i })).toBeVisible() — avoid expect(await page.textContent(...)) patterns unless unavoidable.
-- On failure, screenshots are captured automatically by the test runner — do not add page.screenshot() solely for failure diagnostics unless you need an extra mid-test capture.
-- Use accessibility-driven selectors (getByRole, getByLabel) when possible.
+- Structure: one test.describe block containing 1-3 focused test() calls per file.
+- The sandbox starts the app dev server (npm run dev or npm start) and runs Playwright against it.
+- Base URL: use process.env.AUTOQA_E2E_BASE_URL if set (trimmed, no trailing slash); otherwise infer from codeContext (Vite → 5173, Next/react-scripts → 3000).
+- Prefer web-first assertions on locators: await expect(page.getByRole('button', { name: /submit/i })).toBeVisible()
+- Use accessibility-driven selectors (getByRole, getByLabel, getByPlaceholder, getByText) over CSS selectors.
+- For linked tests: interact with the UI, then verify the result is visible in the UI.
+- On failure, screenshots and video are captured automatically — do not add page.screenshot() solely for diagnostics.
+- Tests run in headed mode with a live browser viewer — keep actions clear and sequential.
 
-Jest + supertest (default for HTTP APIs):
-- For Node.js Express (and other HTTP frameworks exposed as an app or server): you MUST use "supertest" only — require the server module, pass it to supertest, and do NOT call app.listen() yourself.
+Jest + supertest (API-ONLY fallback — use ONLY when no frontend UI exists for the endpoint):
+- For Node.js Express: use "supertest" only — require the server module, pass it to supertest, do NOT call app.listen().
   Example: const request = require('supertest'); const app = require('./todoServer'); const res = await request(app).post('/todos').send(testData.todo);
-- FORBIDDEN for Express HTTP APIs: reaching into Express internals (e.g. app._router, layer.route, walking middleware stacks, invokeRoute helpers, or hand-rolled req/res mocks). Supertest is the only allowed way to hit HTTP routes unless the app is genuinely non-HTTP.
-- Jest structure: wrap tests in describe() and it() (or test()). When using supertest, use async it('...', async () => { ... }) and await every request(...) chain so promises are never dropped. Use expect() for assertions.
-- Naming hygiene: never use the same identifier for a helper function and a const/let (e.g. do NOT declare function createRes() and later const createRes = ... — that is a SyntaxError). Use distinct names: loginRes, createTodoRes, listRes, etc.
-- Authorization: match the real app from codeContext (e.g. if the server reads the raw token from the Authorization header, send .set('Authorization', token) and do NOT add a "Bearer " prefix unless the server explicitly strips it).
-- Never make raw HTTP calls to localhost URLs or assume a server is running externally.
+- FORBIDDEN: reaching into Express internals (app._router, middleware walking, hand-rolled req/res mocks).
+- Jest structure: wrap tests in describe() and it() with async/await. Use expect() for assertions.
+- Naming hygiene: never use the same identifier for a helper function and a const/let.
 - Use CommonJS require() style (not ES modules import).
 - Never re-declare testData — it is already available as a variable.
 
 SERVER CLEANUP (mandatory — prevents Jest from hanging on open handles):
 - Tests run with --forceExit and --runInBand, but you MUST still ensure clean teardown.
-- If you store a reference to a server or HTTP agent, close it in afterAll: afterAll(() => { if (server) server.close(); });
-- For supertest against an app (not a running server), supertest manages connections automatically, but add afterAll as a safety net.
+- If you store a reference to a server or HTTP agent, close it in afterAll.
 - NEVER leave setInterval, setTimeout, or open socket/database connections running after tests complete.
 
 FILE-BASED STORAGE APPS (important for apps using JSON file storage):
 - If the app under test uses file-based storage (e.g. JSON files like todos.json, users.json), the sandbox resets these files to empty state ([] or {}) before each test execution.
 - Each test script starts with a CLEAN, EMPTY data store. Do NOT assume any pre-existing data.
-- Your test must create all the data it needs (e.g. signup a user, then login, then create todos) — never assume users or records already exist.
-- If tests share state within a single describe block, use beforeAll/beforeEach to set up required data.
-- Use unique test data values per test case to reduce collision risk if tests run in any order.
+- Your test must create all the data it needs (e.g. signup a user, then login, then create todos).
+- Use unique test data values per test case to reduce collision risk.
 
 OUTPUT FORMAT:
 Return a JSON object with a single top-level key "testCases" whose value is an array of 2-4 test case objects.
-Each test case object must have: testCaseId, title, steps, testData, testScript, language, codeFiles, isRefinement.`;
-
-const FALLBACK_SMOKE_INSTRUCTIONS = `You are an expert QA engineer generating lightweight smoke tests for code changes that have no requirements traceability coverage.
-
-For each changed file provided, generate exactly one test that:
-- For BACKEND files (.js/.ts API routes, services, utilities): uses Jest + supertest or plain Jest unit test style. Test the primary export or the most changed function. If it is an Express route handler, test that the route responds with the correct HTTP status for a happy-path call. If it is a utility or service, test the primary function with representative inputs.
-- For FRONTEND files (.jsx/.tsx/.vue, components, pages): uses Playwright Test (CommonJS require style). Navigate to the page or render the component if a URL can be inferred from the filename (e.g. pages/Login.jsx → baseURL + /login). Assert that key elements are visible: headings, form fields, primary buttons. Use getByRole and getByLabel locators. Always use the baseURL from the Playwright config — never hardcode a port.
-
-Rules:
-- One test file per changed file. Keep it short: one describe block, two to three it/test cases maximum.
-- Do not import from paths you cannot verify exist. Stick to the file being tested and standard library imports.
-- Do not use test.only or describe.only.
-- Backend tests: use jest, jest-environment-node, supertest — all are preinstalled.
-- Frontend tests: use @playwright/test CommonJS require — it is preinstalled. The baseURL is set in the Playwright config.
-- If the file is a config file, migration, or type definition with no testable logic, return null for that file's script and explain why in the reason field.
-
-Return a JSON object with key "smokeTests" whose value is an array of objects with: filename, fileType ('backend' | 'frontend'), testScript (string or null), framework ('jest' | 'playwright'), reason (one sentence).`;
+Each test case object must have: testCaseId, title, steps, testData, testScript, language, codeFiles, isRefinement, testStrategy.`;
 
 const HEAL_INSTRUCTIONS = `You are an expert test engineer fixing a failing test script for an isolated Docker sandbox.
 The testData variable is already injected as the first line at runtime — do NOT redeclare it.
@@ -784,17 +772,29 @@ Return ONLY the corrected script body. No explanation, no markdown fences, no co
  * Injected only into generateTestCasesForScenario user input ([REFERENCE EXAMPLES] block).
  */
 const FEW_SHOT_EXAMPLES = {
-    javascript: `jest.mock('../lib/widget', () => ({
-  load: jest.fn(() => ({ id: 'mock-record', ok: true }))
-}));
+    javascript: `const { test, expect } = require('@playwright/test');
 
-describe('StructuralExample_notTheAppUnderTest', () => {
-  it('uses a mock and reads inputs from injected testData only', () => {
-    const widget = require('../lib/widget');
-    const result = widget.load(testData.req.id);
+test.describe('StructuralExample_FrontendFirst', () => {
+  test('creates a record through the UI and verifies it appears', async ({ page }) => {
+    // Navigate to the app
+    await page.goto('/');
 
-    expect(widget.load).toHaveBeenCalledWith(testData.req.id);
-    expect(result.ok).toBe(true);
+    // Interact with the real UI using accessibility-driven selectors
+    await page.getByPlaceholder('Enter title').fill(testData.item.title);
+    await page.getByRole('button', { name: /add/i }).click();
+
+    // Verify the result is visible in the UI
+    await expect(page.getByText(testData.item.title)).toBeVisible();
+  });
+
+  test('validates required field shows error on empty submit', async ({ page }) => {
+    await page.goto('/');
+
+    // Submit empty form
+    await page.getByRole('button', { name: /add/i }).click();
+
+    // Verify error feedback appears
+    await expect(page.getByText(/required/i)).toBeVisible();
   });
 });`,
     python: `import pytest
@@ -842,6 +842,37 @@ def test_structural_fixture_and_mock(test_data):
  * @param {string} opts.previousInteractionId   - when resuming a prior test-case generation
  *                                                 (e.g. refinement) without a conversation id.
  */
+
+/**
+ * Detects frontend files and client-side JS patterns in the provided code context.
+ * Used to explicitly signal the LLM to write Playwright E2E tests instead of API tests.
+ */
+function detectFrontendFiles(codeContextSection) {
+    const FRONTEND_EXTS = /\.(html|htm|jsx|tsx|vue|svelte|css|scss)$/i;
+    const FRONTEND_DIRS = /\b(public|src|pages|components|views|client|frontend)\b/i;
+    const CLIENT_JS_PATTERNS = /\b(document\.|window\.|addEventListener|querySelector|getElementById|fetch\(|XMLHttpRequest|React\.|createApp|mount\()\b/;
+    
+    const lines = (codeContextSection || '').split('\n');
+    const frontendFiles = [];
+    
+    for (const line of lines) {
+        const match = line.match(/^=== FILE: (.+?) ===/);
+        if (match) {
+            const filePath = match[1];
+            if (FRONTEND_EXTS.test(filePath) || FRONTEND_DIRS.test(filePath)) {
+                frontendFiles.push(filePath);
+            }
+        }
+    }
+    
+    const hasClientPatterns = CLIENT_JS_PATTERNS.test(codeContextSection);
+    
+    return {
+        frontendFiles,
+        hasFrontendSignals: frontendFiles.length > 0 || hasClientPatterns
+    };
+}
+
 async function generateTestCasesForScenario({
     scenario,
     codeContextSection,
@@ -885,12 +916,21 @@ async function generateTestCasesForScenario({
         : '';
     const scenarioTitleLine = scenario.title ? `\n  Title: ${scenario.title}` : '';
 
+    const { frontendFiles, hasFrontendSignals } = detectFrontendFiles(codeContextSection);
+    const frontendDetectionSection = hasFrontendSignals
+        ? `\n[FRONTEND DETECTION]:
+Frontend files detected in this codebase: ${frontendFiles.slice(0, 5).join(', ')}${frontendFiles.length > 5 ? ' and more' : ''}
+→ This app HAS a frontend UI. You MUST use Playwright for ALL test cases.
+  Do NOT use Jest+supertest. Test through the browser UI.
+  If the scenario describes REST/API actions (e.g. "POST /todos"), you MUST translate these into corresponding UI interactions. Instead of sending an HTTP request, script the browser to fill out the relevant form or click the relevant button that triggers that submission.`
+        : '';
+
     const rawPrompt = `Scenario to cover:
   ID: ${scenario.id}${scenarioTitleLine}
   Description: ${scenario.description || '(no description provided)'}
   Type: ${scenario.type || '(unspecified)'}
   Priority: ${scenario.priority || 'Medium'}${acRef}
-
+${frontendDetectionSection}
 ${refinementHint}${alreadyCoveredSection}
 [CHANGED CODE DIFF]:
 ${prDiffSection || 'No diff available.'}
@@ -913,7 +953,8 @@ ${FEW_SHOT_EXAMPLES.python}
 ${(() => {
         try {
             const rows = [
-                ...db.getTopReferenceExamples('jest', 2),
+                ...db.getTopReferenceExamples('playwright', 2),
+                ...db.getTopReferenceExamples('jest', 0),
                 ...db.getTopReferenceExamples('pytest', 1)
             ];
             if (!rows.length) return '';
@@ -932,7 +973,8 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
 - Have a complete, self-contained, runnable testScript (raw code, no markdown fences)
 - Set language to "javascript" or "python" based on what matches the codebase
 - List the codeFiles array with paths of PR files this test case exercises
-- Set isRefinement: ${refinementContext ? 'true' : 'false'}`;
+- Set isRefinement: ${refinementContext ? 'true' : 'false'}
+${hasFrontendSignals ? '\nCRITICAL OVERRIDE: This codebase has frontend files. Generate ONLY Playwright E2E tests.\nDo NOT generate Jest+supertest tests. testStrategy must be "e2e" or "linked" for every test case.\n' : ''}`;
 
     // Soft-trim oversized PRs before token guard so we never hard-fail the pipeline.
     const prompt = ensureWithinBudget(rawPrompt, PROMPT_TOKEN_BUDGET, 'generateTestCasesForScenario');
@@ -1026,96 +1068,6 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
     };
 }
 
-const FALLBACK_TRUNC = 4000;
-
-/**
- * Lightweight smoke tests for PR files without Jira scenario coverage.
- *
- * @param {Array<{ filename: string, patch?: string, fullContent?: string, fileType: 'backend'|'frontend' }>} changedFiles
- * @param {string} codeContextSection
- * @param {{ title?: string, branch?: string, repoFullName?: string }} prMeta
- * @returns {Promise<{ smokeTests: Array<{ filename, fileType, testScript: string|null, framework, reason }> }>}
- */
-async function generateFallbackSmokeTests(changedFiles, codeContextSection, prMeta = {}) {
-    const traceCorrelationKey = 'fallback-smoke-batch';
-    const filesBlock = (changedFiles || []).map((f) => {
-        const patch = typeof f.patch === 'string'
-            ? f.patch.slice(0, FALLBACK_TRUNC)
-            : '';
-        const full = typeof f.fullContent === 'string'
-            ? f.fullContent.slice(0, FALLBACK_TRUNC)
-            : '';
-        return `FILE: ${f.filename}
-TYPE: ${f.fileType || 'backend'}
-PATCH (truncated):\n${patch || '(none)'}
-FULL CONTENT (truncated):\n${full || '(none)'}`;
-    }).join('\n---\n');
-
-    const rawPrompt = `PR title: ${prMeta.title || '(unknown)'}
-PR branch: ${prMeta.branch || '(unknown)'}
-Repository: ${prMeta.repoFullName || '(unknown)'}
-
-CHANGED FILES (generate one smokeTests entry per file below):
-${filesBlock}
-
-[FULL FILE CONTENTS / REPO CONTEXT]:
-${codeContextSection || 'No additional context.'}
-
-Return JSON only: { "smokeTests": [ ... ] } with one object per input file (same filename), following the schema in your instructions.`;
-
-    const prompt = ensureWithinBudget(rawPrompt, PROMPT_TOKEN_BUDGET, 'generateFallbackSmokeTests');
-    await assertTokenLimit(prompt, DEFAULT_MODEL);
-
-    const stateful = buildStatefulParams({});
-    const finalInput = applyStatefulInput(prompt, stateful);
-
-    const _fbStartMs = Date.now();
-    emitLlmTrace({
-        caller: 'generateFallbackSmokeTests',
-        model: DEFAULT_MODEL,
-        phase: 'request',
-        prompt,
-        correlationKey: traceCorrelationKey
-    });
-
-    const response = await client.responses.create({
-        model: DEFAULT_MODEL,
-        instructions: FALLBACK_SMOKE_INSTRUCTIONS,
-        input: finalInput,
-        text: {
-            format: {
-                type: 'json_schema',
-                name: 'FallbackSmokeTests',
-                schema: FALLBACK_SMOKE_RESPONSE_SCHEMA,
-                strict: false
-            },
-            verbosity: OUTPUT_VERBOSITY
-        },
-        reasoning: { effort: TESTCASE_EFFORT, summary: REASONING_SUMMARY },
-        ...buildCacheParams(CACHE_KEYS.FALLBACK_SMOKE),
-        ...stripInternalParams(stateful)
-    });
-
-    const text = extractResponseText(response);
-    const reasoningSummary = extractReasoningSummary(response);
-    const usage = extractUsage(response);
-    emitLlmTrace({
-        caller: 'generateFallbackSmokeTests',
-        model: DEFAULT_MODEL,
-        phase: 'response',
-        response: text,
-        reasoningSummary,
-        durationMs: Date.now() - _fbStartMs,
-        responseId: response.id,
-        usage,
-        correlationKey: traceCorrelationKey
-    });
-
-    const parsed = safeParseJSON(text);
-    const smokeTests = Array.isArray(parsed?.smokeTests) ? parsed.smokeTests : [];
-    return { smokeTests };
-}
-
 /**
  * Given a failing test case, produce a repaired script.
  * Returns { repairedScript, interactionId, conversationId, reasoningSummary }
@@ -1150,6 +1102,7 @@ async function repairTestCaseScript({
         throw new Error('repairTestCaseScript: testCase.testCaseId is required');
     }
 
+    return runHealQueued(conversationId, async () => {
     let healPatternSection = '';
     try {
         if (testCase?.scenarioId) {
@@ -1237,14 +1190,29 @@ If you already tried an approach in a previous attempt and it failed, use a diff
         correlationKey: testCase.testCaseId
     });
 
-    const callOpenAI = (statefulParams, inputPayload) => client.responses.create({
-        model: DEFAULT_MODEL,
-        instructions: HEAL_INSTRUCTIONS,
-        input: inputPayload,
-        reasoning: { effort: HEAL_EFFORT, summary: REASONING_SUMMARY },
-        ...buildCacheParams(CACHE_KEYS.TESTCASE_HEAL),
-        ...stripInternalParams(statefulParams)
-    });
+    const callOpenAI = async (statefulParams, inputPayload) => {
+        const MAX_BUSY_RETRIES = 5;
+        for (let busyAttempt = 0; ; busyAttempt++) {
+            try {
+                return await client.responses.create({
+                    model: DEFAULT_MODEL,
+                    instructions: HEAL_INSTRUCTIONS,
+                    input: inputPayload,
+                    reasoning: { effort: HEAL_EFFORT, summary: REASONING_SUMMARY },
+                    ...buildCacheParams(CACHE_KEYS.TESTCASE_HEAL),
+                    ...stripInternalParams(statefulParams)
+                });
+            } catch (err) {
+                if (err?.error?.message?.includes('Another process is currently operating on this conversation') && busyAttempt < MAX_BUSY_RETRIES) {
+                    const delayMs = Math.pow(2, busyAttempt) * 2000;
+                    console.warn(`[LLM] Heal conversation busy — retrying in ${delayMs}ms (attempt ${busyAttempt + 1}/${MAX_BUSY_RETRIES})`);
+                    await new Promise(r => setTimeout(r, delayMs));
+                    continue;
+                }
+                throw err;
+            }
+        }
+    };
 
     let response;
     let chainWasStale = false;
@@ -1320,6 +1288,7 @@ If you already tried an approach in a previous attempt and it failed, use a diff
         reasoningItems,
         usage
     };
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,6 +1474,5 @@ module.exports = {
     generateTestScenarios,
     generateTestScenariosForEpic,
     generateTestCasesForScenario,
-    generateFallbackSmokeTests,
     repairTestCaseScript
 };

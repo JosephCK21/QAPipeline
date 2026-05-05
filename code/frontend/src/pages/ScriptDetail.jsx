@@ -6,6 +6,8 @@ import {
   ChevronRight, ChevronDown, Code2, Database, ListChecks, RefreshCw,
   Activity, GitBranch, Terminal, ShieldAlert, Wrench, ImageIcon, Film
 } from 'lucide-react';
+import LiveBrowserPanel from '../components/LiveBrowserPanel';
+import VideoPlayer from '../components/VideoPlayer';
 
 const API_BASE = typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL
   ? String(import.meta.env.VITE_API_BASE_URL).replace(/\/$/, '')
@@ -182,6 +184,9 @@ function AttemptRow({ attempt }) {
 function TestCasePanel({ testCase, attempts }) {
   const [tab, setTab] = useState('steps');
 
+  // Collect all video recordings from attempt events
+  const allVideos = attempts.flatMap(att => att.videos || []);
+
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
@@ -250,7 +255,7 @@ function TestCasePanel({ testCase, attempts }) {
 
       {/* Tabs */}
       <div className="flex border-b border-[#DFE1E6] bg-[#F4F5F7]">
-        {[['steps', 'Steps'], ['script', 'Script'], ['data', 'Test Data'], ['attempts', `Attempts (${attempts.length})`]].map(([key, label]) => (
+        {[['steps', 'Steps'], ['script', 'Script'], ['data', 'Test Data'], ['video', 'Video'], ['attempts', `Attempts (${attempts.length})`]].map(([key, label]) => (
           <button
             key={key}
             onClick={() => setTab(key)}
@@ -300,6 +305,10 @@ function TestCasePanel({ testCase, attempts }) {
             : <p className="text-sm text-[#8993A4] italic">No test data.</p>
         )}
 
+        {tab === 'video' && (
+          <VideoPlayer videos={allVideos} />
+        )}
+
         {tab === 'attempts' && (
           <div className="space-y-2">
             {attempts.length === 0
@@ -318,8 +327,11 @@ function TestCasePanel({ testCase, attempts }) {
 // ---------------------------------------------------------------------------
 function ScriptDetail() {
   const { projectId, runId } = useParams();
-  const { refreshKey } = useAppContext();
+  const { refreshKey, vncContainers, liveExecution } = useAppContext();
 
+  const vncContainersForRun = (vncContainers || []).filter((c) => c.runId === runId);
+  const liveExecutionForRun =
+    liveExecution && liveExecution.runId === runId ? liveExecution : null;
   const [runData, setRunData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -470,10 +482,10 @@ function ScriptDetail() {
         </div>
       </div>
 
-      {/* Main content: scenario list + test case panel side-by-side */}
+      {/* Main content: 3-column layout — scenario list + live browser + test case panel */}
       <div className="flex flex-1 gap-4 min-h-0 overflow-hidden" style={{ minHeight: '520px' }}>
         {/* Left: Scenario list */}
-        <div className="w-full md:w-[340px] flex-shrink-0 bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg overflow-y-auto">
+        <div className="w-full md:w-[280px] flex-shrink-0 bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg overflow-y-auto">
           <div className="p-3 border-b border-[#DFE1E6]">
             <p className="text-xs font-bold text-[#5E6C84] uppercase tracking-wider">Scenarios & Test Cases</p>
           </div>
@@ -552,8 +564,17 @@ function ScriptDetail() {
           )}
         </div>
 
+        {/* Center: Live Browser Panel */}
+        <div className="hidden lg:flex flex-1 min-w-0">
+          <LiveBrowserPanel
+            vncContainers={vncContainersForRun}
+            currentExecution={liveExecutionForRun}
+            isRunning={isRunning}
+          />
+        </div>
+
         {/* Right: Test Case Detail */}
-        <div className="flex-1 bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg overflow-hidden">
+        <div className="flex-1 lg:w-[380px] lg:flex-none bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg overflow-hidden">
           {selectedTestCase ? (
             <TestCasePanel
               testCase={selectedTestCase}

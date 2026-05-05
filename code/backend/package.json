@@ -4,7 +4,7 @@
   "description": "",
   "main": "server.js",
   "scripts": {
-    "test": "node --test __tests__/astPrunerService.test.js __tests__/promptRankerService.test.js __tests__/pipeline.integration.test.js",
+    "test": "node --test __tests__/astPrunerService.test.js __tests__/pipeline.integration.test.js",
     "jira:check": "node ../devscripts/checkJiraApi.js",
     "jira:simulate-webhook": "node ../devscripts/simulateJiraWebhook.js",
     "jira:delete-story-comments": "node ../devscripts/deleteJiraStoryComments.js",

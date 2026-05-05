@@ -895,7 +895,7 @@ app.get('/api/jira/health', async (req, res) => {
 
 app.get('/api/runs/:runId/artifacts/:testCaseKey/:artifactFile', (req, res) => {
     try {
-        const ARTIFACT_NAME_RE = /^[a-zA-Z0-9._-]+\.(png|zip)$/;
+        const ARTIFACT_NAME_RE = /^[a-zA-Z0-9._-]+\.(png|zip|webm)$/;
         const { runId, testCaseKey, artifactFile } = req.params;
         if (!ARTIFACT_NAME_RE.test(artifactFile)) {
             return res.status(400).json({ error: 'Invalid artifact name' });
@@ -909,7 +909,10 @@ app.get('/api/runs/:runId/artifacts/:testCaseKey/:artifactFile', (req, res) => {
             return res.status(404).json({ error: 'Not found' });
         }
         const ext = path.extname(artifactFile).toLowerCase();
-        const ct = ext === '.png' ? 'image/png' : ext === '.zip' ? 'application/zip' : 'application/octet-stream';
+        const ct = ext === '.png' ? 'image/png'
+            : ext === '.zip' ? 'application/zip'
+                : ext === '.webm' ? 'video/webm'
+                    : 'application/octet-stream';
         res.setHeader('Content-Type', ct);
         fs.createReadStream(resolved).pipe(res);
     } catch (err) {
