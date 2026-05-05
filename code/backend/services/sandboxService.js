@@ -139,6 +139,149 @@ function getDockerBaseImagePullTimeoutMs() {
 
 const PLAYWRIGHT_WAIT_ON_MS = 30000;
 
+/** Written into the clone so executeTest uses the same app root as createSandboxPool */
+const APP_ROOT_MARKER = '.autoqa-app-root';
+const MAX_APP_DISCOVERY_DEPTH = 6;
+const SKIP_APP_SCAN_DIRS = new Set([
+    'node_modules', '.git', '.next', 'dist', 'build', 'coverage', '.nuxt',
+    'out', '__pycache__', 'venv', '.venv', 'target', 'playwright-report'
+]);
+
+/**
+ * @param {object|null} pkg
+ * @returns {boolean}
+ */
+function isWebAppPackageJson(pkg) {
+    if (!pkg || typeof pkg !== 'object') return false;
+    const scripts = pkg.scripts || {};
+    if (!scripts.dev && !scripts.start) return false;
+    const d = { ...pkg.dependencies, ...pkg.devDependencies };
+    if (!d || typeof d !== 'object') return false;
+    if (d.next || d.vite || d['react-scripts']) return true;
+    for (const k of Object.keys(d)) {
+        if (k.startsWith('@next/')) return true;
+    }
+    return false;
+}
+
+/**
+ * @param {string} absDir
+ * @returns {object|null}
+ */
+function tryReadPackageJsonSync(absDir) {
+    const p = path.join(absDir, 'package.json');
+    try {
+        const raw = fssync.readFileSync(p, 'utf8');
+        return JSON.parse(raw);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Host-side scan: shallowest dir under sandboxDir whose package.json qualifies as a web app.
+ * @param {string} sandboxDir
+ * @returns {string} POSIX relative path from clone root, or '' for root.
+ */
+function discoverAppRootRelative(sandboxDir) {
+    const override = String(process.env.AUTOQA_APP_SUBPATH || '').trim()
+        .replace(/^\/+/, '')
+        .replace(/\\/g, '/');
+    if (override) {
+        const abs = path.join(sandboxDir, ...override.split('/').filter(Boolean));
+        const pkg = tryReadPackageJsonSync(abs);
+        if (isWebAppPackageJson(pkg)) {
+            return override;
+        }
+        console.warn(`[Sandbox] AUTOQA_APP_SUBPATH="${override}" is not a valid web app root; scanning instead.`);
+    }
+
+    /** @type {{ rel: string, depth: number }[]} */
+    const candidates = [];
+
+    /**
+     * @param {string} relPosix segments joined by /
+     * @param {number} depth directory depth from root
+     */
+    function walk(relPosix, depth) {
+        if (depth > MAX_APP_DISCOVERY_DEPTH) return;
+        const abs = relPosix ? path.join(sandboxDir, ...relPosix.split('/')) : sandboxDir;
+        const pkg = tryReadPackageJsonSync(abs);
+        if (isWebAppPackageJson(pkg)) {
+            candidates.push({
+                rel: relPosix,
+                depth: relPosix ? relPosix.split('/').length : 0
+            });
+        }
+        let entries;
+        try {
+            entries = fssync.readdirSync(abs, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const ent of entries) {
+            if (!ent.isDirectory()) continue;
+            const name = ent.name;
+            if (SKIP_APP_SCAN_DIRS.has(name)) continue;
+            const nextRel = relPosix ? `${relPosix}/${name}` : name;
+            walk(nextRel, depth + 1);
+        }
+    }
+
+    walk('', 0);
+    if (candidates.length === 0) return '';
+    candidates.sort((a, b) => {
+        if (a.depth !== b.depth) return a.depth - b.depth;
+        return a.rel.localeCompare(b.rel);
+    });
+    return candidates[0].rel;
+}
+
+/**
+ * @param {string} sandboxDir
+ * @param {string} relPosix
+ */
+async function writeAppRootMarker(sandboxDir, relPosix) {
+    const line = (relPosix || '').trim().replace(/\\/g, '/');
+    await fs.writeFile(
+        path.join(sandboxDir, APP_ROOT_MARKER),
+        line ? `${line}\n` : '\n',
+        'utf8'
+    );
+}
+
+/**
+ * @param {string} sandboxDir
+ * @returns {Promise<string|null>} null if marker missing
+ */
+async function readAppRootMarker(sandboxDir) {
+    try {
+        const raw = await fs.readFile(path.join(sandboxDir, APP_ROOT_MARKER), 'utf8');
+        return raw.trim().replace(/\\/g, '/');
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * @param {string} sandboxDir
+ * @param {string} relPosix
+ */
+function appDirAbs(sandboxDir, relPosix) {
+    const r = (relPosix || '').trim();
+    if (!r) return sandboxDir;
+    return path.join(sandboxDir, ...r.split('/').filter(Boolean));
+}
+
+/**
+ * Docker -w path for npm run dev (Linux mount /app).
+ * @param {string} relPosix '' or 'sayarat-web' or 'apps/web'
+ */
+function dockerAppWorkdir(relPosix) {
+    const r = (relPosix || '').trim().replace(/^\/+|\/+$/g, '').replace(/\\/g, '/');
+    return r ? `/app/${r}` : '/app';
+}
+
 /**
  * Keep in sync with mcr.microsoft.com/playwright Docker tag (v{VER}-jammy)
  * and devDependency @playwright/test in createSandboxPool.
@@ -342,11 +485,11 @@ async function persistPlaywrightArtifacts(sandboxDir, ctx) {
 }
 
 /**
- * @param {string} sandboxDir
+ * @param {string} absDir directory containing package.json (clone root or nested app)
  * @returns {Promise<object|null>}
  */
-async function loadPackageJsonForPlaywright(sandboxDir) {
-    const p = path.join(sandboxDir, 'package.json');
+async function loadPackageJsonAt(absDir) {
+    const p = path.join(absDir, 'package.json');
     try {
         const raw = await fs.readFile(p, 'utf8');
         return JSON.parse(raw);
@@ -378,16 +521,16 @@ function extractPortFromNpmScript(script) {
 
 /**
  * Best-effort read of Vite `server.port` from common config filenames.
- * @param {string} sandboxDir
+ * @param {string} appRootAbs clone root or nested app directory on the host
  * @returns {Promise<number | null>}
  */
-async function readVitePortFromSandbox(sandboxDir) {
+async function readVitePortFromSandbox(appRootAbs) {
     const names = [
         'vite.config.js', 'vite.config.mjs', 'vite.config.cjs',
         'vite.config.ts', 'vite.config.mts', 'vite.config.cts'
     ];
     for (const name of names) {
-        const fp = path.join(sandboxDir, name);
+        const fp = path.join(appRootAbs, name);
         try {
             const text = await fs.readFile(fp, 'utf8');
             const serverPort = text.match(/\bserver\s*:\s*\{[^}]*\bport\s*:\s*(\d+)/);
@@ -408,11 +551,11 @@ async function readVitePortFromSandbox(sandboxDir) {
 }
 
 /**
- * @param {string} sandboxDir
+ * @param {string} appRootAbs directory containing the app package.json + vite configs (host path)
  * @param {object|null} pkg
  * @returns {Promise<{ devShellCmd: string | null, port: number, targetUrl: string }>}
  */
-async function resolveDevCommandAndTargetUrl(sandboxDir, pkg) {
+async function resolveDevCommandAndTargetUrl(appRootAbs, pkg) {
     const envBase = process.env.AUTOQA_E2E_BASE_URL;
     const trimmed = typeof envBase === 'string' ? envBase.trim() : '';
     if (trimmed) {
@@ -432,7 +575,7 @@ async function resolveDevCommandAndTargetUrl(sandboxDir, pkg) {
     }
 
     if (!pkg || typeof pkg !== 'object') {
-        const fromVite = await readVitePortFromSandbox(sandboxDir);
+        const fromVite = await readVitePortFromSandbox(appRootAbs);
         const port = fromVite ?? 3000; // default to 3000 if not vite
         return { devShellCmd: 'node todoServer.js || node server.js', port, targetUrl: `http://localhost:${port}` };
     }
@@ -450,7 +593,7 @@ async function resolveDevCommandAndTargetUrl(sandboxDir, pkg) {
     let port = extractPortFromNpmScript(scripts.dev)
         ?? extractPortFromNpmScript(scripts.start);
     if (port == null) {
-        port = await readVitePortFromSandbox(sandboxDir);
+        port = await readVitePortFromSandbox(appRootAbs);
     }
     if (port == null) {
         if (has('vite')) port = 5173;
@@ -571,6 +714,10 @@ async function createSandboxPool(runId, prDetails, concurrency = 2, options = {}
                 }));
             }
 
+            const appRel = discoverAppRootRelative(sandboxDir);
+            await writeAppRootMarker(sandboxDir, appRel);
+            console.log(`[Sandbox] App root for npm/dev: ${dockerAppWorkdir(appRel)}`);
+
             // -- Start ONE persistent container ------------------------------------
             const volumeDir = sandboxDir.replace(/\\/g, '/');
             const runTimeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
@@ -673,13 +820,13 @@ async function createSandboxPool(runId, prDetails, concurrency = 2, options = {}
                     }
                 }
 
-                const pkgJsonPath = path.join(sandboxDir, 'package.json');
-                if (fssync.existsSync(pkgJsonPath)) {
+                const appPkgPath = path.join(sandboxDir, appRel, 'package.json');
+                if (fssync.existsSync(appPkgPath)) {
                     await dockerRun([
-                        'exec', containerName,
+                        'exec', '-w', dockerAppWorkdir(appRel), containerName,
                         'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock'
                     ], installTimeoutMs);
-                    console.log(`[Sandbox] Pre-installed app dependencies in ${containerName}.`);
+                    console.log(`[Sandbox] Pre-installed app dependencies in ${containerName} (cwd ${dockerAppWorkdir(appRel)}).`);
                 }
 
                 await dockerRun([
@@ -769,8 +916,15 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                 await fs.rm(pwOut, { recursive: true, force: true }).catch(() => {});
                 await fs.rm(pwHtml, { recursive: true, force: true }).catch(() => {});
 
-                const pkg = await loadPackageJsonForPlaywright(sandboxDir);
-                const { devShellCmd, targetUrl } = await resolveDevCommandAndTargetUrl(sandboxDir, pkg);
+                let appRel = await readAppRootMarker(sandboxDir);
+                if (appRel === null) {
+                    appRel = discoverAppRootRelative(sandboxDir);
+                    await writeAppRootMarker(sandboxDir, appRel);
+                }
+                const appAbs = appDirAbs(sandboxDir, appRel);
+                const appWorkdir = dockerAppWorkdir(appRel);
+                const pkg = await loadPackageJsonAt(appAbs);
+                const { devShellCmd, targetUrl } = await resolveDevCommandAndTargetUrl(appAbs, pkg);
                 if (!devShellCmd) {
                     throw new Error('Dev server failed to start: missing scripts.dev or scripts.start in package.json');
                 }
@@ -781,7 +935,7 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                         '(' + devShellCmd + ') > /tmp/autoqa-dev.log 2>&1 & echo $! > /tmp/autoqa-dev.pid';
                     await execFilePromise(
                         'docker',
-                        ['exec', '-d', '-w', '/app', containerName, 'sh', '-c', startCmd],
+                        ['exec', '-d', '-w', appWorkdir, containerName, 'sh', '-c', startCmd],
                         { timeout: testTimeout }
                     );
                     didStartDevServer = true;
