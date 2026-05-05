@@ -26,4 +26,5 @@ code/backend/__tests__/fixture-autoqa-smoke-db-*.db
 # Playwright output (e2e helper package)
 code/e2e/test-results/
 
-code/devscripts/seedSayaratJiraIssues.js
+code/devscripts/
+

@@ -22,6 +22,59 @@ const {
 
 const MAX_HEAL_ATTEMPTS = 3;
 
+/** Max concurrent OpenAI test-case generation calls per run (improves prompt-cache routing vs unbounded fan-out). */
+const LLM_GEN_MAX_CONCURRENT = Math.max(1, parseInt(process.env.AUTOQA_LLM_MAX_CONCURRENT_GENERATION || '4', 10) || 4);
+
+/** Recent completed scenarios passed as alreadyGeneratedSummary (0 = disable). */
+const LLM_ALREADY_GENERATED_MAX = Math.max(0, parseInt(process.env.AUTOQA_LLM_ALREADY_GENERATED_MAX_ENTRIES || '12', 10) || 12);
+
+/**
+ * Run async work over items with at most `limit` in flight (pool / semaphore).
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T, index: number) => Promise<R>} fn
+ * @returns {Promise<R[]>}
+ */
+async function mapPool(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    const worker = async () => {
+        for (;;) {
+            const i = next++;
+            if (i >= items.length) return;
+            results[i] = await fn(items[i], i);
+        }
+    };
+    const n = Math.min(Math.max(1, limit), Math.max(1, items.length));
+    await Promise.all(Array.from({ length: n }, worker));
+    return results;
+}
+
+/**
+ * Compact summary for [ALREADY COVERED IN THIS RUN] in test-case generation.
+ * @param {string} scenarioId
+ * @param {string} scenarioTitle
+ * @param {string} scenarioType
+ * @param {Array<{ title?: string, testData?: object }>} generatedTestCases
+ */
+function buildGenerationSummaryEntry(scenarioId, scenarioTitle, scenarioType, generatedTestCases) {
+    const coveredInputs = [];
+    for (const tc of generatedTestCases || []) {
+        if (tc?.title) coveredInputs.push(String(tc.title).slice(0, 120));
+        const td = tc?.testData;
+        if (td && typeof td === 'object') {
+            for (const [g, obj] of Object.entries(td)) {
+                if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+                    for (const k of Object.keys(obj)) coveredInputs.push(`${g}.${k}`);
+                }
+            }
+        }
+    }
+    const uniq = [...new Set(coveredInputs)].slice(0, 24);
+    return { scenarioId, title: scenarioTitle || scenarioId, type: scenarioType || '', coveredInputs: uniq };
+}
+
 // ---------------------------------------------------------------------------
 // PR file classification
 // ---------------------------------------------------------------------------
@@ -1059,8 +1112,17 @@ async function runPipeline(runId, prUrl, repoFullName) {
             }
         })();
 
-        // Map over all scenarios and run LLM generation in parallel
-        const generationPromises = mappedScenarios.map(async (scenarioMapping) => {
+        // Test-case LLM generation: bounded concurrency + sliding-window summary for dedupe hints
+        const generationSummary = [];
+        sendEvent('log', {
+            level: 'INFO',
+            message: `Test-case LLM pool: max ${LLM_GEN_MAX_CONCURRENT} concurrent; already-covered hint window=${LLM_ALREADY_GENERATED_MAX}`
+        });
+
+        const generatedResults = (await mapPool(
+            mappedScenarios,
+            LLM_GEN_MAX_CONCURRENT,
+            async (scenarioMapping) => {
             try {
             const scenarioId = scenarioMapping.id || scenarioMapping.scenarioId;
             // Merge RTM row (authoritative for description, type, priority,
@@ -1073,6 +1135,11 @@ async function runPipeline(runId, prUrl, repoFullName) {
             const scenarioPriority = scenarioMapping.priority || rtmRow.priority || 'Medium';
             const scenarioTitle = rtmRow.title || '';
             const scenarioAcRef = Array.isArray(rtmRow.acceptanceCriteriaRef) ? rtmRow.acceptanceCriteriaRef : [];
+
+            const alreadyGeneratedSummary =
+                LLM_ALREADY_GENERATED_MAX > 0
+                    ? generationSummary.slice(-LLM_ALREADY_GENERATED_MAX)
+                    : [];
 
             sendEvent('scenario_execution_updated', {
                 scenarioId,
@@ -1109,7 +1176,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
                     prDiffSection,
                     dependenciesSection: codeContext.dependencies || '',
                     refinementContext,
-                    alreadyGeneratedSummary: [], // Context tracking removed to allow parallel execution
+                    alreadyGeneratedSummary,
                     conversationId: priorConversationId,
                     previousInteractionId: priorResponseId
                 });
@@ -1125,6 +1192,12 @@ async function runPipeline(runId, prUrl, repoFullName) {
             }
 
             sendEvent('log', { level: 'INFO', message: `Generated ${generatedTestCases.length} test case(s) for ${scenarioId}` });
+
+            if (generatedTestCases.length > 0) {
+                generationSummary.push(
+                    buildGenerationSummaryEntry(scenarioId, scenarioTitle, scenarioType, generatedTestCases)
+                );
+            }
 
             if (generatedTestCases.length === 0) {
                 scenarioResults[scenarioId].failed++;
@@ -1183,10 +1256,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 runSummary.scenariosGeneratingLeft = Math.max(0, runSummary.scenariosGeneratingLeft - 1);
                 emitSummary();
             }
-        });
-
-        // Wait for all scenarios to finish generating in parallel
-        const generatedResults = (await Promise.all(generationPromises)).filter(Boolean);
+            }
+        )).filter(Boolean);
 
         // Signal that no more test cases will be queued
         isGenerationFinished = true;

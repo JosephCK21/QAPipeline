@@ -34,6 +34,7 @@ This README is a **deep technical reference**: architecture, **end-to-end flows*
 24. [Failure handling and dead letter queue](#failure-handling-and-dead-letter-queue)
 25. [Security notes](#security-notes)
 26. [Troubleshooting](#troubleshooting)
+27. [**GitHub PR pipeline — complete file \& API reference**](#github-pr-pipeline--complete-file--api-reference) (authoritative detail for `runPipeline`)
 
 ---
 
@@ -42,7 +43,7 @@ This README is a **deep technical reference**: architecture, **end-to-end flows*
 - **Scenarios** (`rtm_scenarios` in SQLite) are the backbone of traceability: they tie Jira epics/stories/ACs to testable conditions consumed by PR mapping and generation.
 - **GitHub webhooks** drive PR runs: qualifying `pull_request` events are **deduplicated** by **`X-GitHub-Delivery`** and by an **active run** row in SQLite (same `prUrl`, `status='running'`). Responses: **202** `{ accepted: true, runId }` when a new run starts; **200** `{ duplicateDelivery: true }` or `{ duplicateRun: true, runId }` when replay-safe no-ops apply. [`runPipeline`](code/backend/pipeline.js) continues asynchronously.
 - **Jira** feeds scenario generation via REST sync, manual **sync-jira**, and optional **Jira webhooks** (queued via [`jiraWebhookQueueService`](code/backend/services/jiraWebhookQueueService.js)).
-- **OpenAI** (official `openai` SDK in [`llmService.js`](code/backend/services/llmService.js)) powers: scenario authoring, PR→scenario mapping, bug-fix classification, per-scenario test generation, **fallback smoke tests** for changed files without scenario coverage (see [Run outcome semantics](#run-outcome-semantics)), and **healing**.
+- **OpenAI** (official `openai` SDK in [`llmService.js`](code/backend/services/llmService.js) and specialised modules under [`code/backend/services/`](code/backend/services/)) powers: Jira→scenario authoring (separate from the PR pipeline), **PR→scenario mapping**, **bug-fix classification**, **per-mapped-scenario test generation**, and **healing** of failing scripts. *Unmapped PR files no longer get a separate “fallback smoke” generation path—[`classifyChangedFiles`](code/backend/pipeline.js) is only used for the early **noop** gate (see [§27](#github-pr-pipeline--complete-file--api-reference)).*
 - **Docker** sandboxes clone the PR head (or receive flat file payloads), install dependencies, run the harness, then **cleanup** containers and temp dirs.
 
 **Audience:** developers and QA operating the dashboard, wiring webhooks, or extending prompts and execution.
@@ -100,16 +101,16 @@ Assume project **P** links `ACME/acme-app` and Jira project **ACME**, with scena
 4. **Fetch PR** metadata and **files** ([`githubService.js`](code/backend/services/githubService.js)).
    - **Load scenarios** for P’s Jira key into a **catalog JSON** for mapping.
    - **LLM:** `mapPrChangesToScenarios` — variable `input` includes **SCENARIO CATALOG**, **PR title/branch**, **changed files** with **patch** and **content** caps, and **project document** text slices (see [LLM matrix](#call-matrix-instructions-vs-variable-input)). **Scenario mapping stats** (`map_attempts` / `map_hits` on **`rtm_scenarios`**) update after mapping.
-   - After mapping, **`classifyChangedFiles`** selects testable backend/frontend paths; **uncovered** files (see **`impactedFiles`** on mappings, **`AUTOQA_FALLBACK_ALWAYS`**, **`AUTOQA_FALLBACK_MAX_FILES`**) drive **`generateFallbackSmokeTests`** when applicable. True noop: **no** mapped scenarios **and** **no** classifiable files → **`complete.success: true`**. Zero mapped **with** classifiable files → **`FALLBACK`** smoke **`test_cases`** and sandbox runs still execute. If scenarios **are** mapped but **generation yields zero** test cases for any of them ⇒ that scenario counts as failure for **[run outcome semantics](#run-outcome-semantics)**.
+   - **`classifyChangedFiles`** (in [`pipeline.js`](code/backend/pipeline.js)) classifies changed paths as frontend/backend “testable” for an **early exit** only: if **no** scenarios mapped **and** **no** such testable files → **`complete.success: true`** and the run stops. If there are testable files but **zero** mapped scenarios, the run continues into the **standard** branch: **no** LLM test generation runs, but **`overall_success`** is still computed as **`[].every(...)` → true** (vacuous pass) while the sandbox pool may still be created — see **[run outcome semantics](#run-outcome-semantics)** and [§27](#github-pr-pipeline--complete-file--api-reference). If scenarios **are** mapped but **generation yields zero** test cases for one of them ⇒ that scenario counts as failure under the same semantics.
 5. **`setLlmRunContext(runId)`** for the pipeline lifetime wires **SQLite LLM traces** + **per-run token rollups** (see [LLM traces and token rollups](#llm-traces-and-token-rollups)).
 6. **Parallel work:** `classifyPrAsBugFix` (if regression enabled) and **`buildCodeContext`** (full files, inferred tests, **dependency** text). Large files may be **pruned** ([`astPrunerService.js`](code/backend/services/astPrunerService.js)).
 7. **Branch — regression vs generation:**
-   - If **bug-fix** and **`REGRESSION_ENABLED`** **and at least one scenario was mapped:** [`runEpicRegression`](code/backend/pipeline.js) loads **existing** `test_cases` for epic scope, **skips per-scenario** LLM generation, executes them in sandbox with the same heal loop; then, when **`requireFallbackSmoke`** applies (**uncovered** files via **`AUTOQA_FALLBACK_*`** / mapping coverage), **`generateFallbackSmokeTests`** runs **after** regression on the **same** pool (**`scenarioId`:** **`FALLBACK`**). **Bug-fix PRs with zero mapped scenarios** do **not** take this shortcut (they use standard + fallback path instead of vacuous regression success).
-   - Else: in parallel, optional **`generateFallbackSmokeTests`** ( **`qa:fallback:generate`** cache key) for **uncovered** PR files → **`test_cases`** with **`source: 'fallback'`**, **`scenarioId: 'FALLBACK'`**; then for each **mapped** scenario, **`generateTestCasesForScenario`** — instructions are stable for cache; **variable `input`** bundles scenario row, **diff**, **\[FULL FILE CONTENTS\]**, **deps**, optional **refinement** of prior script, **`[REFERENCE EXAMPLES]`** (non-cached few-shot). Results **upsert** `test_cases` with **conversation / response ids** for stateful heals (**`source: 'scenario'`** by default).
+   - If **bug-fix** and **`REGRESSION_ENABLED`** **and at least one scenario was mapped:** [`runEpicRegression`](code/backend/pipeline.js) loads **existing** `test_cases` for all scenarios under the touched epics, **skips** new **`generateTestCasesForScenario`** calls, waits for the **sandbox pool**, and executes those scripts with the same **`executeTestCaseWithRetries`** / heal loop (**`regressionMode: true`**). On success after a heal, cases can be stamped **`adapted`** vs **`clean_pass`** (see §27). There is **no** follow-up “fallback smoke” phase in the current tree.
+   - **Else (standard path):** **`sandboxTask`** runs in parallel with generation/execution; **`generateTestCasesForScenario`** runs for each mapped scenario behind a **concurrency pool** (`AUTOQA_LLM_MAX_CONCURRENT_GENERATION`) with a **sliding-window** `alreadyGeneratedSummary` (`AUTOQA_LLM_ALREADY_GENERATED_MAX_ENTRIES`). Each result **upserts** `test_cases` with **conversation / response ids** for later heals. Generated cases are **queued** for the background executor as soon as they are persisted.
 8. **Syntax check** ([`validateSyntaxLocal`](code/backend/services/sandboxService.js)): cheap `new Function` / Python `ast` parse before Docker.
 9. **Sandbox pool** ([`createSandboxPool`](code/backend/services/sandboxService.js)): **`SANDBOX_MAX_CONCURRENT`** global semaphore; per pool slot, temp dir; **`git clone`** via **`http.extraHeader` Basic auth** (`x-access-token` + `GITHUB_TOKEN`) when configured—clone URL stays **`https://github.com/org/repo.git`** without embedding the secret in the URL string. **`npm install`** for app if `package.json`, preinstall **Jest**, **`@playwright/test@` + `PLAYWRIGHT_VERSION`**, **`wait-on`**, etc.
 10. **executeTest:** Jest path **or** Playwright path (detected by `@playwright/test` substring). Playwright: **`npm run dev` / start** wrapped so the shell writes **`/tmp/autoqa-dev.pid`**; teardown **`kill $PID`** then fallback **`pkill`**. Copies **screenshots/traces** to `data/artifacts/...` when configured.
-11. On **failure:** **`repairTestCaseScript`** may prepend **prior successful heal summaries** from **`heal_patterns`** for that **`scenarioId`**. Retry up to **`MAX_HEAL_ATTEMPTS`**. Exhaustion sets **`test_cases.heal_exhausted`** and persists final **`fail`**.
+11. On **failure:** **`repairTestCaseScript`** asks the model for **structured JSON** `{ "testScript": "..." }` (with string fallback parsing). It may prepend **`heal_patterns`** hints for that **`scenarioId`**. Retry up to **`MAX_HEAL_ATTEMPTS`**. Exhaustion sets **`test_cases.heal_exhausted`** and persists final **`fail`**.
 12. **`cleanupSandboxPool`**, **`complete`** or **`failed`** with **`overall_success`** on **`run_history`**, **`setLlmRunContext(null)`**, **`refresh_data`**.
 
 ```mermaid
@@ -126,13 +127,9 @@ sequenceDiagram
     P->>L: mapPrChangesToScenarios
     P->>L: classifyPrAsBugFix · buildCodeContext
     alt standard path
-      P->>L: generateFallbackSmokeTests when unmapped files
-      P->>L: generateTestCasesForScenario per mapped scenario
+      P->>L: generateTestCasesForScenario per mapped scenario pooled
     else regression path
       P->>P: runEpicRegression reuse test_cases
-      opt requireFallbackSmoke
-        P->>L: generateFallbackSmokeTests then heal loop
-      end
     end
     P->>D: createSandboxPool · executeTest · heal loop
     P->>S: complete emit run_updated
@@ -173,7 +170,7 @@ Every production LLM step uses the OpenAI **Responses** API (`client.responses.c
 ### Cross-cutting mechanics (`llmService.js`)
 
 - **`OPENAI_STATEFUL_MODE`:** `conversation` (default) — thread via **conversation** attachments; `chain` — **`previous_response_id`**; `zdr` — **`store: false`** with encrypted reasoning replay through **`applyStatefulInput`**.
-- **Caching:** **`CACHE_KEYS`** includes **`qa:pr:mapping`**, **`qa:testcases:generate`**, **`qa:fallback:generate`**, … and **`prompt_cache_retention`** (e.g. `24h`).
+- **Caching:** **`CACHE_KEYS`** includes **`qa:pr:mapping`**, **`qa:testcases:generate`**, classifier keys, Jira scenario keys, etc., plus **`prompt_cache_retention`** (e.g. `24h`). A stale **`qa:fallback:generate`** key may still exist in the constant object but has **no** live caller in the PR pipeline.
 - **Token limits:** **`MAX_TOKENS_ALLOWED`** (30 000) via **tiktoken `o200k_base`**; **`OPENAI_PROMPT_BUDGET`** (~90% of ceiling); **`ensureWithinBudget`** trims **middle** of oversized **`input`** slices with a visible marker.
 - **Traces:** **`llm_trace`** Socket.IO events stream request/response-shaped payloads live; **`llm_trace_rows`** + **`GET /api/runs/:runId/llm-traces`** persist the same for later inspection when a run **`runId`** is known.
 
@@ -185,13 +182,12 @@ Every production LLM step uses the OpenAI **Responses** API (`client.responses.c
 | **`classifyPrAsBugFix`** | After mapping when `REGRESSION_ENABLED` | [`CLASSIFIER_INSTRUCTIONS`](code/backend/services/prClassificationService.js) | **PR title/body/branch**; **linked Jira issue types** from REST; **`CHANGED FILES`** digest: up to 20 files, **`patch`** truncated ~1500 chars each + note if truncated further ([`buildDiffDigest`](code/backend/services/prClassificationService.js)). Skipped when env disables regression; may skip LLM when Jira says **Bug** unless **`REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG`**. |
 | **`generateTestScenarios`** | Single-story path in [`jiraPipeline.js`](code/backend/jiraPipeline.js) | [`SCENARIO_SYSTEM_INSTRUCTION`](code/backend/services/llmService.js) | Epic/story keys and narrative; **acceptance criteria** text; **`Supporting Documents`** extracted text; optional **existing scenario IDs** hint to avoid duplicates ([`generateTestScenarios`](code/backend/services/llmService.js)). |
 | **`generateTestScenariosForEpic`** | Batch epic path in [`jiraPipeline.js`](code/backend/jiraPipeline.js) | Same **`SCENARIO_SYSTEM_INSTRUCTION`** | Epic summary line; **concatenated stories** (description + AC); **`Supporting Documents`**; validated **`storyId` / `epicId`** enumerations ([`generateTestScenariosForEpic`](code/backend/services/llmService.js)). Falls back per-story on failure. |
-| **`generateFallbackSmokeTests`** | Standard PR path when **`classifyChangedFiles`** yields **uncovered** paths (**`AUTOQA_FALLBACK_ALWAYS`** / **`AUTOQA_FALLBACK_MAX_FILES`**) | [`FALLBACK_SMOKE_INSTRUCTIONS`](code/backend/services/llmService.js) (constant) | PR **title**, **branch**, **repo**; each **uncovered** **`filename`**, **`fileType`**, **patch** and **`fullContent`** capped (~4k each); **`codeContextSection`**. Returns **`smokeTests`**: **`filename`**, **`fileType`**, **`testScript`** (nullable), **`framework`**, **`reason`**. |
-| **`generateTestCasesForScenario`** | PR pipeline per mapped scenario (unless regression-only path) | [`TESTCASE_GENERATION_INSTRUCTIONS`](code/backend/services/llmService.js) plus schema discipline | **Scenario** block: `scenarioId`, narrative, type, priority, **`acceptanceCriteriaRef`**; **`[CHANGED CODE DIFF]`** (`prDiffSection`); **`[FULL FILE CONTENTS]`** (**`codeContextSection`**, possibly AST-pruned); **`[DEPENDENCIES / PACKAGE INFO]`**; **`testData`** rules (injected at runtime — must not be redeclared in scripts); optional **`[REFINEMENT]`** previous `testScript` when superseding; **`alreadyGeneratedSummary`** when relevant; **`[REFERENCE EXAMPLES]`** (**`FEW_SHOT_EXAMPLES`**) — JS/Python structural templates **only in `input`** so they are not part of cached instructions. **Threads** `conversationId` / `previousInteractionId` from DB when continuing a chain. Playwright-specific bullets in instructions: **CommonJS**, **`getByRole`/`getByLabel`**, respect **`AUTOQA_E2E_BASE_URL`** when present for `page.goto` origin, web-first **`expect(locator)...`**. |
-| **`repairTestCaseScript`** | After sandbox/syntax failure (≤ **`MAX_HEAL_ATTEMPTS`**) | [`HEAL_INSTRUCTIONS`](code/backend/services/llmService.js) | **Stateful:** minimal user turn — last **`failureOutput`** + failing **`testScript`** only. **Fallback:** full **`testCase`**, **`failureOutput`**, **`attemptHistory`**, **`scenarioDescription`**, **`codeContextSection`**, **`testData`** JSON. **Hints:** **`heal_patterns`** row text for the **`scenarioId`** may prepend prior successful heal summaries (**skipped** for sentinel **`scenarioId`** **`FALLBACK`** — patterns are not learned there). |
+| **`generateTestCasesForScenario`** | PR pipeline per mapped scenario (unless regression-only path) | [`TESTCASE_GENERATION_INSTRUCTIONS`](code/backend/services/llmService.js) plus schema discipline | **Scenario** block: `scenarioId`, narrative, type, priority, **`acceptanceCriteriaRef`**; **`[CHANGED CODE DIFF]`** (`prDiffSection`); **`[FULL FILE CONTENTS]`** (**`codeContextSection`**, possibly AST-pruned); **`[DEPENDENCIES / PACKAGE INFO]`**; **`testData`** rules (injected at runtime — must not be redeclared in scripts); optional **`[REFINEMENT]`** previous `testScript` when superseding; **`alreadyGeneratedSummary`** (sliding window from earlier scenarios in the same run); **`[REFERENCE EXAMPLES]`** (**`FEW_SHOT_EXAMPLES`**) — JS/TS/Python structural templates **only in `input`** so they are not part of cached instructions. **Threads** `conversationId` / `previousInteractionId` from DB when continuing a chain. Playwright-oriented wording in instructions: **CommonJS**, **`getByRole`/`getByLabel`**, respect **`AUTOQA_E2E_BASE_URL`** when present for `page.goto` origin, web-first **`expect(locator)...`**. Returns structured **`testCases`** JSON from **`responses.create`**. |
+| **`repairTestCaseScript`** | After sandbox or local syntax failure (≤ **`MAX_HEAL_ATTEMPTS`** in [`pipeline.js`](code/backend/pipeline.js)) | [`HEAL_INSTRUCTIONS`](code/backend/services/llmService.js) | **Primary:** OpenAI **`text.format.type: json_schema`** enforcing **`{ "testScript": string }`**, with tolerant parsing if the model emits markdown. **Stateful:** when **`conversationId`** / **`previous_response_id`** chain is valid, the user turn can be **minimal** — last **`failureOutput`** + failing **`testScript`**. Otherwise a **manual history** fallback rebuilds context. **ZDR / reasoning:** prior encrypted **`reasoning`** items can be replayed across heal attempts. **`heal_patterns`** (per **`scenarioId`**) may prepend short summaries of past successful heals. |
 
 ### JSON / schema outputs
 
-Structured outputs are constrained by **JSON schemas** wired into **`responses.create`** in [`llmService.js`](code/backend/services/llmService.js) (`testCases`, **`smokeTests`** wrapper, scenarios, mapping, classifier, etc.).
+Structured outputs are constrained by **JSON schemas** wired into **`responses.create`** / **`text.format`** in [`llmService.js`](code/backend/services/llmService.js) — including PR **mapping**, **bug-fix classifier**, **`generateTestCasesForScenario`** (`testCases` array), **heal** (`testScript` string), and Jira **scenario** generators (separate from the PR pipeline).
 
 ---
 
@@ -208,7 +204,7 @@ These are **engineering refactors** documented for operators upgrading long-live
 | **Path helper** | **[`code/devscripts/_paths.js`](code/devscripts/_paths.js)** exposes `repoRoot`, `backendRoot`, `frontendRoot`, and **`loadBackendEnv()`** via `createRequire(backend/package.json)` so scripts work when run from any cwd. |
 | **Playwright sandbox** | **`PLAYWRIGHT_VERSION`** in [`sandboxService.js`](code/backend/services/sandboxService.js) pins **Docker image** `mcr.microsoft.com/playwright:v{VERSION}-jammy` and **`@playwright/test@{VERSION}`** npm install. **`resolveDevCommandAndTargetUrl`** respects **`AUTOQA_E2E_BASE_URL`**, parses **`vite.config.*` `server.port`** heuristically, and reads **`-p` / `--port` / `PORT=`** from **`package.json` scripts**. Generated **`playwright.autoqa.config.cjs`** supports **`AUTOQA_PLAYWRIGHT_*` timeout/retry** envs and **`baseURL`** from **`AUTOQA_E2E_BASE_URL`**. |
 | **First-party E2E** | **[`code/e2e/`](code/e2e/)** hosts **`@playwright/test`** smoke specs; **[`.github/workflows/playwright.yml`](.github/workflows/playwright.yml)** installs **Chromium** only and runs **`npx playwright test`** with **`webServer`** starting the Vite dev server on **`http://localhost:5173`**. |
-| **Fallback smoke (unmapped files)** | **`pipeline.js`**: **`classifyChangedFiles`**, coverage via mapping **`impactedFiles`**, **`generateFallbackSmokeTests`** ([`llmService.js`](code/backend/services/llmService.js)); persists **`test_cases`** with **`scenarioId: 'FALLBACK'`**, **`source: 'fallback'`**; shares sandbox pool + heal loop; **`reference_examples`** / **`heal_patterns`** promotion skipped on pass for **`FALLBACK`**. Env: **`AUTOQA_FALLBACK_ALWAYS`**, **`AUTOQA_FALLBACK_MAX_FILES`**. |
+| **Unmapped-file “fallback smoke” removed** | Earlier builds could LLM-generate smoke tests for PR files without scenario coverage (**`scenarioId: 'FALLBACK'`**). The current [`pipeline.js`](code/backend/pipeline.js) does **not** call that path; [`llmService.js`](code/backend/services/llmService.js) no longer exports a fallback generator. **`classifyChangedFiles`** remains only for the **early noop** gate. Legacy DB rows / UI badges may still show **`source: 'fallback'`**. |
 | **Platform persistence + quality** | **`db.js`** migrations (**`webhook_deliveries`**, **`llm_trace_rows`**, **`heal_patterns`**, **`reference_examples`**, **`run_history`/`rtm_scenarios`/`test_cases` columns**—see [Platform updates](#platform-updates-persistence-webhooks-sandboxes-llm-quality)); **`overall_success`** semantics; **`SANDBOX_MAX_CONCURRENT`**; clone via **`http.extraHeader`**; **`npm test`** backend suites. |
 | **Sayarat seed gitignore** | Path is now **`code/devscripts/seedSayaratJiraIssues.js`** (still **gitignored** for local datasets). |
 
@@ -316,7 +312,7 @@ Numbers map **path → responsibility** (production code and tooling).
 |------|----------|
 | [`server.js`](code/backend/server.js) | Express routes (projects, runs, Jira, GitHub, uploads, webhooks—including **`GET /api/runs/:runId/llm-traces`**, **`GET /api/dlq`**, **`POST /api/dlq/:id/replay`**, **`GET /api/projects/:projectKey/heal-exhausted`**), Socket.IO attachment, smee client wiring, signature verification helpers, DLQ publishes on critical failures, **`webhook_deliveries`** idempotency. |
 | [`db.js`](code/backend/db.js) | SQLite schema/init (**`PRAGMA user_version`** migrations); CRUD for scenarios, runs, test cases, DLQ, story sync log, webhook deliveries, LLM traces, heal patterns, reference examples; **`getActiveRunByPrUrl`**; artifact URL helpers consumed by routes. |
-| [`pipeline.js`](code/backend/pipeline.js) | **`runPipeline`**: **`createRun`** with **`prUrl`**, **`setLlmRunContext`**, PR mapping (**`incrementScenarioMappingStats`**), **`classifyChangedFiles`** + optional **`generateFallbackSmokeTests`** (**`FALLBACK`** bucket) on the standard path—or **`runFallbackSmokeExecutionWithPool`** after **`runEpicRegression`** when applicable—classification, code context, generation vs regression (regression only when **≥1** mapped scenario), sandbox executor + heal (**`upsertHealPattern`** / **`bumpReferenceExample`** skipped for **`scenarioId`** **`FALLBACK`**), **`overall_success`** rollup—event logging via **`createEventLogger`**. **`runEpicRegression`** for regression branch. |
+| [`pipeline.js`](code/backend/pipeline.js) | **`runPipeline`**: **`setLlmRunContext`** first; **`createRun`** with **`prUrl`**, partial unique index races; **`attachPrScenarioMapping`** → **`mapPrChangesToScenarios`**; **`classifyChangedFiles`** early-exit noop when **no** mapped scenarios and **no** classifiable files; enrichment of mappings with RTM rows; parallel **`classifyPrAsBugFix`**, **`buildCodeContext`**, **`createSandboxPool`**; bug-fix **+** mapped → **`runEpicRegression`** (reuse DB **`test_cases`**, **`regressionMode`** heal stamps); else **standard** path — **`mapPool`**-bounded **`generateTestCasesForScenario`**, **`generationSummary`** window, background queue **`executeTestCaseWithRetries`** (**`repairTestCaseScript`**, **`upsertHealPattern`**, **`bumpReferenceExample`**, **`incrementScenarioTestOutcome`**). Phases and **`complete`** via **`createEventLogger`**. Constants: **`MAX_HEAL_ATTEMPTS`**, **`LLM_GEN_MAX_CONCURRENT`** (`AUTOQA_LLM_MAX_CONCURRENT_GENERATION`), **`LLM_ALREADY_GENERATED_MAX`** (`AUTOQA_LLM_ALREADY_GENERATED_MAX_ENTRIES`). |
 | [`jiraPipeline.js`](code/backend/jiraPipeline.js) | **`runJiraPipeline`**: fetch issues/docs, call scenario LLM(s), upsert scenarios, Jira comments, emit progress. |
 | [`schemas.js`](code/backend/schemas.js) | Zod schemas validating API bodies (e.g. webhook payloads, project create); exports **`CURRENT_SCHEMA_VERSION`**. |
 | [`SCHEMA_CHANGELOG.md`](code/backend/SCHEMA_CHANGELOG.md) | Human changelog aligned with **`CURRENT_SCHEMA_VERSION`**. |
@@ -335,7 +331,7 @@ Numbers map **path → responsibility** (production code and tooling).
 
 | Path | Used for |
 |------|----------|
-| [`llmService.js`](code/backend/services/llmService.js) | All OpenAI **Responses** calls: mapping, classification, scenario + test generation, **`generateFallbackSmokeTests`** ( **`FALLBACK_SMOKE`** / **`qa:fallback:generate`** ), healing; token budget + cache params; **`llm_trace`** Socket emission + **`llm_trace_rows`** persistence when **`setLlmRunContext`** active; **`addRunTokenUsage`** rollups; instruction constants (`SCENARIO_SYSTEM_INSTRUCTION`, `TESTCASE_GENERATION_INSTRUCTIONS`, **`FALLBACK_SMOKE_INSTRUCTIONS`**, `HEAL_INSTRUCTIONS`, …). |
+| [`llmService.js`](code/backend/services/llmService.js) | Shared OpenAI **Responses** client: stateful modes (**`OPENAI_STATEFUL_MODE`**: `conversation` \| `chain` \| `zdr`), **`buildCacheParams`**, **`ensureWithinBudget`**, tracing (**`emitLlmTrace`**, **`llm_trace_rows`** when **`setLlmRunContext`**), token rollups. **PR pipeline exports:** **`generateTestCasesForScenario`**, **`repairTestCaseScript`**. **Jira pipeline exports:** **`generateTestScenarios`**, **`generateTestScenariosForEpic`**. Instruction constants include **`SCENARIO_SYSTEM_INSTRUCTION`**, **`TESTCASE_GENERATION_INSTRUCTIONS`**, **`HEAL_INSTRUCTIONS`**. Mapping and classifier live in sibling modules but use the same utilities. |
 | [`githubService.js`](code/backend/services/githubService.js) | Octokit: PR metadata, diff, file contents, dependency discovery, inferred test companion paths. |
 | [`jiraService.js`](code/backend/services/jiraService.js) | Jira REST wrappers, ADF helpers, connectivity checks. |
 | [`jiraWebhookQueueService.js`](code/backend/services/jiraWebhookQueueService.js) | Serialized async queue for Jira-triggered jobs. |
@@ -391,7 +387,7 @@ Numbers map **path → responsibility** (production code and tooling).
 | [`src/pages/ProjectDashboard.jsx`](code/frontend/src/pages/ProjectDashboard.jsx) | `/projects/:projectId` — RTM dashboards, epic metrics, PR run workspace via query params; scenario rows may show mapping / sandbox outcome badges sourced from **`rtm_scenarios`**. |
 | [`src/pages/ProjectSettings.jsx`](code/frontend/src/pages/ProjectSettings.jsx) | `/projects/:projectId/settings` — Jira/GitHub linking, **`BranchPolicyMatrix`**, sync button. |
 | [`src/pages/PipelineRunsList.jsx`](code/frontend/src/pages/PipelineRunsList.jsx) | `/pipelines` — runs table navigation into dashboard + **`runId`**; renders per-run token totals when present on **`run_history`**. |
-| [`src/pages/ScriptDetail.jsx`](code/frontend/src/pages/ScriptDetail.jsx) | Generated script inspector; **Heal exhausted** when **`heal_exhausted`**; neutral **`smoke`** pill when **`source === 'fallback'`** (**`scenarioId`** **`FALLBACK`**). |
+| [`src/pages/ScriptDetail.jsx`](code/frontend/src/pages/ScriptDetail.jsx) | Generated script inspector; **Heal exhausted** when **`heal_exhausted`**; neutral **`smoke`** pill when **`source === 'fallback'`** (legacy **`FALLBACK`** data). |
 | [`src/pages/AgentChatDebug.jsx`](code/frontend/src/pages/AgentChatDebug.jsx) | `/llm-traces` — rolling **`llm_trace`** from context; append **`?run=<runId>`** to load **`GET /api/runs/:runId/llm-traces`**. |
 | [`src/components/Sidebar.jsx`](code/frontend/src/components/Sidebar.jsx) | Primary navigation + collapse. |
 | [`src/components/Navbar.jsx`](code/frontend/src/components/Navbar.jsx) | Top chrome: search placeholder, theme toggle. |
@@ -410,7 +406,7 @@ Numbers map **path → responsibility** (production code and tooling).
 |-------|---------|
 | **`rtm_scenarios`** | Scenario rows keyed by **`scenarioId`**, linked to **`projectKey`**, epic/story ids, textual fields, statuses, **`map_attempts`** / **`map_hits`** (PR mapping churn), **`test_pass_count`** / **`test_fail_count`**, **`schema_version`**, timestamps. |
 | **`run_history`** | One row per pipeline execution: **`runId`**, **`repoFullName`**, **`prUrl`**, **`status`**, **`completedAt`**, JSON **`events`** / **`logs`**, legacy JSON **`llm_traces`** (UI history), **`scenario_statuses`**, optional **`localProjectId`**, OpenAI **`input_tokens_total`** / **`output_tokens_total`** / **`cached_tokens_total`**, **`overall_success`**. |
-| **`test_cases`** | Executable artifacts: **`testScript`**, **`source`** (**`scenario`** \| **`fallback`**), **`schema_version`**, versioning, **`healAttempts`**, **`heal_exhausted`**, **`conversationId`**, **`latestResponseId`**, **`scenarioId`** (**`FALLBACK`** sentinel for smoke tests), **`runId`**. |
+| **`test_cases`** | Executable artifacts: **`testScript`**, **`source`** (**`scenario`** \| **`fallback`** legacy), **`schema_version`**, versioning, **`healAttempts`**, **`heal_exhausted`**, **`conversationId`**, **`latestResponseId`**, **`scenarioId`** ( **`FALLBACK`** only on old rows), **`runId`**, optional **`regression`** / **`originalScript`** stamps after epic regression heals. |
 | **`webhook_deliveries`** | Idempotency ledger for **`X-GitHub-Delivery`** and Jira synthetic keys (**`delivery_id`**). |
 | **`llm_trace_rows`** | Persisted LLM dialog rows tied to **`runId`** (+ step labels / payloads) for **`GET /api/runs/:runId/llm-traces`**. |
 | **`heal_patterns`** | Scenario-scoped text snippets from heals that ultimately passed—fed back into **`repairTestCaseScript`** hints. |
@@ -449,7 +445,7 @@ Routes of interest remain: `/api/jira/health`, `/api/jira/spaces`, `/api/project
 ## Workflow: GitHub PR to test run
 
 - **`POST /api/webhooks/github`** validates optional HMAC (**note:** implementation hashes **`JSON.stringify(req.body)`** when secret set—your GitHub configuration must match that behavior).
-- **Fallback smoke:** parallel to **per-scenario** generation **or** sequentially **after epic regression** when applicable, **`generateFallbackSmokeTests`** may add **`test_cases`** under **`scenarioId: 'FALLBACK'`** ([Run outcome semantics](#run-outcome-semantics)).
+- **No fallback-smoke phase:** unmapped “testable” files do **not** currently trigger extra LLM work; see **[§27 GitHub PR pipeline](#github-pr-pipeline--complete-file--api-reference)** for exact gating and edge cases.
 
 | Phase (socket `phase_update`) | Meaning |
 |---------------------------------|--------|
@@ -458,11 +454,11 @@ Routes of interest remain: `/api/jira/health`, `/api/jira/spaces`, `/api/project
 | Classification | Regression classifier (maybe skipped) |
 | Code Context | File fetches + prompt assembly |
 | Sandbox Setup | Docker pool provisioning |
-| Syntax Validation | In-process AST/JS parse gate |
-| Test Generation | LLM authoring: **`generateFallbackSmokeTests`** (uncovered files; **parallel** with per-scenario work on the standard path, **after regression** when on the bug-fix + mapped path if **`requireFallbackSmoke`**) + **`generateTestCasesForScenario`** per mapped scenario (**skipped** on bug-fix regression path for mapped scenarios—not for optional fallback smoke) |
+| Syntax Validation | In-process AST/`new Function` gate before Docker |
+| Test Generation | **`generateTestCasesForScenario`** per mapped scenario (bounded concurrency); **skipped** on pure epic-regression path |
 | Sandbox Testing | `executeTest` iterations |
 | Test Healing | `repairTestCaseScript` cycles |
-| Regression Execution | `runEpicRegression` branch (only when PR is classified bug-fix **and** scenarios were mapped) |
+| Regression Execution | `runEpicRegression` branch (only when PR is classified bug-fix **and** `mappedScenarios.length > 0`) |
 
 Event types (**`run_updated`** `data`): `phase_update`, `log`, `pr_details`, `pr_scenario_mapping`, `pr_classification`, `scenario_execution_updated`, `test_case_attempt`, `test_cases_saved`, `regression_summary`, `run_summary_updated`, **`complete`**, **`error`**.
 
@@ -474,7 +470,7 @@ Unchanged **core behavior**; **`REGRESSION_CLASSIFIER_JIRA_LLM_BLEND`** (see [Co
 
 - **`REGRESSION_ENABLED`** (string check in pipeline), **`REGRESSION_BUGFIX_CONFIDENCE_THRESHOLD`**, **`REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG`**, **`REGRESSION_CLASSIFIER_JIRA_LLM_BLEND`**
 - **`classifyPrAsBugFix`** merges Jira **Bug** shortcut with LLM textual classification (**blend** optional)
-- **`runEpicRegression`** runs only when **`REGRESSION_ENABLED`**, the PR is classified as a **bug-fix**, **and** **at least one** scenario was mapped; it replays existing **`test_cases`** across epic scope under PR head with heal loop; tracks **`clean_pass`**, **`adapted`**, **`regression_fail`** style outcomes internally. When **`requireFallbackSmoke`**, the pipeline then runs **`runFallbackSmokeExecutionWithPool`** on the same sandbox pool before **`complete`**. Zero mapped scenarios → standard path (including fallback smoke), not vacuum **regression** success.
+- **`runEpicRegression`** runs only when **`REGRESSION_ENABLED`**, the PR is classified as a **bug-fix**, **and** **`mappedScenarios.length > 0`**; it replays existing **`test_cases`** across epic scope under the PR head with the same **`executeTestCaseWithRetries`** / heal loop. Success after a heal can set **`regression`** on the row to **`adapted`** vs **`clean_pass`**. **No mapped scenarios** + bug-fix classification falls through to the **standard** path (which then has **nothing** to generate if the map stayed empty — see [Run outcome semantics](#run-outcome-semantics)).
 
 Refer to [`prClassificationService.js`](code/backend/services/prClassificationService.js) and **`runEpicRegression`** inside [`pipeline.js`](code/backend/pipeline.js).
 
@@ -524,9 +520,9 @@ Budget trimming via **`ensureWithinBudget`** remains a **secondary** scissors on
 ## Run outcome semantics
 
 - **`complete.success`** mirrors **`overall_success`** on **`run_history`**: **`true`** only when every **scenario that participated in the rollup** finishes with **`failed === 0`** and **`passed > 0`** for that scenario’s tally. Sticky partial success (“one green anywhere makes the whole run green”) **does not** apply on the standard PR path—that rule is **`every` mapped / regressed scenario must be fully green**.
-- **Standard generation path (`runPipeline`):** rollup keys are **`mappedScenarios`** **plus** an optional **`FALLBACK`** bucket when **`requireFallbackSmoke`**. Each **mapped** scenario must have **at least one passing** sandbox run and **zero failures**. The **`FALLBACK`** bucket (unmapped-file smoke tests) follows the same rule when present. If fallback was required but **no** executable scripts were produced, the run treats that bucket as failed. If generation returns **zero** test cases for a mapped scenario after a successful LLM call, that scenario’s **`failed`** count is incremented and the run **`complete`**s with **`success: false`** unless another path short-circuits earlier.
-- **Zero-map:** if **`mappedScenarios.length === 0`** **and** there are **no** classifiable PR files for fallback smoke (**`classifyChangedFiles`**), the pipeline **`complete`**s **`success: true`** as an intentional noop. If there **are** classifiable files, **fallback smoke tests** run (**`generateFallbackSmokeTests`**, **`scenarioId`:** **`FALLBACK`**, **`source`:** **`fallback`**), and **`overall_success`** requires that bucket to have **`passed > 0`** with **`failed === 0`** (see standard path rollup below).
-- **Epic regression (`runEpicRegression`):** rollup is **per epic scenario that had runnable `test_cases`**. If **no epic** resolves from mappings, **no** stored tests exist, or the epic set yields **zero** runnable cases, the regression helper returns **`success: true`** (nothing to regress—distinct from “tests ran and failed”). When **`requireFallbackSmoke`** is also true, the **pipeline** `complete.success` is **`regressionResult.success` AND** the same **`FALLBACK`** bucket rules as the standard path (after fallback runs on the shared sandbox pool).
+- **Standard generation path (`runPipeline`):** rollup is **`mappedScenarios` only**. Each mapped scenario must have **at least one passing** sandbox run and **zero failures**. If generation returns **zero** test cases for a mapped scenario (after an LLM call that returned an empty array), that scenario’s **`failed`** count is incremented and the run **`complete`**s with **`success: false`**. There is **no** separate **`FALLBACK`** bucket in the rollup anymore.
+- **Zero mapped scenarios:** if **`mappedScenarios.length === 0`** **and** **`classifyChangedFiles`** finds **no** frontend/backend-testable paths, the pipeline logs a noop and **`complete`**s **`success: true`**. If there **are** classifiable files but **still** zero mappings, the pipeline continues: **`[].every(...)`** makes **`overallSuccess === true`** even though **no** tests are generated or run — **Docker** may still spin up during the standard-path executor wait (**current behavior**; worth tightening if product requires failure or explicit “no coverage” status).
+- **Epic regression (`runEpicRegression`):** rollup is **per epic scenario that had runnable `test_cases`**. If **no epic** resolves from mappings, **no** stored tests exist, or the epic set yields **zero** runnable cases, the regression helper returns **`success: true`** (nothing to regress—distinct from “tests ran and failed”). The PR pipeline does **not** attach any extra post-regression LLM phase.
 - Interpret UI **`scenario_execution_updated`** “partial” statuses as **inter-run** aggregates (passed/failed counts), not **`overall_success`**.
 
 ---
@@ -542,7 +538,7 @@ This section summarizes **cross-cutting platform work**: SQLite-backed idempoten
 - **Concurrency / dedupe:** partial **unique index** on **`run_history(prUrl)`** where **`status = 'running'`** so only **one active PR URL run** survives at rest (races **`createRun`** catch **`SQLITE_CONSTRAINT_UNIQUE`**).
 - **`run_history`:** **`prUrl`**, token totals (**`input_tokens_total`**, **`output_tokens_total`**, **`cached_tokens_total`**), **`overall_success`** (**`INTEGER`** 0/1).
 - **`rtm_scenarios`:** **`map_attempts`**, **`map_hits`**, **`test_pass_count`**, **`test_fail_count`**, **`schema_version`**.
-- **`test_cases`:** **`heal_exhausted`**, **`schema_version`** on new inserts, **`source`** (`'scenario'` \| `'fallback'`) for RTM vs unmapped-file smoke tests (sentinel **`scenarioId`:** **`FALLBACK`**).
+- **`test_cases`:** **`heal_exhausted`**, **`schema_version`** on new inserts, **`source`** (`'scenario'` typical; **`'fallback`** legacy when old smoke rows exist), optional **`scenarioId: 'FALLBACK'`** on those legacy rows only.
 - **Override path:** **`AUTOQA_DB_PATH`** relocates **`autoqa.db`** (defaults under **`code/backend/data/`**).
 
 ### Webhooks: delivery dedupe and active-run guard
@@ -561,11 +557,11 @@ Jira: enqueue path writes **`webhook_deliveries`** with a deterministic hash ide
 
 ### Healing memory and examples
 
-Successful heals **`upsert`** **`heal_patterns`** rows (scenario-scoped summaries consumed as hints in **`repairTestCaseScript`** — not for **`scenarioId`** **`FALLBACK`**). **`reference_examples`** records structural templates surfaced as **`[REFERENCE EXAMPLES]`** in generation **`input`**; **`bumpReferenceExample`** adjusts usage counts when outcomes succeed (**also skipped** for **`FALLBACK`** smoke passes).
+Successful heals **`upsert`** **`heal_patterns`** rows (scenario-scoped summaries consumed as hints in **`repairTestCaseScript`**). **`reference_examples`** records structural templates surfaced as **`[REFERENCE EXAMPLES]`** in generation **`input`**; **`bumpReferenceExample`** adjusts usage counts when outcomes succeed.
 
-### Fallback smoke tests (unmapped PR files)
+### Legacy `FALLBACK` rows (historical)
 
-When the PR changes **classifiable** backend/frontend paths (see **`classifyChangedFiles`** in [`pipeline.js`](code/backend/pipeline.js)) that are **not** “covered” by scenario mapping **`impactedFiles`**—or when **no** scenarios map and files remain—[`generateFallbackSmokeTests`](code/backend/services/llmService.js) runs (prompt cache key **`qa:fallback:generate`**). Rows use **`scenarioId: 'FALLBACK'`** and **`source: 'fallback'`**; they share the same **`executeTest`** + heal path as scenario tests. **`incrementScenarioTestOutcome`**, **`upsertHealPattern`**, and **`bumpReferenceExample`** are **skipped** for **`FALLBACK`**. Configure caps and “always on” behavior via **`AUTOQA_FALLBACK_ALWAYS`** and **`AUTOQA_FALLBACK_MAX_FILES`** ([Configuration](#configuration-environment-variables)).
+Older builds could persist **`test_cases`** with **`scenarioId: 'FALLBACK'`** and **`source: 'fallback'`** for unmapped-file smoke tests. The **current** orchestrator does not create them. The dashboard may still render the neutral **smoke** pill for such rows if they exist in SQLite.
 
 ### PR classifier blend
 
@@ -581,7 +577,7 @@ Playwright / dev-server teardown: launcher writes **`/tmp/autoqa-dev.pid`** and 
 
 - **`ProjectDashboard`:** scenario badges for mapping stats / test counters where exposed.
 - **`PipelineRunsList`:** optional token rollup line from run row fields.
-- **`ScriptDetail`:** **Heal exhausted** badge when **`test_cases.heal_exhausted`**; **`smoke`** neutral pill when **`source === 'fallback'`** ( **`scenarioId`:** **`FALLBACK`**).
+- **`ScriptDetail`:** **Heal exhausted** badge when **`test_cases.heal_exhausted`**; **`smoke`** neutral pill when **`source === 'fallback'`** (**legacy** **`scenarioId`** **`FALLBACK`** rows only).
 - **`AgentChatDebug`:** **`/llm-traces?run=<runId>`** hydrates from **`GET /api/runs/:runId/llm-traces`**.
 - **`App.jsx`:** listens for **`jira_queue_updated`** to refresh queue UX.
 
@@ -685,8 +681,8 @@ Copy **`code/backend/.env.example` → `.env`** and fill secrets.
 | `PORT` | HTTP listener (default **3001**) |
 | `GITHUB_TOKEN` | Octokit operations + authenticated sandbox **`git clone`** (passed via **`http.extraHeader`**, not embedded in clone URL when set) |
 | `AUTOQA_DB_PATH` | Optional override path for **`autoqa.db`** (defaults under **`code/backend/data`**) |
-| `AUTOQA_FALLBACK_ALWAYS` | **`true`** — run fallback smoke LLM on every classifiable changed file even when scenarios map; **`false`** (default) — only files not listed in **`impactedFiles`** of any mapped scenario (and all classifiable files when **zero** scenarios map). |
-| `AUTOQA_FALLBACK_MAX_FILES` | Cap fallback files per PR (default **10**); **frontend**-classified paths are prioritized. |
+| `AUTOQA_LLM_MAX_CONCURRENT_GENERATION` | Cap parallel **`generateTestCasesForScenario`** calls per PR (default **4**; balances OpenAI rate limits vs latency). |
+| `AUTOQA_LLM_ALREADY_GENERATED_MAX_ENTRIES` | Max prior scenario summaries in **`alreadyGeneratedSummary`** for dedupe hints (default **12**; **0** disables). |
 | `SANDBOX_MAX_CONCURRENT` | Global cap on concurrent sandbox directory + Docker image creates (default **3**) |
 | `REGRESSION_CLASSIFIER_JIRA_LLM_BLEND` | **0–1** weight blending LLM bug-fix verdict with linked Jira **Bug** issues (see **`prClassificationService`**) |
 | `GITHUB_WEBHOOK_SECRET` | Enables GitHub webhook HMAC (must match hashing scheme in `verifyGitHubSignature`) |
@@ -765,6 +761,121 @@ Sandbox execution **requires Docker** locally or in CI for remote workers (this 
 - GitHub webhook `catch` ⇒ **`publishToDLQ('github_webhook', ...)`**
 - Jira fatal handler ⇒ **`publishToDLQ('jira_webhook', ...)`**
 - Inspect via **`GET /api/dlq`**; bounded replay via **`POST /api/dlq/:id/replay`** (Jira-shaped bodies only today).
+
+---
+
+## GitHub PR pipeline — complete file & API reference
+
+This section is scoped to **`runPipeline`** and everything it **requires**—the path from **GitHub** → **SQLite** → **OpenAI** → **Docker** → **`complete`**. Jira→scenario authoring ([`jiraPipeline.js`](code/backend/jiraPipeline.js)) is orthogonal except that it fills **`rtm_scenarios`** consumed by PR mapping.
+
+### Webhook ingress ([`server.js`](code/backend/server.js))
+
+For **`pull_request`** **`opened` \| `synchronize` \| `reopened`**:
+
+1. **`verifyGitHubSignature`** — when **`GITHUB_WEBHOOK_SECRET`** is set, compares **`X-Hub-Signature-256`** to **`HMAC-SHA256(secret, JSON.stringify(body))`** (the raw body is **not** used; configuring GitHub must match this).
+2. **`insertWebhookDelivery`** on **`X-GitHub-Delivery`** — duplicate ⇒ **200** `{ duplicateDelivery: true }`.
+3. Resolve **`linkedProject`** via **`findProjectByGithubRepo`**. A project must have **`jiraProjectKey`**, else **202** `{ accepted: true, ignored: true, reason: 'not_linked' }`.
+4. **`getActiveRunByPrUrl(prUrl)`** — if a **`running`** row exists ⇒ **200** `{ duplicateRun: true, runId }`.
+5. Allocate **`runId`** (`uuidv4`), respond **202** `{ accepted: true, runId }`.
+6. **`process.nextTick`**: emit **`pr_opened`** / **`refresh_data`**, **`require('./pipeline').runPipeline(runId, prUrl, repoFullName)`**, **`.catch` → `publishToDLQ('github_webhook', …)`**.
+
+Body validation uses **`githubWebhookSchema`** from [`schemas.js`](code/backend/schemas.js).
+
+### Orchestrator ([`pipeline.js`](code/backend/pipeline.js))
+
+| Unit | Responsibility |
+|------|----------------|
+| **`classifyChangedFiles`**, **`shouldSkipFileForFallback`**, **`isFrontendPathForFallback`**, **`isBackendPathForFallback`** | Heuristic PR-file tagging (**`frontend`** / **`backend`**). Helper names are legacy (“fallback”); the output is only used for the **noop** gate today (testable paths vs zero maps). |
+| **`buildGenerationSummaryEntry`** | Derives **`coveredInputs`** titles + **`testData`** key paths for **`alreadyGeneratedSummary`** sliding window. |
+| **`mapPool`** | Bounded-concurrency iterator used for parallel **`generateTestCasesForScenario`**. |
+| **`createEventLogger`** | **`updateRun`** + Socket.IO **`run_updated`** / **`refresh_data`**; special-cases **`test_execution_started` / `test_execution_ended`** as **ephemeral** browser-tracking emits only. |
+| **`attachPrScenarioMapping`** | Loads scenarios, docs, **`fetchPRDetails`**, **`mapPrChangesToScenarios`**, **`incrementScenarioMappingStats`**, returns **`mappings`** + embedded **`_prDetails`**. |
+| **`parsePROwnerRepo`** | Derives **`owner`/`repo`** from **`headRepoFullName`**. |
+| **`buildCodeContext`** | **`fetchFullFileContents`** for changed non-doc file paths, **`inferTestFilePaths`** companions, **`fetchPRDependencies`** text. |
+| **`detectRefinementCandidates`** | Finds existing **`test_cases`** whose **`codeFiles`** intersect PR filenames; **`markTestCaseSuperseded`** and pass **refinement** context + prior **OpenAI** anchors into generation. |
+| **`executeWithPool`** | Generic pool scheduler (used in **`runEpicRegression`**). |
+| **`executeTestCaseWithRetries`** | Local **`validateSyntaxLocal`** gate; **`executeTest`** loop; on failure **`repairTestCaseScript`** up to **`MAX_HEAL_ATTEMPTS`** (3); **`upsertHealPattern`**, **`bumpReferenceExample`** after **pass** if heals occurred; **`incrementScenarioTestOutcome`**; **`runSummary`** counter updates; regression **clean_pass** / **adapted** stamping. |
+| **`runEpicRegression`** | Expands **epic** scope from **`mappedScenarios`**, loads runnable **`test_cases`** per scenario, runs **`executeWithPool`** over **heal** loop. |
+| **`runPipeline`** | Full state machine described in the [worked example](#worked-example-github-pr-pipeline-from-webhook-to-complete) and [run outcome semantics](#run-outcome-semantics). |
+
+**Constants / env:** **`MAX_HEAL_ATTEMPTS = 3`**; **`LLM_GEN_MAX_CONCURRENT`** from **`AUTOQA_LLM_MAX_CONCURRENT_GENERATION`**; **`LLM_ALREADY_GENERATED_MAX`** from **`AUTOQA_LLM_ALREADY_GENERATED_MAX_ENTRIES`**. The **`generatedResults`** variable after **`mapPool`** is currently unused (harmless; safe to delete in a hygiene pass).
+
+### GitHub integration ([`githubService.js`](code/backend/services/githubService.js))
+
+Uses **`@octokit/rest`** with **`GITHUB_TOKEN`**.
+
+| Function | Typical REST / network |
+|----------|-------------------------|
+| **`fetchPRDetails`** | **`pulls.get`**, **`pulls.listFiles`**, then **`fetch(file.raw_url)`** per file for full text (not the Git blob API). |
+| **`fetchFullFileContents`** | **`repos.getContent`** per path on a given **`ref`**. |
+| **`fetchPRDependencies`** | **`pulls.get`**, **`repos.get`**, **`repos.getContent`** for **`package.json`** / **`requirements.txt`** across head, base, default branch. |
+| **`inferTestFilePaths`** | Naming heuristics (**`.test.`**, **`__tests__`**, etc.). |
+
+### PR → scenario mapping ([`prScenarioMappingService.js`](code/backend/services/prScenarioMappingService.js))
+
+- Filters PR files to **`CODE_EXTENSIONS`**; **skips** non-code for mapping.
+- Builds variable prompt: **scenario catalog** JSON, PR title/branch, per-file **`patch` / `fullContent`** (6 000 char cap each), up to **five** **`documentTexts`** slices.
+- **`client.responses.create`**: **`instructions: PR_MAPPING_INSTRUCTIONS`**, **`text.format.json_schema`** (**`MAPPING_RESPONSE_SCHEMA`**), **`reasoning.effort: TESTCASE_EFFORT`** (same exported tier as test-case work—**not** a separate mapping effort today), **`...buildCacheParams(CACHE_KEYS.PR_MAPPING)`**, **`store: true`**.
+- Parses **`mappings`** + **`unresolvedChanges`**; drops unknown **`scenarioId`**s.
+
+### Bug-fix classification ([`prClassificationService.js`](code/backend/services/prClassificationService.js))
+
+- **`classifyPrAsBugFix({ prDetails })`**: may short-circuit from **linked Jira** issue types; else **`client.responses.create`** with **`CLASSIFIER_INSTRUCTIONS`**, **`buildDiffDigest`** in **`input`**, **`buildCacheParams(CACHE_KEYS.PR_CLASSIFIER)`**, optional **blend** with **`REGRESSION_CLASSIFIER_JIRA_LLM_BLEND`**.
+
+### OpenAI — generation & heal ([`llmService.js`](code/backend/services/llmService.js), PR exports only)
+
+**Shared infrastructure:** **`DEFAULT_MODEL`**, **`OPENAI_*`** reasoning / verbosity / cache retention, **`OPENAI_STATEFUL_MODE`** (**`conversation`** \| **`chain`** \| **`zdr`**), **`buildStatefulParams`**, **`applyStatefulInput`**, **`ensureWithinBudget`**, **`assertTokenLimit`**, **`emitLlmTrace`**, **`addRunTokenUsage`** when **`setLlmRunContext(runId)`** is active.
+
+| Export | Role in PR pipeline |
+|--------|---------------------|
+| **`setLlmRunContext` / `getLlmRunContext`** | Thread-safe run id for traces + token rollups. |
+| **`generateTestCasesForScenario`** | **`responses.create`** with cached **`TESTCASE_GENERATION_INSTRUCTIONS`**, variable **`input`** (scenario block, diffs, code context, deps, refinement, **`alreadyGeneratedSummary`**, few-shot **`REFERENCE EXAMPLES`**), **`text.format.json_schema`** for **`testCases`**, **`reasoning.effort: TESTCASE_EFFORT`**, stateful continuation via **`conversationId`** / **`previousInteractionId`**. Post-processes **`enforceTestData`**. |
+| **`repairTestCaseScript`** | **`responses.create`** with **`HEAL_INSTRUCTIONS`**, **`text.format.json_schema`** **`HEAL_RESPONSE_SCHEMA`** (`{ testScript }`), **`reasoning.effort: HEAL_EFFORT`**, minimal or full **`input`** depending on chain validity; returns **`repairedScript`**, new **interaction** id, optional **reasoning** items for **ZDR**. |
+
+Jira scenario functions (**`generateTestScenarios*`**) live in the same module but are **not** on the PR critical path.
+
+### Context pruning ([`astPrunerService.js`](code/backend/services/astPrunerService.js))
+
+**`pruneFileContentForContext(path, content, { onPrune })`** shrinks oversized files before they are concatenated into **`codeContextSection`** (Babel for JS/TS/JSX; Python **`def`/`class`** truncation heuristic).
+
+### Sandbox execution ([`sandboxService.js`](code/backend/services/sandboxService.js))
+
+Pipeline-critical exports:
+
+- **`createSandboxPool`**, **`cleanupSandboxPool`** — **Docker** **`mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-jammy`**, **`git clone`** with optional **`http.extraHeader`** **token**, **`SANDBOX_MAX_CONCURRENT`**, **`npm install`** / harness deps.
+- **`validateSyntaxLocal`** — **`new Function`** (JS) or Python **`ast`** parse before **`executeTest`**.
+- **`executeTest`** — Jest vs **Playwright** branches, **`buildPlaywrightAutoqaConfigSource`**, dev-server **`docker exec -d`**, **`wait-on`**, artifact **`persistPlaywrightArtifacts`**.
+
+### Persistence used by the pipeline ([`db.js`](code/backend/db.js))
+
+**Writes / reads on the PR path include:** **`createRun`**, **`updateRun`**, **`incrementScenarioMappingStats`**, **`incrementScenarioTestOutcome`**, **`getScenariosByProject`**, **`getTestCasesByProject`**, **`getTestCasesByScenario`**, **`markTestCaseSuperseded`**, **`upsertTestCase`**, **`updateTestCaseStatus`**, **`upsertHealPattern`**, **`bumpReferenceExample`**, **`insertWebhookDelivery`** (via **`server.js`**), **`getActiveRunByPrUrl`**, **`listLlmTracesByRun`**, plus **`llm_trace_rows`** / token columns when **`setLlmRunContext`** is set.
+
+### Project & document helpers
+
+| Module | Pipeline use |
+|--------|----------------|
+| [`projectStore.js`](code/backend/services/projectStore.js) | **`findProjectByGithubRepo`** → **`jiraProjectKey`**, **`id`**. |
+| [`documentAssociationStore.js`](code/backend/services/documentAssociationStore.js) | **`getDocsForProject`** → **`extractTextFromFiles`**. |
+| [`documentParserService.js`](code/backend/services/documentParserService.js) | **`extractTextFromFiles`** for mapping prompt slices. |
+
+### Schema versioning ([`schemas.js`](code/backend/schemas.js))
+
+**`CURRENT_SCHEMA_VERSION`** stamped on new **`test_cases`** inserts from **`runPipeline`**.
+
+### Frontend (pipeline UX only)
+
+| File | Role |
+|------|------|
+| [`App.jsx`](code/frontend/src/App.jsx) | **`run_updated`**, **`llm_trace`**, **`pr_opened`**, **`test_execution_started` / `test_execution_ended`** for live run UI. |
+| [`ProjectDashboard.jsx`](code/frontend/src/pages/ProjectDashboard.jsx) | Run/scenario workspace. |
+| [`PipelineRunsList.jsx`](code/frontend/src/pages/PipelineRunsList.jsx) | Run list + token totals. |
+| [`ScriptDetail.jsx`](code/frontend/src/pages/ScriptDetail.jsx) | Per-test-case script, heal exhaustion, legacy **smoke** pill. |
+| [`AgentChatDebug.jsx`](code/frontend/src/pages/AgentChatDebug.jsx) | **`GET /api/runs/:runId/llm-traces`**. |
+| [`LiveBrowserPanel.jsx`](code/frontend/src/components/LiveBrowserPanel.jsx) / [`VideoPlayer.jsx`](code/frontend/src/components/VideoPlayer.jsx) | Optional live / recorded sandbox playback when wired. |
+
+### Automated tests touching the pipeline
+
+[`code/backend/__tests__/pipeline.integration.test.js`](code/backend/__tests__/pipeline.integration.test.js) — lightweight integration (**skips** on **`better-sqlite3`** ABI mismatch). [`astPrunerService.test.js`](code/backend/__tests__/astPrunerService.test.js) — context pruning unit tests.
 
 ---
 

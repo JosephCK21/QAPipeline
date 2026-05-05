@@ -668,6 +668,16 @@ const TESTCASE_RESPONSE_SCHEMA = {
     required: ['testCases']
 };
 
+/** Structured output for heal/repair — single field keeps parsing reliable. */
+const HEAL_RESPONSE_SCHEMA = {
+    type: 'object',
+    properties: {
+        testScript: { type: 'string' }
+    },
+    required: ['testScript'],
+    additionalProperties: false
+};
+
 // ---------------------------------------------------------------------------
 // Static instruction blocks — held OUTSIDE the variable prompt so the same
 // prefix hashes identically on every call and benefits from OpenAI's automatic
@@ -677,17 +687,28 @@ const TESTCASE_RESPONSE_SCHEMA = {
 const SCENARIO_SYSTEM_INSTRUCTION = `You are a senior QA engineer specialising in functional and non-functional testing.
 Your task is to produce concrete, actionable test scenarios — not vague checks.
 
+These scenarios are consumed by an automated PR pipeline that mostly verifies behaviour through real browser E2E (Playwright)
+when a user interface exists. Write scenarios so each one maps cleanly to a small set of observable checks.
+
 Rules:
 - Each scenario description must clearly state: the exact precondition, the action performed, and the expected outcome.
 - Do NOT use generic phrases like "verify the system works" — be specific about data, state, and expected result.
+- Where the story implies a UI: phrase the expected outcome in terms a user or tester can SEE (visible labels, messages,
+  list contents, disabled buttons, empty states, navigation). Prefer role/label semantics ("Save" button, field "Email")
+  over raw CSS selectors or hex colours. Reserve pixel-exact colours/classes only when the acceptance criterion truly
+  demands visual design compliance.
+- Where the story is API-only (no user-facing surface): state HTTP status, key response fields, and persistence or side
+  effects explicitly so API-level automation can assert them. If both UI and API apply, tie them in one outcome (e.g.
+  submit in UI + reflected data + optional status).
 - Cover all four types for every acceptance criterion where applicable: happy_path, edge_case, negative, boundary.
 - For negative scenarios: specify exactly what invalid input or broken state is used and what error/response is expected.
 - For boundary scenarios: call out the exact limit being tested (e.g. max length, zero value, first/last item).
 - For edge cases: consider concurrency, empty states, special characters, or unusual but valid combinations.
+- Keep one clear verification focus per scenario — avoid stacking many unrelated assertions in a single description.
 - scenarioId must be unique within the array and follow the pattern SCN-<storyKey>-<index> (e.g. SCN-QPT-4-1).
 - storyId must exactly match the story key (e.g. QPT-4).
 - epicId must exactly match the epic key.
-- Return ONLY valid JSON matching the schema. No markdown fences. No explanation text.`;
+Output shape is enforced by the API schema — no markdown or explanation, only the structured response.`;
 
 const TESTCASE_GENERATION_INSTRUCTIONS = `You are an expert QA engineer generating concrete, executable test cases for an isolated Docker sandbox.
 
@@ -751,10 +772,7 @@ FILE-BASED STORAGE APPS (important for apps using JSON file storage):
 - Each test script starts with a CLEAN, EMPTY data store. Do NOT assume any pre-existing data.
 - Your test must create all the data it needs (e.g. signup a user, then login, then create todos).
 - Use unique test data values per test case to reduce collision risk.
-
-OUTPUT FORMAT:
-Return a JSON object with a single top-level key "testCases" whose value is an array of 2-4 test case objects.
-Each test case object must have: testCaseId, title, steps, testData, testScript, language, codeFiles, isRefinement, testStrategy.`;
+Produce 2–4 test cases per scenario; required fields and object shape are defined by the API response schema — do not echo the schema in prose.`;
 
 const HEAL_INSTRUCTIONS = `You are an expert test engineer fixing a failing test script for an isolated Docker sandbox.
 The testData variable is already injected as the first line at runtime — do NOT redeclare it.
@@ -765,7 +783,7 @@ If the script uses app._router, manual middleware walking, or fake req/res mocks
 If the app uses file-based storage (JSON files), the data files are reset to empty ([] or {}) before each test run. The test must create all data it needs (signup, login, create records) — never assume pre-existing data.
 Ensure no open handles (servers, intervals, sockets) remain after tests — add afterAll cleanup if needed.
 If you already tried a similar approach in a previous turn and it failed, use a completely different strategy.
-Return ONLY the corrected script body. No explanation, no markdown fences, no comments about what changed. Just the raw executable code.`;
+Return structured output only: JSON object with one key "testScript" whose value is the full corrected script body as a string (raw executable code, no markdown fences, no commentary outside the string).`;
 
 /**
  * Few-shot structural templates for JSON testScript output (style/layout only — not runnable against a specific repo).
@@ -820,9 +838,8 @@ def test_structural_fixture_and_mock(test_data):
 // Test case generation
 //
 // NOTE: testData is intentionally a dynamic free-form object (keys are arbitrary
-// fixture group names). Strict json_schema requires every property to be declared,
-// which doesn't fit a dynamic map — so this call uses json_object mode.
-// enforceTestData() below acts as a safety net if the model returns testData: {}.
+// fixture group names). We use json_schema with strict: false so testData can be
+// an open object; enforceTestData() remains the safety net if the model returns testData: {}.
 // ---------------------------------------------------------------------------
 
 /**
@@ -1198,6 +1215,15 @@ If you already tried an approach in a previous attempt and it failed, use a diff
                     model: DEFAULT_MODEL,
                     instructions: HEAL_INSTRUCTIONS,
                     input: inputPayload,
+                    text: {
+                        format: {
+                            type: 'json_schema',
+                            name: 'HealedTestScript',
+                            schema: HEAL_RESPONSE_SCHEMA,
+                            strict: true
+                        },
+                        verbosity: OUTPUT_VERBOSITY
+                    },
                     reasoning: { effort: HEAL_EFFORT, summary: REASONING_SUMMARY },
                     ...buildCacheParams(CACHE_KEYS.TESTCASE_HEAL),
                     ...stripInternalParams(statefulParams)
@@ -1275,7 +1301,16 @@ If you already tried an approach in a previous attempt and it failed, use a diff
         correlationKey: testCase.testCaseId
     });
 
-    const repairedScript = text.replace(/^```(?:\w+)?\n?/gm, '').replace(/^```$/gm, '').trim();
+    let repairedScript = '';
+    try {
+        const parsed = safeParseJSON(text);
+        if (parsed && typeof parsed.testScript === 'string') repairedScript = parsed.testScript.trim();
+    } catch (_) {
+        repairedScript = '';
+    }
+    if (!repairedScript) {
+        repairedScript = String(text || '').replace(/^```(?:\w+)?\n?/gm, '').replace(/^```$/gm, '').trim();
+    }
     return {
         repairedScript,
         interactionId: response.id || null,
@@ -1312,7 +1347,8 @@ Acceptance Criteria: ${story.acceptanceCriteria || 'None'}
 Supporting Documents: ${localDocsText || 'None'}
 ${alreadyGeneratedSection}
 Generate a thorough set of test scenarios covering all four types (happy_path, edge_case, negative, boundary) for every acceptance criterion.
-Return a JSON object with a "scenarios" array. Each scenario object has: scenarioId, storyId, epicId, title, description, acceptanceCriteriaRef, type, priority.`;
+Bias descriptions toward outcomes that can be verified in a browser when the product has a UI; keep API-only stories precise for HTTP/persistence checks.
+Structured response shape is enforced by the API — focus on substantive scenario content.`;
 
     try {
         await assertTokenLimit(prompt, currentModel);
@@ -1377,9 +1413,9 @@ Valid epicId value: ${epicContext.key || 'N/A'}
 
 ${storiesSection}
 
-Return a JSON object with a "scenarios" array containing all scenarios for all stories.
-Each scenario object must have: scenarioId, storyId, epicId, title, description, acceptanceCriteriaRef, type, priority.
-Cover all four types (happy_path, edge_case, negative, boundary) per acceptance criterion.`;
+Cover all four types (happy_path, edge_case, negative, boundary) per acceptance criterion for every story.
+Bias descriptions toward user-visible, observable outcomes when stories involve a UI; keep pure-API stories explicit on status, body, and storage.
+Structured response shape is enforced by the API — include every story via valid storyId / epicId.`;
 
     try {
         await assertTokenLimit(prompt, currentModel);
