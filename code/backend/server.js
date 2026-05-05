@@ -38,6 +38,7 @@ const {
     findProjectByGithubRepo,
     findProjectByJiraProjectKey
 } = require('./services/projectStore');
+const { sanitizeArtifactSegment } = require('./services/sandboxService');
 
 // Storage for uploaded requirements
 const storage = multer.diskStorage({
@@ -917,6 +918,42 @@ app.get('/api/runs/:runId/artifacts/:testCaseKey/:artifactFile', (req, res) => {
         fs.createReadStream(resolved).pipe(res);
     } catch (err) {
         console.error('[Artifacts] Serve failed:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/** List Playwright artifacts on disk for a run + test case (for RTM panel media tab). */
+app.get('/api/runs/:runId/test-cases/:testCaseId/media', (req, res) => {
+    try {
+        const ARTIFACT_NAME_RE = /^[a-zA-Z0-9._-]+\.(png|zip|webm)$/;
+        const { runId, testCaseId } = req.params;
+        const safeTc = sanitizeArtifactSegment(testCaseId);
+        const artifactsBase = path.resolve(path.join(__dirname, 'data', 'artifacts'));
+        const dir = path.resolve(path.join(artifactsBase, String(runId || ''), safeTc));
+        if (!dir.startsWith(artifactsBase)) {
+            return res.status(400).json({ error: 'Bad path' });
+        }
+        const encodeSeg = (s) => encodeURIComponent(String(s));
+        const screenshots = [];
+        const videos = [];
+        const traces = [];
+        if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+            return res.json({ screenshots, videos, traces, testCaseKey: safeTc });
+        }
+        const names = fs.readdirSync(dir).filter((n) => ARTIFACT_NAME_RE.test(n)).sort();
+        for (const name of names) {
+            const ext = path.extname(name).toLowerCase();
+            const entry = {
+                fileName: name,
+                url: `/api/runs/${encodeSeg(runId)}/artifacts/${encodeSeg(safeTc)}/${encodeSeg(name)}`
+            };
+            if (ext === '.png') screenshots.push(entry);
+            else if (ext === '.webm') videos.push(entry);
+            else if (ext === '.zip') traces.push(entry);
+        }
+        res.json({ screenshots, videos, traces, testCaseKey: safeTc });
+    } catch (err) {
+        console.error('[Artifacts] List media failed:', err.message);
         res.status(500).json({ error: err.message });
     }
 });

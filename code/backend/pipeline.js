@@ -141,7 +141,8 @@ function createEventLogger(runId) {
         let logsMsg = null;
 
         if (type === 'phase_update') {
-            updateParams.status = data.status;
+            // Do not write data.status onto run_history.status — phase "completed"
+            // is not the same as run completed; only `complete` / `error` set run status.
             logsMsg = `[Phase] ${data.phase}: ${data.status}`;
         } else if (type === 'log') {
             console.log(`[Pipeline] ${data.level}: ${data.message}`);
@@ -154,6 +155,15 @@ function createEventLogger(runId) {
             updateParams.status = data.success ? 'completed' : 'failed';
             updateParams.completedAt = new Date().toISOString();
             updateParams.overall_success = data.success ? 1 : 0;
+            if (typeof data.passedCount === 'number') {
+                updateParams.finished_passed_count = data.passedCount;
+            }
+            if (typeof data.failedCount === 'number') {
+                updateParams.finished_failed_count = data.failedCount;
+            }
+            if (typeof data.testCaseCount === 'number') {
+                updateParams.finished_test_case_count = data.testCaseCount;
+            }
         } else if (type === 'error') {
             updateParams.status = 'failed';
             logsMsg = `[ERROR] ${data.message}`;
@@ -880,7 +890,12 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
         if (!hasMappedScenarios && classifiedAll.length === 0) {
             sendEvent('log', { level: 'WARN', message: 'No scenarios mapped and no testable PR files — nothing to run.' });
-            sendEvent('complete', { success: true });
+            sendEvent('complete', {
+                success: true,
+                passedCount: runSummary.passedCount,
+                failedCount: runSummary.failedCount,
+                testCaseCount: runSummary.passedCount + runSummary.failedCount
+            });
             return;
         }
 
@@ -1027,7 +1042,12 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
             emitSummary();
             cleanupSandboxPool(runId, sandboxPool);
-            sendEvent('complete', { success: overallSuccess });
+            sendEvent('complete', {
+                success: overallSuccess,
+                passedCount: runSummary.passedCount,
+                failedCount: runSummary.failedCount,
+                testCaseCount: runSummary.passedCount + runSummary.failedCount
+            });
             return;
         }
 
@@ -1304,7 +1324,12 @@ async function runPipeline(runId, prUrl, repoFullName) {
         if (_sandboxPool) {
             cleanupSandboxPool(runId, _sandboxPool);
         }
-        sendEvent('complete', { success: overallSuccess });
+        sendEvent('complete', {
+            success: overallSuccess,
+            passedCount: runSummary.passedCount,
+            failedCount: runSummary.failedCount,
+            testCaseCount: runSummary.passedCount + runSummary.failedCount
+        });
 
     } catch (error) {
         console.error('\n================ PIPELINE CRASHED =================');
@@ -1313,7 +1338,12 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('phase_update', { phase: 'Test Generation', status: 'error' });
         sendEvent('log', { level: 'ERROR', message: `Fatal Error: ${error.message}` });
         sendEvent('error', { message: error.message });
-        sendEvent('complete', { success: false });
+        sendEvent('complete', {
+            success: false,
+            passedCount: runSummary.passedCount,
+            failedCount: runSummary.failedCount,
+            testCaseCount: runSummary.passedCount + runSummary.failedCount
+        });
         if (_sandboxPool) {
             cleanupSandboxPool(runId, _sandboxPool);
         }

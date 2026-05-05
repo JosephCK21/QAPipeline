@@ -21,7 +21,7 @@ function Sidebar() {
 
   return (
     <aside className={`fixed left-0 top-0 h-full transition-all duration-300 z-40 ${
-      sidebarCollapsed ? 'w-16' : 'w-64'
+      sidebarCollapsed ? 'w-16' : 'w-56'
     } ${darkMode ? 'bg-[#161B22] border-r border-[#30363D]' : 'bg-white border-r border-[#DFE1E6]'}`}>
       {/* Logo */}
       <div className={`h-16 flex items-center justify-between px-4 border-b ${darkMode ? 'border-[#30363D]' : 'border-[#DFE1E6]'}`}>

@@ -2,7 +2,8 @@
 
 AutoQA is a local, **AI-assisted quality workflow** for teams that use **Jira** for requirements and **GitHub** for code. It maintains an **RTM-style** catalog of test **scenarios** in SQLite, links each AutoQA **project** to a Jira space and a GitHub repository, and runs a **PR pipeline** that: maps PR changes to relevant scenarios, calls the **OpenAI API** to generate or reuse **executable test scripts**, runs them in an isolated **Docker** sandbox (**Jest**, **Playwright Test**, or **pytest**), and on failure can **heal** (rewrite) the failing script up to a limit. A **React + Vite** dashboard talks to a **Node.js Express** backend over **REST** and **Socket.IO**.
 
-This README is a **deep technical reference**: architecture, **end-to-end flows**, **exactly what each LLM step receives**, **worked examples**, **sandbox / Playwright behavior**, **repository and per-file roles**, configuration, APIs, and operations.
+This README is a **deep technical reference**: architecture, **end-to-end flows**, **what the OpenAI model is asked on every pipeline step** (static **instructions** vs variable **input**, **schemas**, **stateful threads**), **worked examples**, **sandbox / Playwright behavior**, **repository and per-file roles**, configuration, APIs, and operations.  
+**Note:** “Commands” in this stack are of two kinds: (1) **HTTP calls to OpenAI’s Responses API** (`client.responses.create` in [`llmService.js`](code/backend/services/llmService.js) and sibling modules), which carry **prompts** and **context**; (2) **host/Docker commands** that run after generation (git, `npm install`, Jest, Playwright) — see [Sandbox execution](#sandbox-execution-and-test-healing).
 
 ---
 
@@ -13,28 +14,29 @@ This README is a **deep technical reference**: architecture, **end-to-end flows*
 3. [Worked example: GitHub PR pipeline](#worked-example-github-pr-pipeline-from-webhook-to-complete)
 4. [Worked example: Jira to RTM scenarios](#worked-example-jira-to-rtm-scenarios)
 5. [Application flow summaries](#application-flow-summaries)
-6. [LLM context reference (exhaustive)](#llm-context-reference-exhaustive)
-7. [Recent repository changes (structural)](#recent-repository-changes-structural)
-8. [Repository layout (tree)](#repository-layout-tree)
-9. [File encyclopedia (every source file)](#file-encyclopedia-every-source-file)
-10. [Data model](#data-model)
-11. [Workflow: Jira to scenarios](#workflow-jira-to-scenarios-rtm)
-12. [Workflow: GitHub PR to test run](#workflow-github-pr-to-test-run)
-13. [Bug-fix classification and epic regression](#bug-fix-classification-and-epic-regression)
-14. [Sandbox execution and test healing](#sandbox-execution-and-test-healing)
-15. [Code context pruning (`astPrunerService`)](#code-context-pruning-astprunerservice)
-16. [Run outcome semantics](#run-outcome-semantics)
-17. [Platform updates: persistence, webhooks, sandboxes, LLM quality](#platform-updates-persistence-webhooks-sandboxes-llm-quality)
-18. [HTTP API reference](#http-api-reference)
-19. [Real-time events (Socket.IO)](#real-time-events-socketio)
-20. [Frontend map](#frontend-map)
-21. [Configuration (environment variables)](#configuration-environment-variables)
-22. [First-party Playwright E2E (this repo)](#first-party-playwright-e2e-this-repo)
-23. [Local development and operations](#local-development-and-operations)
-24. [Failure handling and dead letter queue](#failure-handling-and-dead-letter-queue)
-25. [Security notes](#security-notes)
-26. [Troubleshooting](#troubleshooting)
-27. [**GitHub PR pipeline — complete file \& API reference**](#github-pr-pipeline--complete-file--api-reference) (authoritative detail for `runPipeline`)
+6. [LLM: Responses API, prompts, and variable context](#llm-responses-api-prompts-and-variable-context)
+7. [LLM context reference (exhaustive)](#llm-context-reference-exhaustive)
+8. [Recent repository changes (structural)](#recent-repository-changes-structural)
+9. [Repository layout (tree)](#repository-layout-tree)
+10. [File encyclopedia (every source file)](#file-encyclopedia-every-source-file)
+11. [Data model](#data-model)
+12. [Workflow: Jira to scenarios](#workflow-jira-to-scenarios-rtm)
+13. [Workflow: GitHub PR to test run](#workflow-github-pr-to-test-run)
+14. [Bug-fix classification and epic regression](#bug-fix-classification-and-epic-regression)
+15. [Sandbox execution and test healing](#sandbox-execution-and-test-healing)
+16. [Code context pruning (`astPrunerService`)](#code-context-pruning-astprunerservice)
+17. [Run outcome semantics](#run-outcome-semantics)
+18. [Platform updates: persistence, webhooks, sandboxes, LLM quality](#platform-updates-persistence-webhooks-sandboxes-llm-quality)
+19. [HTTP API reference](#http-api-reference)
+20. [Real-time events (Socket.IO)](#real-time-events-socketio)
+21. [Frontend map](#frontend-map)
+22. [Configuration (environment variables)](#configuration-environment-variables)
+23. [First-party Playwright E2E (this repo)](#first-party-playwright-e2e-this-repo)
+24. [Local development and operations](#local-development-and-operations)
+25. [Failure handling and dead letter queue](#failure-handling-and-dead-letter-queue)
+26. [Security notes](#security-notes)
+27. [Troubleshooting](#troubleshooting)
+28. [**GitHub PR pipeline — complete file \& API reference**](#github-pr-pipeline--complete-file--api-reference) (authoritative detail for `runPipeline`)
 
 ---
 
@@ -46,7 +48,7 @@ This README is a **deep technical reference**: architecture, **end-to-end flows*
 - **OpenAI** (official `openai` SDK in [`llmService.js`](code/backend/services/llmService.js) and specialised modules under [`code/backend/services/`](code/backend/services/)) powers: Jira→scenario authoring (separate from the PR pipeline), **PR→scenario mapping**, **bug-fix classification**, **per-mapped-scenario test generation**, and **healing** of failing scripts. *Unmapped PR files no longer get a separate “fallback smoke” generation path—[`classifyChangedFiles`](code/backend/pipeline.js) is only used for the early **noop** gate (see [§27](#github-pr-pipeline--complete-file--api-reference)).*
 - **Docker** sandboxes clone the PR head (or receive flat file payloads), install dependencies, run the harness, then **cleanup** containers and temp dirs.
 
-**Audience:** developers and QA operating the dashboard, wiring webhooks, or extending prompts and execution.
+**Audience:** developers and QA operating the dashboard, wiring webhooks, or extending prompts and execution. For **exact prompt assembly and API fields**, start at [LLM: Responses API, prompts, and variable context](#llm-responses-api-prompts-and-variable-context).
 
 ---
 
@@ -163,7 +165,125 @@ See [Workflow: GitHub](#workflow-github-pr-to-test-run) and the worked example a
 
 ---
 
+## LLM: Responses API, prompts, and variable context
+
+This section is the **authoritative narrative** for what the model receives. Implementation lives primarily in [`llmService.js`](code/backend/services/llmService.js), [`prScenarioMappingService.js`](code/backend/services/prScenarioMappingService.js), and [`prClassificationService.js`](code/backend/services/prClassificationService.js).
+
+### What “command” means here
+
+- **To OpenAI:** Each LLM step is a **`client.responses.create({...})` call** (official Node SDK). There is no shell involved. Typical fields:
+  - **`model`** — defaults to `OPENAI_MODEL` or `gpt-5.4-mini`.
+  - **`instructions`** — long, **static** system-style rules. Kept stable per call-type so **prompt caching** (`prompt_cache_key` + optional `prompt_cache_retention`) can discount repeated prefix tokens.
+  - **`input`** — **variable** user message: scenario text, PR diffs, file contents, etc. Often a single string; in **ZDR** mode it can become a **multi-item** list after **`applyStatefulInput`** (see below).
+  - **`text.format`** — usually **`type: 'json_schema'`** with **`strict: true`**, enforcing structured outputs (`mappings`, `testCases`, `testScript`, Jira `scenarios`, classifier verdict).
+  - **`reasoning`** — `{ effort, summary }` per step; effort is **env-tuned per task** (scenario authoring vs test generation vs heal).
+  - **`store`** — `true` for most calls so threads can continue; **`false`** in ZDR mode.
+  - **Threading:** `conversation` (Conversations API id) or `previous_response_id` chaining — see **Stateful modes**.
+- **To the sandbox (after the model returns code):** Separate **`docker` / `npm` / `npx playwright test` / `jest`** invocations in [`sandboxService.js`](code/backend/services/sandboxService.js). Those are **not** passed as LLM prompts; they execute the generated `testScript`.
+
+### `instructions` vs `input` (and why it matters for caching)
+
+OpenAI’s Responses API treats **`instructions`** as a stable prefix. AutoQA mirrors that design:
+
+- **Mapping** ([`PR_MAPPING_INSTRUCTIONS`](code/backend/services/prScenarioMappingService.js)) — short analyst rules (“map only to catalog IDs”, confidence 0–1, `unresolvedChanges`, JSON shape).
+- **Bug-fix classification** ([`CLASSIFIER_INSTRUCTIONS`](code/backend/services/prClassificationService.js)) — definition of “just a bug fix” vs feature/refactor, title/body heuristics, required JSON fields.
+- **Jira → RTM scenarios** ([`SCENARIO_SYSTEM_INSTRUCTION`](code/backend/services/llmService.js)) — narrative + ID patterns (`SCN-<storyKey>-n`), UI-vs-API phrasing, four scenario types.
+- **PR test generation** ([`TESTCASE_GENERATION_INSTRUCTIONS`](code/backend/services/llmService.js)) — long block: Playwright-first strategy, **testData** vs **testScript** separation, CommonJS, `getByRole`/`getByLabel`, Jest+supertest **only** for API-only surfaces, steps schema `{ action, expectedResult }`, file-store reset rules, etc.
+- **Heal** ([`HEAL_INSTRUCTIONS`](code/backend/services/llmService.js)) — fix failing script, never redeclare `testData`, return **only** `{ "testScript": "..." }`.
+
+Everything **repository-specific** (this PR’s diff, file bodies, catalog JSON, Jira story text) goes in **`input`** so the **`instructions`** hash stays identical across runs of the same call type → **better `cached_tokens` hits** (see server logs: `[LLM usage] caller: in=… cached=…`).
+
+### Stateful modes (`OPENAI_STATEFUL_MODE`)
+
+| Mode | `responses.create` extras | Effect on `input` |
+|------|---------------------------|-------------------|
+| **`conversation`** (default) | `store: true`, `conversation: <id>` | Full string `input`; prior turns live server-side on that conversation. **`generateTestCasesForScenario`** creates a conversation per **scenario** when needed; **`repairTestCaseScript`** serializes heals per **conversationId** to avoid API races. |
+| **`chain`** | `store: true`, `previous_response_id` when continuing | Same string `input`; continuity via last response id (30-day retention on OpenAI side). |
+| **`zdr`** | `store: false`, `include: ['reasoning.encrypted_content']` | **`applyStatefulInput`** may **prepend** prior turn **`reasoning`** items so encrypted chain-of-thought is replayed; base `input` wraps as `{ role: 'user', content: ... }` when needed. |
+
+Helpers: **`buildStatefulParams`**, **`stripInternalParams`**, **`applyStatefulInput`** in [`llmService.js`](code/backend/services/llmService.js).
+
+### Reasoning effort and model defaults (env)
+
+| Env var | Default | Used on |
+|---------|---------|---------|
+| `OPENAI_MODEL` | `gpt-5.4-mini` | All callers unless overridden. |
+| `OPENAI_SCENARIO_EFFORT` | `low` | `generateTestScenarios`, `generateTestScenariosForEpic`. |
+| `OPENAI_TESTCASE_EFFORT` | `medium` | `generateTestCasesForScenario`, and **PR mapping** (`mapPrChangesToScenarios` — same tier as test-case work today). |
+| `OPENAI_HEAL_EFFORT` | `high` | `repairTestCaseScript`. |
+| `OPENAI_CLASSIFIER_EFFORT` | `low` | `classifyPrAsBugFix`. |
+
+`OPENAI_PROMPT_CACHE_RETENTION` (e.g. `24h`), `OPENAI_OUTPUT_VERBOSITY`, and `OPENAI_REASONING_SUMMARY` apply across calls.
+
+### Token budget and trimming
+
+Before each **`responses.create`**, variable text is checked against **`PROMPT_TOKEN_BUDGET`** (~90% of **`MAX_TOKENS_ALLOWED`**, measured with **tiktoken `o200k_base`**). **`ensureWithinBudget`** may **truncate from the middle** of oversized `input` with a visible marker so the pipeline does not hard-fail on huge PRs. Mapping prefers keeping the **scenario catalog** at the top of the payload (see comment in [`prScenarioMappingService.js`](code/backend/services/prScenarioMappingService.js)).
+
+### Call-by-call: what goes into `input` (variable context)
+
+**1. `mapPrChangesToScenarios`** ([`prScenarioMappingService.js`](code/backend/services/prScenarioMappingService.js))
+
+- **`instructions`:** `PR_MAPPING_INSTRUCTIONS` (impact analyst, catalog-only IDs, `unresolvedChanges`).
+- **`input`** string blocks, in order:
+  1. **`SCENARIO CATALOG`** — `JSON.stringify` of normalized RTM rows (`id`, `title`, `description`, `type`, `storyId`, `relatedReq`, …); only non-obsolete scenarios.
+  2. **`PULL REQUEST CONTEXT`** — `Title`, `Branch`.
+  3. **`CHANGED FILES`** — for each **code** file (extension filter): `filename`, `status`, **`patch`** capped at **6000** chars, **`fullContent`** capped at **6000** chars (from PR list-files fetch).
+  4. **`PROJECT DOCUMENTS`** — up to **5** slices of extracted document text from linked uploads (non-code files excluded from file list earlier).
+- **Schema output:** `mappings[]` + `unresolvedChanges[]` (`MAPPING_RESPONSE_SCHEMA`).
+
+**2. `classifyPrAsBugFix`** ([`prClassificationService.js`](code/backend/services/prClassificationService.js))
+
+- Skipped when linked Jira types already include **Bug** and **`REGRESSION_CLASSIFIER_LLM_EVEN_IF_JIRA_BUG`** is not set and blend weight is 0.
+- **`instructions`:** `CLASSIFIER_INSTRUCTIONS`.
+- **`input`:**
+  - `PR TITLE`, `PR BRANCH`, full `PR BODY`.
+  - **`LINKED JIRA ISSUES`** — JSON of `{ key, issueType }` from REST.
+  - **`CHANGED FILES`** — `buildDiffDigest`: up to **20** files, each **`patch`** truncated to **1500** chars + note if more files omitted.
+- **Schema:** `isBugFix`, `confidence`, `rationale`.
+
+**3. `generateTestScenarios` (single story)** / **`generateTestScenariosForEpic` (batch)**
+
+- **`instructions`:** `SCENARIO_SYSTEM_INSTRUCTION` (same for both).
+- **`input`:** Free-form **English + embedded Jira text**, not diffs:
+  - Per-story: epic key/summary, story key, title, description, acceptance criteria, **`Supporting Documents`** extracted text, optional **`[ALREADY ASSIGNED SCENARIO IDs]`** to avoid duplicate IDs/coverage.
+  - Epic batch: epic line, **`Supporting Documents`**, **`Valid storyId values`**, **`Valid epicId value`**, then **all stories** with description + AC separated by `---`.
+- **Schema:** `{ scenarios: [ ... ] }` (`SCENARIO_RESPONSE_SCHEMA`).
+- **One-shot:** no conversation chaining for Jira scenario generation.
+
+**4. `generateTestCasesForScenario` (PR pipeline)**
+
+- **`instructions`:** `TESTCASE_GENERATION_INSTRUCTIONS` (Playwright-first, testData rules, steps shape, server cleanup, etc.).
+- **`input`** string is assembled in code order:
+  1. **Scenario header** — `ID`, optional `Title`, `Description`, `Type`, `Priority`, optional **`Acceptance Criteria (refs)`**.
+  2. **`[FRONTEND DETECTION]`** — if [`detectFrontendFiles`](code/backend/services/llmService.js) sees UI paths, injects a **hard override**: only Playwright, no Jest+supertest.
+  3. **`[REFINEMENT]`** — if superseding an existing case: prior **`testScript`** and version (from [`detectRefinementCandidates`](code/backend/pipeline.js)).
+  4. **`[ALREADY COVERED IN THIS RUN — avoid duplicating…]`** — sliding window **`alreadyGeneratedSummary`**: prior scenarios’ titles, types, **`coveredInputs`** (from [`buildGenerationSummaryEntry`](code/backend/pipeline.js)); capped by **`AUTOQA_LLM_ALREADY_GENERATED_MAX_ENTRIES`**.
+  5. **`[CHANGED CODE DIFF]`** — `prDiffSection` from pipeline (PR-anchored diff text).
+  6. **`[FULL FILE CONTENTS]`** — `codeContextSection`: full files + inferred tests; large files may be **AST-pruned** first ([`astPrunerService.js`](code/backend/services/astPrunerService.js)).
+  7. **`[DEPENDENCIES / PACKAGE INFO]`** — `dependenciesSection` (package manifests / pins).
+  8. **`[REFERENCE EXAMPLES]`** — **structural** few-shot snippets (`FEW_SHOT_EXAMPLES.javascript` / `.python`), explicitly “format only, not this repo”.
+  9. **`[REPOSITORY-STYLE EXAMPLES]`** — optional rows from **`reference_examples`** table (top Playwright/Jest/pytest snippets by `use_count`), truncated ~3500 chars each.
+  10. **Closing task lines** — e.g. `TCN-${scenario.id}-<index>` pattern, 2–4 cases, `isRefinement`, and **`CRITICAL OVERRIDE`** block if frontend detected.
+- **Post-processing:** **`enforceTestData`** backfills empty `testData` from script references; **`normalizeTestCaseSteps`** coerces steps to `{ action, expectedResult }` for DB/UI.
+- **Schema:** `testCases[]` (`TESTCASE_RESPONSE_SCHEMA`); `testData` remains free-form JSON inside each case.
+
+**5. `repairTestCaseScript` (heal)**
+
+- **`instructions`:** `HEAL_INSTRUCTIONS`.
+- **Stateful `input` (short):** When **`conversationId`** or **`previousInteractionId`** exists, only **new** material is sent: attempt number, **`[SANDBOX FAILURE OUTPUT]`**, failed **`testScript`**, “Fix the script.”, optional **`heal_patterns`** hint block (scenario-scoped past successful heal summaries from SQLite).
+- **Stateless `input` (long):** If no chain or stale chain: full **`[WHAT THIS TEST VERIFIES]`**, **`[PREVIOUS ATTEMPT HISTORY]`**, **`heal_patterns`**, **`[CURRENT FAILED SCRIPT]`**, **`[CURRENT SANDBOX FAILURE OUTPUT]`**, **`[RELEVANT SOURCE CODE CONTEXT]`** (`codeContextSection`), **`[TEST DATA]`** as JSON, plus anti-repetition instructions.
+- **Schema:** `{ testScript: string }` (`HEAL_RESPONSE_SCHEMA`). Parse fallbacks strip markdown fences if needed.
+
+### Observability: what operators see of prompts
+
+- **Live:** Socket.IO **`llm_trace`** events (`phase: 'request' | 'response'`) with truncated **`prompt`** / **`response`**, **`usage`** (input/output/**cached** tokens), **`caller`** label matching the rows above.
+- **Persisted:** While **`setLlmRunContext(runId)`** is active in the PR pipeline, responses also append **`llm_trace_rows`** and roll up tokens on **`run_history`**. **`GET /api/runs/:runId/llm-traces`** and **`/llm-traces?run=<runId>`** in the UI replay them.
+
+---
+
 ## LLM context reference (exhaustive)
+
+The subsections below **summarize** the same surface (matrix, schemas, tracing) in compact form; the [preceding section](#llm-responses-api-prompts-and-variable-context) is the **detailed** walkthrough of prompts and variable context.
 
 Every production LLM step uses the OpenAI **Responses** API (`client.responses.create`): a **fixed `instructions`** string participates in **prompt caching** via **`buildCacheParams`** / **`CACHE_KEYS`** in [`llmService.js`](code/backend/services/llmService.js); the **`input`** field holds variable context. **`emitLlmTrace`** (when enabled) publishes **`llm_trace`** over Socket.IO for the **Agent Console**.
 

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAppContext } from '../App';
+import { deriveRunDisplayStatus } from '../lib/runDisplayStatus';
 import { 
   Activity, 
   PlayCircle, 
@@ -45,32 +46,32 @@ function PipelineRunsList() {
     fetchRuns();
   }, [refreshKey]);
 
-  const getStatusIcon = (status) => {
-    switch (status) {
-      case 'completed':
+  const getRunStatusIcon = (run) => {
+    const d = deriveRunDisplayStatus(run);
+    switch (d.variant) {
+      case 'green':
         return <CheckCircle2 className="w-5 h-5 text-[#00875A]" />;
-      case 'failed':
-      case 'error':
+      case 'red':
         return <XCircle className="w-5 h-5 text-[#C9372C]" />;
-      case 'running':
-      case 'in_progress':
+      case 'amber':
+        return <AlertTriangle className="w-5 h-5 text-[#B65C00]" />;
+      case 'neutral':
+        return <CheckCircle2 className="w-5 h-5 text-[#5E6C84]" />;
+      case 'blue':
       default:
         return <Loader className="w-5 h-5 text-[#0C66E4] animate-spin" />;
     }
   };
 
-  const getStatusText = (status) => {
-    switch (status) {
-      case 'completed':
-        return <span className="text-[#00875A] font-medium">Completed</span>;
-      case 'failed':
-      case 'error':
-        return <span className="text-[#C9372C] font-medium">Failed</span>;
-      case 'running':
-      case 'in_progress':
-      default:
-        return <span className="text-[#0C66E4] font-medium animate-pulse">Running</span>;
-    }
+  const getRunStatusText = (run) => {
+    const d = deriveRunDisplayStatus(run);
+    const cls =
+      d.variant === 'green' ? 'text-[#00875A]' :
+      d.variant === 'red' ? 'text-[#C9372C]' :
+      d.variant === 'amber' ? 'text-[#B65C00]' :
+      d.variant === 'neutral' ? 'text-[#5E6C84]' :
+      'text-[#0C66E4] animate-pulse';
+    return <span className={`${cls} font-medium`}>{d.label}</span>;
   };
 
   return (
@@ -148,8 +149,8 @@ function PipelineRunsList() {
                       </td>
                       <td className="p-4">
                         <div className="flex items-center gap-2">
-                          {getStatusIcon(run.status)}
-                          {getStatusText(run.status)}
+                          {getRunStatusIcon(run)}
+                          {getRunStatusText(run)}
                         </div>
                       </td>
                       <td className="p-4">

@@ -188,7 +188,7 @@ function initDb() {
 }
 
 /** User-facing schema batch id (increment when adding migrations below). */
-const DB_MIGRATION_VERSION = 2;
+const DB_MIGRATION_VERSION = 3;
 
 function migrateDbV2() {
     try {
@@ -256,6 +256,9 @@ function migrateDbV2() {
         addRunCol('output_tokens_total', 'INTEGER DEFAULT 0');
         addRunCol('cached_tokens_total', 'INTEGER DEFAULT 0');
         addRunCol('overall_success', 'INTEGER');
+        addRunCol('finished_passed_count', 'INTEGER');
+        addRunCol('finished_failed_count', 'INTEGER');
+        addRunCol('finished_test_case_count', 'INTEGER');
 
         const tcCols = db.pragma('table_info(test_cases)');
         if (!tcCols.find(c => c.name === 'heal_exhausted')) {
@@ -603,7 +606,10 @@ function updateRun(runId, patch) {
             input_tokens_total = @input_tokens_total,
             output_tokens_total = @output_tokens_total,
             cached_tokens_total = @cached_tokens_total,
-            overall_success = @overall_success
+            overall_success = @overall_success,
+            finished_passed_count = @finished_passed_count,
+            finished_failed_count = @finished_failed_count,
+            finished_test_case_count = @finished_test_case_count
         WHERE runId = @runId
     `);
     
@@ -622,10 +628,18 @@ function updateRun(runId, patch) {
         cached_tokens_total: merged.cached_tokens_total ?? 0,
         overall_success: merged.overall_success !== undefined && merged.overall_success !== null
             ? merged.overall_success
-            : null
+            : null,
+        finished_passed_count: merged.finished_passed_count === undefined || merged.finished_passed_count === null
+            ? null
+            : Number(merged.finished_passed_count),
+        finished_failed_count: merged.finished_failed_count === undefined || merged.finished_failed_count === null
+            ? null
+            : Number(merged.finished_failed_count),
+        finished_test_case_count: merged.finished_test_case_count === undefined || merged.finished_test_case_count === null
+            ? null
+            : Number(merged.finished_test_case_count)
     });
 }
-
 function getRun(runId) {
     const stmt = db.prepare('SELECT * FROM run_history WHERE runId = ?');
     const row = stmt.get(runId);

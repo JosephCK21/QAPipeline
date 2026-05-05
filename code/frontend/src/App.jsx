@@ -157,7 +157,7 @@ function App() {
       <Router>
         <div className={`flex min-h-screen ${darkMode ? 'bg-[#0D1117]' : 'bg-[#F4F5F7]'}`}>
           <Sidebar />
-          <div className={`flex-1 flex flex-col transition-all duration-300 ${sidebarCollapsed ? 'ml-16' : 'ml-64'}`}>
+          <div className={`flex-1 flex flex-col transition-all duration-300 ${sidebarCollapsed ? 'ml-16' : 'ml-56'}`}>
             <Navbar />
             <main className={`flex-1 p-6 overflow-auto ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>
               <Routes>

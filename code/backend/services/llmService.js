@@ -608,6 +608,35 @@ function enforceTestData(testCases) {
     return testCases;
 }
 
+/** Normalize LLM steps to { action, expectedResult } for DB + dashboard (supports legacy string[]). */
+function normalizeTestCaseSteps(testCases) {
+    for (const tc of testCases || []) {
+        const raw = tc.steps;
+        if (!Array.isArray(raw)) {
+            tc.steps = [];
+            continue;
+        }
+        tc.steps = raw.map((s) => {
+            if (typeof s === 'string') {
+                return { action: s.trim(), expectedResult: '' };
+            }
+            if (s && typeof s === 'object') {
+                const action = String(s.action != null ? s.action : '')
+                    || String(s.description != null ? s.description : '')
+                    || String(s.text != null ? s.text : '');
+                const expectedResult = String(
+                    s.expectedResult != null ? s.expectedResult
+                        : s.expected != null ? s.expected
+                            : ''
+                );
+                return { action: action.trim(), expectedResult: expectedResult.trim() };
+            }
+            return { action: '', expectedResult: '' };
+        });
+    }
+    return testCases;
+}
+
 // ---------------------------------------------------------------------------
 // Structured Output schemas (strict json_schema)
 // ---------------------------------------------------------------------------
@@ -653,7 +682,18 @@ const TESTCASE_RESPONSE_SCHEMA = {
                 properties: {
                     testCaseId:    { type: 'string' },
                     title:         { type: 'string' },
-                    steps:         { type: 'array', items: { type: 'string' } },
+                    steps: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                action:           { type: 'string' },
+                                expectedResult:  { type: 'string' }
+                            },
+                            required: ['action'],
+                            additionalProperties: false
+                        }
+                    },
                     testData:      { type: 'object', additionalProperties: true },
                     testScript:    { type: 'string' },
                     language:      { type: 'string', enum: ['javascript', 'python'] },
@@ -772,6 +812,12 @@ FILE-BASED STORAGE APPS (important for apps using JSON file storage):
 - Each test script starts with a CLEAN, EMPTY data store. Do NOT assume any pre-existing data.
 - Your test must create all the data it needs (e.g. signup a user, then login, then create todos).
 - Use unique test data values per test case to reduce collision risk.
+
+STEPS (dashboard / RTM):
+- For each test case, "steps" MUST be an array of objects with "action" (string, required) and optional "expectedResult" (string).
+- Each "action" is a short imperative line describing what the user or automation does; "expectedResult" is what should be observable after that step when helpful.
+- Do NOT emit bare strings inside "steps" — only objects { "action": "...", "expectedResult": "..." }.
+
 Produce 2–4 test cases per scenario; required fields and object shape are defined by the API response schema — do not echo the schema in prose.`;
 
 const HEAL_INSTRUCTIONS = `You are an expert test engineer fixing a failing test script for an isolated Docker sandbox.
@@ -1073,6 +1119,7 @@ ${hasFrontendSignals ? '\nCRITICAL OVERRIDE: This codebase has frontend files. G
         : (Array.isArray(parsed?.testCases) ? parsed.testCases : null);
     if (!testCases) throw new Error('generateTestCasesForScenario: expected testCases array from LLM');
 
+    normalizeTestCaseSteps(testCases);
     enforceTestData(testCases);
 
     return {

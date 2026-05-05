@@ -1,10 +1,17 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { Activity, ShieldCheck, Bug, Clock, GitCommit, Search, ChevronRight, ChevronDown, X, AlertTriangle, Settings, CheckCircle2, XCircle, Loader, PlayCircle, FileText, Upload, Trash2, Code2, Database, ListChecks, RefreshCw, GitBranch, ExternalLink, TrendingUp, Zap, BarChart2 } from 'lucide-react';
+import { useParams, useNavigate, Link } from 'react-router-dom';
+import { Activity, ShieldCheck, Bug, Clock, GitCommit, Search, ChevronRight, ChevronDown, X, AlertTriangle, Settings, CheckCircle2, XCircle, Loader, PlayCircle, FileText, Upload, Trash2, Code2, Database, ListChecks, RefreshCw, GitBranch, ExternalLink, TrendingUp, Zap, BarChart2, Film, ImageIcon } from 'lucide-react';
 import { useAppContext } from '../App';
 import { computeAllEpicMetrics } from '../lib/epicMetrics';
+import { deriveRunDisplayStatus, buildRunHistoryDetailLine } from '../lib/runDisplayStatus';
+import { normalizeStepForDisplay } from '../lib/stepDisplay';
 import { JIRA_BASE_URL } from '../lib/env';
 import EpicStackedChart from '../components/EpicStackedChart';
+import VideoPlayer from '../components/VideoPlayer';
+
+const API_BASE = typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL
+  ? String(import.meta.env.VITE_API_BASE_URL).replace(/\/$/, '')
+  : 'http://localhost:3001';
 
 function normTcStatus(s) {
   return String(s || '').toLowerCase();
@@ -72,8 +79,11 @@ function ProjectDashboard() {
   const [panelMode, setPanelMode] = useState('scenario'); // 'scenario' | 'testcase'
   // Which scenario cards are expanded to show test cases
   const [expandedScenarios, setExpandedScenarios] = useState({});
-  // Code/data view toggle inside test case panel
-  const [tcPanelTab, setTcPanelTab] = useState('steps'); // 'steps' | 'script' | 'data'
+  // Code/data / media tabs inside test case panel
+  const [tcPanelTab, setTcPanelTab] = useState('steps'); // 'steps' | 'script' | 'data' | 'media'
+  const [tcMedia, setTcMedia] = useState(null);
+  const [tcMediaLoading, setTcMediaLoading] = useState(false);
+  const [tcMediaError, setTcMediaError] = useState(null);
 
   useEffect(() => {
     fetchProjectData();
@@ -81,6 +91,43 @@ function ProjectDashboard() {
     fetchProjectRuns();
     fetchDocuments();
   }, [projectId, refreshKey]);
+
+  useEffect(() => {
+    if (!isPanelOpen || panelMode !== 'testcase' || !selectedTestCase) {
+      setTcMedia(null);
+      setTcMediaError(null);
+      setTcMediaLoading(false);
+      return;
+    }
+    if (tcPanelTab !== 'media') return;
+    const runId = selectedTestCase.runId;
+    const testCaseId = selectedTestCase.testCaseId;
+    if (!runId || !testCaseId) {
+      setTcMedia(null);
+      setTcMediaLoading(false);
+      setTcMediaError(null);
+      return;
+    }
+    let cancelled = false;
+    setTcMedia(null);
+    setTcMediaLoading(true);
+    setTcMediaError(null);
+    fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/test-cases/${encodeURIComponent(testCaseId)}/media`)
+      .then((r) => {
+        if (!r.ok) throw new Error(r.statusText || 'Failed to load media');
+        return r.json();
+      })
+      .then((data) => {
+        if (!cancelled) setTcMedia(data);
+      })
+      .catch((e) => {
+        if (!cancelled) setTcMediaError(e.message);
+      })
+      .finally(() => {
+        if (!cancelled) setTcMediaLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [isPanelOpen, panelMode, selectedTestCase, tcPanelTab]);
 
   const fetchDocuments = async () => {
     try {
@@ -361,7 +408,7 @@ function ProjectDashboard() {
         const prRuns = projectRuns.filter(r => r.prUrl);
         const uniquePRs = new Set(prRuns.map(r => r.prUrl)).size;
         const lastRun = projectRuns[0];
-        const lastRunStatus = lastRun?.status;
+        const lastRunDisplay = lastRun ? deriveRunDisplayStatus(lastRun) : null;
 
         const insightCards = [
           {
@@ -485,17 +532,23 @@ function ProjectDashboard() {
                       darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'
                     }`}>Last Pipeline Run</h3>
                     <div className="flex items-center gap-2 mb-3">
-                      {lastRunStatus === 'completed'
+                      {lastRunDisplay?.variant === 'green'
                         ? <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                        : lastRunStatus === 'failed' || lastRunStatus === 'error'
+                        : lastRunDisplay?.variant === 'red'
                           ? <XCircle className="w-4 h-4 text-red-400" />
-                          : <Loader className="w-4 h-4 text-blue-400 animate-spin" />}
+                          : lastRunDisplay?.variant === 'amber'
+                            ? <AlertTriangle className="w-4 h-4 text-amber-400" />
+                            : lastRunDisplay?.variant === 'neutral'
+                              ? <CheckCircle2 className="w-4 h-4 text-[#8993A4]" />
+                              : <Loader className="w-4 h-4 text-blue-400 animate-spin" />}
                       <span className={`text-xs font-semibold ${
-                        lastRunStatus === 'completed' ? (darkMode ? 'text-[#3FB950]' : 'text-[#00875A]') :
-                        lastRunStatus === 'failed' || lastRunStatus === 'error' ? (darkMode ? 'text-[#F85149]' : 'text-[#C9372C]') :
+                        lastRunDisplay?.variant === 'green' ? (darkMode ? 'text-[#3FB950]' : 'text-[#00875A]') :
+                        lastRunDisplay?.variant === 'red' ? (darkMode ? 'text-[#F85149]' : 'text-[#C9372C]') :
+                        lastRunDisplay?.variant === 'amber' ? (darkMode ? 'text-[#D29922]' : 'text-[#B65C00]') :
+                        lastRunDisplay?.variant === 'neutral' ? (darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]') :
                         (darkMode ? 'text-[#58A6FF]' : 'text-[#0C66E4]')
                       }`}>
-                        {lastRunStatus === 'completed' ? 'Passed' : lastRunStatus === 'failed' || lastRunStatus === 'error' ? 'Failed' : 'Running'}
+                        {lastRunDisplay?.label || 'Running'}
                       </span>
                       <span className={`text-[10px] font-mono ml-auto ${
                         darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'
@@ -894,78 +947,76 @@ function ProjectDashboard() {
 
       {/* Pipeline Runs View */}
       {activeTab === 'runs' && (
-        <div className="bg-[#F4F5F7] border border-[#DFE1E6] rounded-lg overflow-hidden p-4">
+        <div className={`border rounded-lg overflow-hidden p-4 transition-colors ${darkMode ? 'bg-[#161B22] border-[#30363D]' : 'bg-[#F4F5F7] border-[#DFE1E6]'}`}>
           <div className="flex items-center gap-2 mb-6">
-            <Activity className="w-5 h-5 text-blue-400" />
-            <h3 className="text-lg font-bold text-[#172B4D]">Execution History</h3>
+            <Activity className={`w-5 h-5 ${darkMode ? 'text-[#58A6FF]' : 'text-blue-400'}`} />
+            <h3 className={`text-lg font-bold ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>Execution History</h3>
           </div>
           
           {projectRuns.length === 0 ? (
-            <div className="text-center py-12 bg-[#F1F2F4]/30 rounded-lg border border-dashed border-[#C1C7D0]">
-              <PlayCircle className="w-8 h-8 text-[#8993A4] mx-auto mb-3" />
-              <p className="text-[#5E6C84]">No QA pipelines have run for this project yet.</p>
+            <div className={`text-center py-12 rounded-lg border border-dashed ${darkMode ? 'bg-[#0D1117]/80 border-[#30363D]' : 'bg-[#F1F2F4]/30 border-[#C1C7D0]'}`}>
+              <PlayCircle className={`w-8 h-8 mx-auto mb-3 ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`} />
+              <p className={darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}>No QA pipelines have run for this project yet.</p>
             </div>
           ) : (
             <div className="space-y-2">
               {projectRuns.map((run) => {
-                // Extract compact summary from events array
-                const summaryEvent = [...(run.events || [])].reverse().find(e => e.type === 'run_summary_updated');
-                const summary = summaryEvent?.data || {};
-                const isRunning = run.status === 'running';
-                const isFailed = run.status === 'failed' || run.status === 'error';
-                const isCompleted = run.status === 'completed';
+                const display = deriveRunDisplayStatus(run);
+                const { line: detailLine } = buildRunHistoryDetailLine(run);
 
                 return (
-                  <div key={run.runId} className="bg-[#FFFFFF] border border-[#DFE1E6] rounded-lg px-4 py-3 flex items-center justify-between gap-4 group hover:bg-[#F1F2F4] transition-colors">
+                  <div key={run.runId} className={`rounded-lg px-4 py-3 flex items-center justify-between gap-4 group border transition-colors ${
+                    darkMode
+                      ? 'bg-[#1C2333] border-[#30363D] hover:bg-[#21262D]'
+                      : 'bg-[#FFFFFF] border-[#DFE1E6] hover:bg-[#F1F2F4]'
+                  }`}>
                     {/* Left: status icon + run ID + timestamp */}
-                    <div className="flex items-center gap-3 min-w-0">
+                    <div className="flex items-center gap-3 min-w-0 flex-shrink-0">
                       <div className="flex-shrink-0">
-                        {isCompleted ? <CheckCircle2 className="w-4 h-4 text-green-500" /> :
-                         isFailed    ? <XCircle className="w-4 h-4 text-red-500" /> :
-                                       <Loader className="w-4 h-4 text-blue-400 animate-spin" />}
+                        {display.variant === 'green'
+                          ? <CheckCircle2 className={`w-4 h-4 ${darkMode ? 'text-[#3FB950]' : 'text-green-500'}`} />
+                          : display.variant === 'red'
+                            ? <XCircle className={`w-4 h-4 ${darkMode ? 'text-[#F85149]' : 'text-red-500'}`} />
+                            : display.variant === 'amber'
+                              ? <AlertTriangle className={`w-4 h-4 ${darkMode ? 'text-[#D29922]' : 'text-amber-500'}`} />
+                              : display.variant === 'neutral'
+                                ? <CheckCircle2 className={`w-4 h-4 ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`} />
+                                : <Loader className={`w-4 h-4 animate-spin ${darkMode ? 'text-[#58A6FF]' : 'text-blue-400'}`} />}
                       </div>
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-mono text-[#172B4D]">#{run.runId.substring(0, 8)}</span>
-                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${isCompleted ? 'bg-green-500/15 text-[#00875A]' : isFailed ? 'bg-red-500/15 text-[#C9372C]' : 'bg-blue-500/15 text-blue-300'}`}>
-                            {isCompleted ? 'Passed' : isFailed ? 'Failed' : 'Running'}
+                          <span className={`text-sm font-mono ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>#{run.runId.substring(0, 8)}</span>
+                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+                            display.variant === 'green'
+                              ? (darkMode ? 'bg-[rgba(63,185,80,0.15)] text-[#3FB950]' : 'bg-green-500/15 text-[#00875A]')
+                              : display.variant === 'red'
+                                ? (darkMode ? 'bg-[rgba(248,81,73,0.15)] text-[#F85149]' : 'bg-red-500/15 text-[#C9372C]')
+                                : display.variant === 'amber'
+                                  ? (darkMode ? 'bg-[rgba(210,153,34,0.15)] text-[#D29922]' : 'bg-amber-500/15 text-[#B65C00]')
+                                  : display.variant === 'neutral'
+                                    ? (darkMode ? 'bg-[#30363D] text-[#8B949E]' : 'bg-[#DFE1E6] text-[#5E6C84]')
+                                    : (darkMode ? 'bg-[rgba(56,139,253,0.15)] text-[#58A6FF]' : 'bg-blue-500/15 text-blue-300')
+                          }`}>
+                            {display.label}
                           </span>
                         </div>
-                        <span className="text-[10px] text-[#8993A4] flex items-center gap-1 mt-0.5">
+                        <span className={`text-[10px] flex items-center gap-1 mt-0.5 ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}>
                           <Clock className="w-3 h-3" />
                           {new Date(run.createdAt || Date.now()).toLocaleString()}
                         </span>
                       </div>
                     </div>
 
-                    {/* Middle: mini live counters */}
-                    <div className="hidden md:flex items-center gap-3 text-[11px]">
-                      {summary.scenarioCount > 0 && (
-                        <span className="flex items-center gap-1 text-[#5E6C84]">
-                          <Activity className="w-3 h-3" />{summary.scenarioCount} scenario{summary.scenarioCount !== 1 ? 's' : ''}
-                        </span>
-                      )}
-                      {summary.testCaseCount > 0 && (
-                        <span className="flex items-center gap-1 text-[#5E6C84]">
-                          <ListChecks className="w-3 h-3" />{summary.testCaseCount} case{summary.testCaseCount !== 1 ? 's' : ''}
-                        </span>
-                      )}
-                      {summary.passedCount > 0 && (
-                        <span className="flex items-center gap-1 text-[#00875A]">
-                          <CheckCircle2 className="w-3 h-3" />{summary.passedCount} pass
-                        </span>
-                      )}
-                      {summary.failedCount > 0 && (
-                        <span className="flex items-center gap-1 text-[#C9372C]">
-                          <XCircle className="w-3 h-3" />{summary.failedCount} fail
-                        </span>
-                      )}
-                      {summary.retryCount > 0 && (
-                        <span className="flex items-center gap-1 text-orange-400">
-                          <RefreshCw className="w-3 h-3" />{summary.retryCount} retry
-                        </span>
-                      )}
-                    </div>
+                    {detailLine ? (
+                      <p
+                        className={`flex-1 min-w-0 text-[11px] truncate text-left ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}
+                        title={detailLine}
+                      >
+                        {detailLine}
+                      </p>
+                    ) : (
+                      <div className="flex-1 min-w-0" aria-hidden="true" />
+                    )}
 
                     {/* Right: actions */}
                     <div className="flex items-center gap-2 flex-shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
@@ -977,7 +1028,7 @@ function ProjectDashboard() {
                       </button>
                       <button
                         onClick={(e) => handleDeleteRun(run.runId, e)}
-                        className="p-1.5 text-[#8993A4] hover:text-[#C9372C] hover:bg-red-400/10 rounded transition-colors"
+                        className={`p-1.5 rounded transition-colors ${darkMode ? 'text-[#8B949E] hover:text-[#F85149] hover:bg-[rgba(248,81,73,0.1)]' : 'text-[#8993A4] hover:text-[#C9372C] hover:bg-red-400/10'}`}
                         title="Delete run and all test cases"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -1056,70 +1107,70 @@ function ProjectDashboard() {
       )}
 
       {/* Slide-In Details Panel */}
-      <div className={`fixed inset-y-0 right-0 w-full max-w-[560px] bg-[#F4F5F7] border-l border-[#DFE1E6] shadow-[0_0_40px_rgba(0,0,0,0.5)] transform transition-transform duration-300 ease-in-out z-40 overflow-y-auto ${isPanelOpen ? 'translate-x-0' : 'translate-x-full'}`}>
+      <div className={`fixed inset-y-0 right-0 w-full max-w-[560px] ${darkMode ? 'bg-[#161B22] border-l border-[#30363D]' : 'bg-[#F4F5F7] border-l border-[#DFE1E6]'} shadow-[0_0_40px_rgba(0,0,0,0.5)] transform transition-transform duration-300 ease-in-out z-40 overflow-y-auto ${isPanelOpen ? 'translate-x-0' : 'translate-x-full'}`}>
 
           {/* SCENARIO PANEL */}
           {isPanelOpen && panelMode === 'scenario' && selectedItem && (
               <div className="h-full flex flex-col">
-                  <div className="flex justify-between items-start p-6 border-b border-[#DFE1E6] bg-[#F4F5F7] sticky top-0 z-10">
+                  <div className={`flex justify-between items-start p-6 border-b sticky top-0 z-10 ${darkMode ? 'border-[#30363D] bg-[#161B22]' : 'border-[#DFE1E6] bg-[#F4F5F7]'}`}>
                       <div className="pr-4">
-                          <p className="text-sm font-medium text-indigo-400 font-mono mb-1">{selectedItem.id}</p>
-                          <h2 className="text-xl font-bold text-[#172B4D] leading-tight">Scenario Detail</h2>
+                          <p className={`text-sm font-medium font-mono mb-1 ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-400'}`}>{selectedItem.id}</p>
+                          <h2 className={`text-xl font-bold leading-tight ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>Scenario Detail</h2>
                           <div className="flex items-center mt-3 text-sm">
                             {(() => {
                               const tcs = selectedItem.testCases || [];
                               const ex = normTcStatus(selectedItem.execStatus);
                               if (ex === 'fail') {
-                                return <><AlertTriangle className="w-4 h-4 text-red-500 mr-2"/><span className="text-[#C9372C] font-medium">Failed</span></>;
+                                return <><AlertTriangle className={`w-4 h-4 mr-2 ${darkMode ? 'text-[#F85149]' : 'text-red-500'}`}/><span className={`font-medium ${darkMode ? 'text-[#F85149]' : 'text-[#C9372C]'}`}>Failed</span></>;
                               }
                               if (tcs.some((t) => normTcStatus(t.status) === 'healing')) {
-                                return <><RefreshCw className="w-4 h-4 text-blue-500 mr-2 animate-pulse"/><span className="text-[#0C66E4] font-medium">Healing (LLM repair)</span></>;
+                                return <><RefreshCw className={`w-4 h-4 mr-2 animate-pulse ${darkMode ? 'text-[#58A6FF]' : 'text-blue-500'}`}/><span className={`font-medium ${darkMode ? 'text-[#58A6FF]' : 'text-[#0C66E4]'}`}>Healing (LLM repair)</span></>;
                               }
                               if (tcs.some((t) => normTcStatus(t.status) === 'running')) {
-                                return <><Loader className="w-4 h-4 text-amber-500 mr-2 animate-spin"/><span className="text-[#B65C00] font-medium">Running in sandbox</span></>;
+                                return <><Loader className={`w-4 h-4 mr-2 animate-spin ${darkMode ? 'text-[#D29922]' : 'text-amber-500'}`}/><span className={`font-medium ${darkMode ? 'text-[#D29922]' : 'text-[#B65C00]'}`}>Running in sandbox</span></>;
                               }
                               if (ex === 'pass') {
-                                return <><ShieldCheck className="w-4 h-4 text-green-500 mr-2"/><span className="text-[#00875A] font-medium">Passed</span></>;
+                                return <><ShieldCheck className={`w-4 h-4 mr-2 ${darkMode ? 'text-[#3FB950]' : 'text-green-500'}`}/><span className={`font-medium ${darkMode ? 'text-[#3FB950]' : 'text-[#00875A]'}`}>Passed</span></>;
                               }
-                              return <><Clock className="w-4 h-4 text-[#8993A4] mr-2"/><span className="text-[#5E6C84] font-medium">Pending execution</span></>;
+                              return <><Clock className={`w-4 h-4 mr-2 ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}/><span className={`font-medium ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>Pending execution</span></>;
                             })()}
                           </div>
                       </div>
-                      <button onClick={closePanel} className="text-[#5E6C84] hover:text-[#172B4D] bg-[#F1F2F4] hover:bg-[#DFE1E6] p-2 rounded-full transition-colors flex-shrink-0 mt-1">
+                      <button onClick={closePanel} className={`p-2 rounded-full transition-colors flex-shrink-0 mt-1 ${darkMode ? 'text-[#8B949E] hover:text-[#E6EDF3] bg-[#30363D] hover:bg-[#484F58]' : 'text-[#5E6C84] hover:text-[#172B4D] bg-[#F1F2F4] hover:bg-[#DFE1E6]'}`}>
                           <X className="w-5 h-5"/>
                       </button>
                   </div>
                   <div className="p-6 space-y-6 flex-1">
                       <div>
-                          <h4 className="text-xs uppercase tracking-widest font-bold text-[#8993A4] mb-2 flex items-center"><span className="w-1 h-4 bg-indigo-500 rounded mr-2"/>Description</h4>
-                          <p className="text-[#5E6C84] text-sm leading-relaxed bg-[#FFFFFF] p-4 rounded border border-[#DFE1E6]">{selectedItem.description}</p>
+                          <h4 className={`text-xs uppercase tracking-widest font-bold mb-2 flex items-center ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}><span className="w-1 h-4 bg-indigo-500 rounded mr-2"/>Description</h4>
+                          <p className={`text-sm leading-relaxed p-4 rounded border ${darkMode ? 'text-[#8B949E] bg-[#1C2333] border-[#30363D]' : 'text-[#5E6C84] bg-[#FFFFFF] border-[#DFE1E6]'}`}>{selectedItem.description}</p>
                       </div>
                       <div className="grid grid-cols-2 gap-3">
-                          <div className="bg-[#FFFFFF] p-3 rounded border border-[#DFE1E6]"><span className="text-xs text-[#8993A4] block mb-1">Type</span><span className="text-sm font-medium text-[#172B4D]">{selectedItem.type || '—'}</span></div>
-                          <div className="bg-[#FFFFFF] p-3 rounded border border-[#DFE1E6]"><span className="text-xs text-[#8993A4] block mb-1">Priority</span><span className="text-sm font-medium text-[#172B4D]">{selectedItem.priority || '—'}</span></div>
+                          <div className={`p-3 rounded border ${darkMode ? 'bg-[#1C2333] border-[#30363D]' : 'bg-[#FFFFFF] border-[#DFE1E6]'}`}><span className={`text-xs block mb-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}>Type</span><span className={`text-sm font-medium ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>{selectedItem.type || '—'}</span></div>
+                          <div className={`p-3 rounded border ${darkMode ? 'bg-[#1C2333] border-[#30363D]' : 'bg-[#FFFFFF] border-[#DFE1E6]'}`}><span className={`text-xs block mb-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}>Priority</span><span className={`text-sm font-medium ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>{selectedItem.priority || '—'}</span></div>
                       </div>
 
                       {/* Test Cases Summary inside scenario panel */}
                       {(selectedItem.testCases?.length > 0) && (
                           <div>
-                              <h4 className="text-xs uppercase tracking-widest font-bold text-[#8993A4] mb-2 flex items-center"><span className="w-1 h-4 bg-green-500 rounded mr-2"/>Test Cases ({selectedItem.testCases.length})</h4>
+                              <h4 className={`text-xs uppercase tracking-widest font-bold mb-2 flex items-center ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}><span className="w-1 h-4 bg-green-500 rounded mr-2"/>Test Cases ({selectedItem.testCases.length})</h4>
                               <div className="space-y-2">
                                   {selectedItem.testCases.map(tc => (
                                       <div key={tc.testCaseId}
                                           onClick={() => openTestCaseDetails(tc, selectedItem)}
-                                          className="cursor-pointer flex items-center justify-between p-3 bg-[#FFFFFF] hover:bg-[#F1F2F4] rounded border border-[#DFE1E6] transition-colors">
+                                          className={`cursor-pointer flex items-center justify-between p-3 rounded border transition-colors ${darkMode ? 'bg-[#1C2333] border-[#30363D] hover:bg-[#21262D]' : 'bg-[#FFFFFF] border-[#DFE1E6] hover:bg-[#F1F2F4]'}`}>
                                           <div>
-                                              <span className="text-xs font-mono text-indigo-400">{tc.testCaseId}</span>
+                                              <span className={`text-xs font-mono ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-400'}`}>{tc.testCaseId}</span>
                                               {tc.version > 1 && <span className="ml-2 text-[9px] px-1 bg-blue-500/20 text-blue-300 rounded border border-blue-500/30">v{tc.version}</span>}
-                                              <p className="text-xs text-[#5E6C84] mt-0.5">{tc.title}</p>
+                                              <p className={`text-xs mt-0.5 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>{tc.title}</p>
                                           </div>
                                           <div className="flex items-center gap-2 flex-shrink-0">
-                                              {normTcStatus(tc.status) === 'pass' && <CheckCircle2 className="w-4 h-4 text-[#00875A]"/>}
-                                              {normTcStatus(tc.status) === 'fail' && <XCircle className="w-4 h-4 text-[#C9372C]"/>}
-                                              {normTcStatus(tc.status) === 'running' && <Loader className="w-4 h-4 text-amber-500 animate-spin"/>}
-                                              {normTcStatus(tc.status) === 'healing' && <RefreshCw className="w-4 h-4 text-[#0C66E4] animate-pulse"/>}
-                                              {(!normTcStatus(tc.status) || normTcStatus(tc.status) === 'pending') && <Clock className="w-4 h-4 text-[#8993A4]"/>}
-                                              <ChevronRight className="w-4 h-4 text-[#8993A4]"/>
+                                              {normTcStatus(tc.status) === 'pass' && <CheckCircle2 className={`w-4 h-4 ${darkMode ? 'text-[#3FB950]' : 'text-[#00875A]'}`}/>}
+                                              {normTcStatus(tc.status) === 'fail' && <XCircle className={`w-4 h-4 ${darkMode ? 'text-[#F85149]' : 'text-[#C9372C]'}`}/>}
+                                              {normTcStatus(tc.status) === 'running' && <Loader className={`w-4 h-4 animate-spin ${darkMode ? 'text-[#D29922]' : 'text-amber-500'}`}/>}
+                                              {normTcStatus(tc.status) === 'healing' && <RefreshCw className={`w-4 h-4 animate-pulse ${darkMode ? 'text-[#58A6FF]' : 'text-[#0C66E4]'}`}/>}
+                                              {(!normTcStatus(tc.status) || normTcStatus(tc.status) === 'pending') && <Clock className={`w-4 h-4 ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}/>}
+                                              <ChevronRight className={`w-4 h-4 ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}/>
                                           </div>
                                       </div>
                                   ))}
@@ -1129,8 +1180,8 @@ function ProjectDashboard() {
 
                       {selectedItem.lastPRTested && (
                           <div>
-                              <h4 className="text-xs uppercase tracking-widest font-bold text-[#8993A4] mb-2 flex items-center"><span className="w-1 h-4 bg-blue-500 rounded mr-2"/>Last PR Trace</h4>
-                              <div className="bg-blue-900/10 border border-blue-900 p-3 rounded"><span className="text-xs text-blue-400 block mb-1">Run ID</span><span className="text-sm text-blue-300 font-mono">{selectedItem.lastPRTested}</span></div>
+                              <h4 className={`text-xs uppercase tracking-widest font-bold mb-2 flex items-center ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}><span className="w-1 h-4 bg-blue-500 rounded mr-2"/>Last PR Trace</h4>
+                              <div className={`p-3 rounded border ${darkMode ? 'bg-[rgba(56,139,253,0.1)] border-[rgba(56,139,253,0.3)]' : 'bg-blue-900/10 border border-blue-900'}`}><span className={`text-xs block mb-1 ${darkMode ? 'text-[#58A6FF]' : 'text-blue-400'}`}>Run ID</span><span className={`text-sm font-mono ${darkMode ? 'text-[#79C0FF]' : 'text-blue-300'}`}>{selectedItem.lastPRTested}</span></div>
                           </div>
                       )}
                   </div>
@@ -1140,37 +1191,41 @@ function ProjectDashboard() {
           {/* TEST CASE PANEL */}
           {isPanelOpen && panelMode === 'testcase' && selectedTestCase && (
               <div className="h-full flex flex-col">
-                  <div className="flex justify-between items-start p-6 border-b border-[#DFE1E6] bg-[#F4F5F7] sticky top-0 z-10">
+                  <div className={`flex justify-between items-start p-6 border-b sticky top-0 z-10 ${darkMode ? 'border-[#30363D] bg-[#161B22]' : 'border-[#DFE1E6] bg-[#F4F5F7]'}`}>
                       <div className="pr-4 min-w-0">
-                          <p className="text-[10px] text-[#8993A4] mb-1">
-                              {selectedTestCase.parentScenario?.id} → <span className="text-indigo-400 font-mono">{selectedTestCase.testCaseId}</span>
+                          <p className={`text-[10px] mb-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}>
+                              {selectedTestCase.parentScenario?.id} → <span className={`font-mono ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-400'}`}>{selectedTestCase.testCaseId}</span>
                               {selectedTestCase.version > 1 && <span className="ml-2 text-[9px] px-1 bg-blue-500/20 text-blue-300 rounded border border-blue-500/30">v{selectedTestCase.version}</span>}
                           </p>
-                          <h2 className="text-lg font-bold text-[#172B4D] leading-tight">{selectedTestCase.title}</h2>
+                          <h2 className={`text-lg font-bold leading-tight ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>{selectedTestCase.title}</h2>
                           <div className="flex items-center mt-2 text-xs gap-3">
-                              {normTcStatus(selectedTestCase.status) === 'pass' && <span className="flex items-center gap-1 text-[#00875A]"><CheckCircle2 className="w-3.5 h-3.5"/>Passed</span>}
-                              {normTcStatus(selectedTestCase.status) === 'fail' && <span className="flex items-center gap-1 text-[#C9372C]"><XCircle className="w-3.5 h-3.5"/>Failed</span>}
-                              {normTcStatus(selectedTestCase.status) === 'running' && <span className="flex items-center gap-1 text-[#B65C00]"><Loader className="w-3.5 h-3.5 animate-spin"/>Running</span>}
-                              {normTcStatus(selectedTestCase.status) === 'healing' && <span className="flex items-center gap-1 text-[#0C66E4]"><RefreshCw className="w-3.5 h-3.5 animate-pulse"/>Healing</span>}
-                              {(!normTcStatus(selectedTestCase.status) || normTcStatus(selectedTestCase.status) === 'pending') && <span className="flex items-center gap-1 text-[#5E6C84]"><Clock className="w-3.5 h-3.5"/>Pending</span>}
-                              {selectedTestCase.language && <span className="flex items-center gap-1 text-[#5E6C84]"><Code2 className="w-3.5 h-3.5"/>{selectedTestCase.language}</span>}
+                              {normTcStatus(selectedTestCase.status) === 'pass' && <span className={`flex items-center gap-1 ${darkMode ? 'text-[#3FB950]' : 'text-[#00875A]'}`}><CheckCircle2 className="w-3.5 h-3.5"/>Passed</span>}
+                              {normTcStatus(selectedTestCase.status) === 'fail' && <span className={`flex items-center gap-1 ${darkMode ? 'text-[#F85149]' : 'text-[#C9372C]'}`}><XCircle className="w-3.5 h-3.5"/>Failed</span>}
+                              {normTcStatus(selectedTestCase.status) === 'running' && <span className={`flex items-center gap-1 ${darkMode ? 'text-[#D29922]' : 'text-[#B65C00]'}`}><Loader className="w-3.5 h-3.5 animate-spin"/>Running</span>}
+                              {normTcStatus(selectedTestCase.status) === 'healing' && <span className={`flex items-center gap-1 ${darkMode ? 'text-[#58A6FF]' : 'text-[#0C66E4]'}`}><RefreshCw className="w-3.5 h-3.5 animate-pulse"/>Healing</span>}
+                              {(!normTcStatus(selectedTestCase.status) || normTcStatus(selectedTestCase.status) === 'pending') && <span className={`flex items-center gap-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}><Clock className="w-3.5 h-3.5"/>Pending</span>}
+                              {selectedTestCase.language && <span className={`flex items-center gap-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}><Code2 className="w-3.5 h-3.5"/>{selectedTestCase.language}</span>}
                           </div>
                       </div>
                       <div className="flex items-center gap-2 flex-shrink-0">
-                          <button onClick={() => { setPanelMode('scenario'); setSelectedItem(selectedTestCase.parentScenario); }} className="text-[#5E6C84] hover:text-indigo-400 bg-[#F1F2F4] hover:bg-[#DFE1E6] p-2 rounded-full transition-colors" title="Back to scenario">
+                          <button onClick={() => { setPanelMode('scenario'); setSelectedItem(selectedTestCase.parentScenario); }} className={`p-2 rounded-full transition-colors ${darkMode ? 'text-[#8B949E] hover:text-[#58A6FF] bg-[#30363D] hover:bg-[#484F58]' : 'text-[#5E6C84] hover:text-indigo-400 bg-[#F1F2F4] hover:bg-[#DFE1E6]'}`} title="Back to scenario">
                               <ChevronRight className="w-4 h-4 rotate-180"/>
                           </button>
-                          <button onClick={closePanel} className="text-[#5E6C84] hover:text-[#172B4D] bg-[#F1F2F4] hover:bg-[#DFE1E6] p-2 rounded-full transition-colors">
+                          <button onClick={closePanel} className={`p-2 rounded-full transition-colors ${darkMode ? 'text-[#8B949E] hover:text-[#E6EDF3] bg-[#30363D] hover:bg-[#484F58]' : 'text-[#5E6C84] hover:text-[#172B4D] bg-[#F1F2F4] hover:bg-[#DFE1E6]'}`}>
                               <X className="w-5 h-5"/>
                           </button>
                       </div>
                   </div>
 
                   {/* Tab bar */}
-                  <div className="flex border-b border-[#DFE1E6] bg-[#F4F5F7]">
-                      {[['steps','Steps','ListChecks'], ['script','Test Script','Code2'], ['data','Test Data','Database']].map(([key, label, _]) => (
+                  <div className={`flex border-b ${darkMode ? 'border-[#30363D] bg-[#161B22]' : 'border-[#DFE1E6] bg-[#F4F5F7]'}`}>
+                      {[['steps','Steps'], ['script','Test Script'], ['data','Test Data'], ['media','Run & media']].map(([key, label]) => (
                           <button key={key} onClick={() => setTcPanelTab(key)}
-                              className={`px-5 py-3 text-xs font-medium border-b-2 transition-colors ${tcPanelTab === key ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]'}`}>
+                              className={`px-5 py-3 text-xs font-medium border-b-2 transition-colors ${
+                                tcPanelTab === key
+                                  ? (darkMode ? 'border-[#58A6FF] text-[#58A6FF]' : 'border-indigo-500 text-indigo-400')
+                                  : (darkMode ? 'border-transparent text-[#6E7681] hover:text-[#8B949E]' : 'border-transparent text-[#8993A4] hover:text-[#5E6C84]')
+                              }`}>
                               {label}
                           </button>
                       ))}
@@ -1181,27 +1236,30 @@ function ProjectDashboard() {
                       {tcPanelTab === 'steps' && (
                           <div className="space-y-3">
                               {(selectedTestCase.steps || []).length === 0
-                                  ? <p className="text-sm text-[#8993A4] italic">No steps recorded.</p>
-                                  : (selectedTestCase.steps || []).map((step, i) => (
-                                      <div key={i} className="bg-[#FFFFFF] border border-[#DFE1E6] rounded p-3">
+                                  ? <p className={`text-sm italic ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>No steps recorded.</p>
+                                  : (selectedTestCase.steps || []).map((step, i) => {
+                                      const { action, expectedResult } = normalizeStepForDisplay(step);
+                                      return (
+                                      <div key={i} className={`rounded p-3 border ${darkMode ? 'bg-[#1C2333] border-[#30363D]' : 'bg-[#FFFFFF] border-[#DFE1E6]'}`}>
                                           <div className="flex items-start gap-3">
-                                              <span className="flex-shrink-0 w-5 h-5 rounded-full bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 text-[10px] flex items-center justify-center font-bold">{i + 1}</span>
+                                              <span className={`flex-shrink-0 w-5 h-5 rounded-full text-[10px] flex items-center justify-center font-bold ${darkMode ? 'bg-[rgba(56,139,253,0.15)] border border-[rgba(56,139,253,0.35)] text-[#58A6FF]' : 'bg-indigo-500/20 border border-indigo-500/40 text-indigo-300'}`}>{i + 1}</span>
                                               <div className="min-w-0">
-                                                  <p className="text-xs text-[#172B4D] font-medium mb-1">{step.action}</p>
-                                                  {step.expectedResult && (
-                                                      <p className="text-[10px] text-[#8993A4] italic">Expected: {step.expectedResult}</p>
+                                                  <p className={`text-xs font-medium mb-1 ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>{action || '—'}</p>
+                                                  {expectedResult && (
+                                                      <p className={`text-[10px] italic ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}>Expected: {expectedResult}</p>
                                                   )}
                                               </div>
                                           </div>
                                       </div>
-                                  ))
+                                      );
+                                  })
                               }
                               {selectedTestCase.codeFiles?.length > 0 && (
                                   <div className="mt-4">
-                                      <h5 className="text-xs text-[#8993A4] uppercase tracking-wider mb-2 flex items-center gap-1"><GitBranch className="w-3 h-3"/>Covers Files</h5>
+                                      <h5 className={`text-xs uppercase tracking-wider mb-2 flex items-center gap-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}><GitBranch className="w-3 h-3"/>Covers Files</h5>
                                       <div className="space-y-1">
                                           {selectedTestCase.codeFiles.map(f => (
-                                              <span key={f} className="block text-[11px] font-mono text-[#5E6C84] bg-[#F1F2F4] px-2 py-1 rounded">{f}</span>
+                                              <span key={f} className={`block text-[11px] font-mono px-2 py-1 rounded ${darkMode ? 'text-[#8B949E] bg-[#30363D]' : 'text-[#5E6C84] bg-[#F1F2F4]'}`}>{f}</span>
                                           ))}
                                       </div>
                                   </div>
@@ -1213,8 +1271,8 @@ function ProjectDashboard() {
                       {tcPanelTab === 'script' && (
                           <div>
                               {selectedTestCase.testScript
-                                  ? <pre className="text-xs text-[#5E6C84] bg-[#FAFBFC] p-4 rounded border border-[#DFE1E6] overflow-auto whitespace-pre-wrap font-mono leading-relaxed">{selectedTestCase.testScript}</pre>
-                                  : <p className="text-sm text-[#8993A4] italic">No test script generated yet.</p>
+                                  ? <pre className={`text-xs p-4 rounded border overflow-auto whitespace-pre-wrap font-mono leading-relaxed ${darkMode ? 'text-[#8B949E] bg-[#0D1117] border-[#30363D]' : 'text-[#5E6C84] bg-[#FAFBFC] border-[#DFE1E6]'}`}>{selectedTestCase.testScript}</pre>
+                                  : <p className={`text-sm italic ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>No test script generated yet.</p>
                               }
                           </div>
                       )}
@@ -1223,18 +1281,95 @@ function ProjectDashboard() {
                       {tcPanelTab === 'data' && (
                           <div>
                               {selectedTestCase.testData && Object.keys(selectedTestCase.testData).length > 0
-                                  ? <pre className="text-xs text-[#5E6C84] bg-[#FAFBFC] p-4 rounded border border-[#DFE1E6] overflow-auto whitespace-pre-wrap font-mono">{JSON.stringify(selectedTestCase.testData, null, 2)}</pre>
-                                  : <p className="text-sm text-[#8993A4] italic">No test data recorded.</p>
+                                  ? <pre className={`text-xs p-4 rounded border overflow-auto whitespace-pre-wrap font-mono ${darkMode ? 'text-[#8B949E] bg-[#0D1117] border-[#30363D]' : 'text-[#5E6C84] bg-[#FAFBFC] border-[#DFE1E6]'}`}>{JSON.stringify(selectedTestCase.testData, null, 2)}</pre>
+                                  : <p className={`text-sm italic ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>No test data recorded.</p>
                               }
+                          </div>
+                      )}
+
+                      {tcPanelTab === 'media' && (
+                          <div className="space-y-4">
+                              {(!selectedTestCase.runId || !selectedTestCase.testCaseId) ? (
+                                  <p className={`text-sm italic ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>This test case is not tied to a pipeline run yet.</p>
+                              ) : tcMediaLoading ? (
+                                  <div className={`flex items-center gap-2 text-sm ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}><Loader className="w-4 h-4 animate-spin"/>Loading media…</div>
+                              ) : tcMediaError ? (
+                                  <p className={`text-sm ${darkMode ? 'text-[#F85149]' : 'text-[#C9372C]'}`}>{tcMediaError}</p>
+                              ) : (
+                                  <>
+                                      <div className={`text-xs space-y-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>
+                                          <p className={`uppercase tracking-wider text-[10px] ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>Run</p>
+                                          <p><span className={darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}>ID</span>{' '}<span className={`font-mono ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>{String(selectedTestCase.runId).slice(0, 8)}…</span></p>
+                                          <Link
+                                              to={`/projects/${projectId}/run/${encodeURIComponent(selectedTestCase.runId)}/scripts`}
+                                              className={`inline-flex items-center gap-1 hover:underline ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-500'}`}
+                                          >
+                                              Open run scripts & attempts <ExternalLink className="w-3 h-3"/>
+                                          </Link>
+                                      </div>
+
+                                      {tcMedia && (
+                                          <>
+                                              {(tcMedia.videos || []).length > 0 ? (
+                                                  <div>
+                                                      <p className={`text-[10px] uppercase tracking-wider mb-2 flex items-center gap-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}><Film className="w-3 h-3"/> Video</p>
+                                                      <VideoPlayer videos={tcMedia.videos} darkMode={darkMode} />
+                                                  </div>
+                                              ) : null}
+                                              {(tcMedia.screenshots || []).length > 0 && (
+                                                  <div>
+                                                      <p className={`text-[10px] uppercase tracking-wider mb-2 flex items-center gap-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}><ImageIcon className="w-3 h-3"/> Screenshots</p>
+                                                      <div className="space-y-2">
+                                                          {(tcMedia.screenshots || []).map((s) => (
+                                                              <a
+                                                                  key={s.url}
+                                                                  href={`${API_BASE}${s.url}`}
+                                                                  target="_blank"
+                                                                  rel="noreferrer"
+                                                                  className={`block rounded overflow-hidden hover:ring-2 ${darkMode ? 'border border-[#30363D] bg-[#1C2333] hover:ring-[#58A6FF]/40' : 'border border-[#DFE1E6] bg-[#FFFFFF] hover:ring-indigo-400/40'}`}
+                                                              >
+                                                                  <img
+                                                                      src={`${API_BASE}${s.url}`}
+                                                                      alt={s.fileName || 'Screenshot'}
+                                                                      className="w-full max-h-64 object-contain bg-[#171717]"
+                                                                  />
+                                                                  <span className={`block text-[9px] px-2 py-1 truncate ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}>{s.fileName}</span>
+                                                              </a>
+                                                          ))}
+                                                      </div>
+                                                  </div>
+                                              )}
+                                              {(tcMedia.traces || []).length > 0 && (
+                                                  <div>
+                                                      <p className={`text-[10px] uppercase tracking-wider mb-1 flex items-center gap-1 ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}><Film className="w-3 h-3"/> Trace files</p>
+                                                      <ul className={`text-[11px] space-y-2 ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-500'}`}>
+                                                          {(tcMedia.traces || []).map((t) => (
+                                                              <li key={t.url}>
+                                                                  <a href={`${API_BASE}${t.url}`} download={t.fileName} className="hover:underline break-all">{t.fileName}</a>
+                                                                  <span className={`block text-[9px] mt-0.5 ${darkMode ? 'text-[#8B949E]' : 'text-[#8993A4]'}`}>
+                                                                      Inspect locally with: <code className={`px-1 rounded text-[10px] ${darkMode ? 'bg-[#30363D] text-[#E6EDF3]' : 'bg-[#F4F5F7] text-[#172B4D]'}`}>npx playwright show-trace &lt;this-file.zip&gt;</code>
+                                                                  </span>
+                                                              </li>
+                                                          ))}
+                                                      </ul>
+                                                  </div>
+                                              )}
+                                              {(!tcMedia.videos?.length && !tcMedia.screenshots?.length && !tcMedia.traces?.length) && (
+                                                  <p className={`text-sm italic ${darkMode ? 'text-[#6E7681]' : 'text-[#8993A4]'}`}>No media for this run (no Playwright video, screenshots, or traces were saved for this test case).</p>
+                                              )}
+                                          </>
+                                      )}
+                                  </>
+                              )}
                           </div>
                       )}
                   </div>
 
                   {/* Footer meta */}
-                  <div className="px-6 py-3 border-t border-[#DFE1E6] bg-[#F4F5F7] text-[10px] text-[#8993A4] flex items-center justify-between">
+                  <div className={`px-6 py-3 border-t flex items-center justify-between text-[10px] ${darkMode ? 'border-[#30363D] bg-[#161B22] text-[#8B949E]' : 'border-[#DFE1E6] bg-[#F4F5F7] text-[#8993A4]'}`}>
                       <span>Created {selectedTestCase.createdAt ? new Date(selectedTestCase.createdAt).toLocaleString() : '—'}</span>
                       {selectedTestCase.healAttempts > 0 && <span className="flex items-center gap-1 text-orange-400"><RefreshCw className="w-3 h-3"/>{selectedTestCase.healAttempts} heal attempt{selectedTestCase.healAttempts !== 1 ? 's' : ''}</span>}
-                      {selectedTestCase.prUrl && <a href={selectedTestCase.prUrl} target="_blank" rel="noreferrer" className="text-indigo-400 hover:underline truncate max-w-[160px]" title={selectedTestCase.prUrl}>PR ↗</a>}
+                      {selectedTestCase.prUrl && <a href={selectedTestCase.prUrl} target="_blank" rel="noreferrer" className={`hover:underline truncate max-w-[160px] ${darkMode ? 'text-[#58A6FF]' : 'text-indigo-400'}`} title={selectedTestCase.prUrl}>PR ↗</a>}
                   </div>
               </div>
           )}
