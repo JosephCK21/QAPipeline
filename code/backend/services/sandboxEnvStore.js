@@ -4,6 +4,7 @@ const path = require('path');
 const SANDBOX_ENV_DIR = path.join(__dirname, '..', 'data', 'sandbox-env');
 const KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const RESERVED_PREFIX = 'AUTOQA_';
+const AUTOQA_WHITELIST = new Set(['AUTOQA_E2E_BASE_URL']);
 
 function assertSafeProjectId(projectId) {
     const id = String(projectId || '').trim();
@@ -36,7 +37,7 @@ function normalizeEnvMap(raw) {
     const out = {};
     for (const [k, v] of Object.entries(raw)) {
         if (typeof k !== 'string' || !KEY_RE.test(k)) continue;
-        if (k.startsWith(RESERVED_PREFIX)) continue;
+        if (k.startsWith(RESERVED_PREFIX) && !AUTOQA_WHITELIST.has(k)) continue;
         if (v == null) continue;
         out[k] = typeof v === 'string' ? v : String(v);
     }

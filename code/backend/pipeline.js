@@ -1,4 +1,9 @@
 const { fetchPRDetails, fetchFullFileContents, inferTestFilePaths, fetchPRDependencies } = require('./services/githubService');
+const {
+    preparePrGitWorkspace,
+    readFilesFromWorkspace,
+    readDepsFromWorkspace
+} = require('./services/prGitWorkspace');
 const { cleanupSandboxPool, createSandboxPool, executeTest, validateSyntaxLocal } = require('./services/sandboxService');
 const { findProjectByGithubRepo } = require('./services/projectStore');
 const { readSandboxEnv } = require('./services/sandboxEnvStore');
@@ -12,6 +17,7 @@ const { generateTestCasesForScenario, repairTestCaseScript, setLlmRunContext } =
 const { CURRENT_SCHEMA_VERSION } = require('./schemas');
 
 const crypto = require('crypto');
+const fssync = require('fs');
 const {
     updateRun, createRun, getScenariosByProject,
     getTestCasesByProject, getTestCasesByScenario, markTestCaseSuperseded,
@@ -201,7 +207,11 @@ function createEventLogger(runId) {
 // ---------------------------------------------------------------------------
 // PR scenario mapping (unchanged from previous version)
 // ---------------------------------------------------------------------------
-async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent) {
+/**
+ * Runs PR scenario mapping using optional pre-built prDetails from a git workspace (REST-sparing).
+ * @param {{ bootstrapPrDetails?: object | null }} [opts]
+ */
+async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent, opts = {}) {
     try {
         const linkedProject = findProjectByGithubRepo(repoFullName);
         if (!linkedProject?.id) {
@@ -217,8 +227,14 @@ async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent) {
         }
 
         const docs = getDocsForProject(linkedProject.id);
+        const seeded = opts.bootstrapPrDetails || null;
+        const prDetailsLoader = seeded ? Promise.resolve(seeded) : fetchPRDetails(prUrl);
         const [prDetails, documentTexts] = await Promise.all([
-            fetchPRDetails(prUrl),
+            prDetailsLoader.then((p) => {
+                const d = p && typeof p === 'object' ? p : {};
+                if (!d._prUrl) d._prUrl = prUrl;
+                return d;
+            }),
             extractTextFromFiles(docs)
         ]);
         sendEvent('log', { level: 'INFO', message: `PR mapping: fetched PR with ${prDetails?.files?.length || 0} changed file(s): ${(prDetails?.files || []).map(f => f.filename).join(', ')}` });
@@ -272,11 +288,23 @@ async function buildCodeContext(prDetails) {
             return !NON_CODE_EXTS.has(ext);
         });
 
+    if (prDetails._workspaceRoot && fssync.existsSync(prDetails._workspaceRoot)) {
+        const [fullFiles, testFiles, dependencies] = await Promise.all([
+            readFilesFromWorkspace(prDetails._workspaceRoot, changedPaths),
+            readFilesFromWorkspace(prDetails._workspaceRoot, inferTestFilePaths(changedPaths), { quiet: true })
+                .then(r => r.filter(f => !f.content.startsWith('// Could not fetch'))),
+            readDepsFromWorkspace(prDetails._workspaceRoot).catch(() => 'Not available')
+        ]);
+        return { fullFiles, testFiles, dependencies };
+    }
+
     const [fullFiles, testFiles, dependencies] = await Promise.all([
         fetchFullFileContents(owner, repo, ref, changedPaths),
         fetchFullFileContents(owner, repo, ref, inferTestFilePaths(changedPaths), { quiet: true })
             .then(r => r.filter(f => !f.content.startsWith('// Could not fetch'))),
-        fetchPRDependencies(`https://github.com/${owner}/${repo}/pull/${(prDetails._prUrl || '').split('/').pop() || '1'}`)
+        fetchPRDependencies(`https://github.com/${owner}/${repo}/pull/${(prDetails._prUrl || '').split('/').pop() || '1'}`, {
+            workspaceRoot: prDetails._workspaceRoot
+        })
             .catch(() => 'Not available')
     ]);
 
@@ -549,6 +577,13 @@ async function executeTestCaseWithRetries({
         const failureSnippet = failureOutput.slice(0, 2000);
         sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId}: FAIL on attempt ${attempt}` });
         sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId} failure output: ${failureSnippet}` });
+
+        const INFRA_FAILURE_PATTERNS = /ERR_CONNECTION_REFUSED|ECONNREFUSED|ERR_CONNECTION_RESET|net::ERR_ABORTED|Dev server not running/i;
+        const isInfraFailure = INFRA_FAILURE_PATTERNS.test(failureOutput);
+        if (isInfraFailure) {
+            sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId}: Infrastructure failure detected (dev server unreachable) — skipping heal, marking as fail.` });
+            break;
+        }
 
         if (attempt < MAX_HEAL_ATTEMPTS) {
             healAttempts++;
@@ -863,17 +898,49 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
     const emitSummary = () => sendEvent('run_summary_updated', { runId, ...runSummary });
 
-    // Declared here so the catch block can always clean up the pool.
+    // Declared here so the catch/finally block can always clean up the pool and PR workspace.
     let _sandboxPool = null;
+    let _prWsCleanup = null;
 
     try {
         // Phase 1: Initializing
         sendEvent('phase_update', { phase: 'Initializing', status: 'running' });
         sendEvent('phase_update', { phase: 'Initializing', status: 'completed' });
 
-        // Phase 2: PR Mapping
+        // Phase 2: PR Mapping — optional git-first workspace (suppresses REST listFiles + per-file pulls)
         sendEvent('phase_update', { phase: 'PR Mapping', status: 'running' });
-        const prMapping = await attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent);
+
+        const useRestFiles = /^1|true|yes$/i.test(String(process.env.AUTOQA_PR_USE_REST_FILES || '').trim());
+        let bootstrapPrDetails = null;
+        if (!useRestFiles) {
+            sendEvent('log', {
+                level: 'INFO',
+                message: '[PR ingest] Git-first mode: materializing PR via local git checkout (mapping/context skip REST listFiles getContent/raw).'
+            });
+            try {
+                const { prDetails: wsDetails, cleanup } = await preparePrGitWorkspace(runId, prUrl);
+                bootstrapPrDetails = wsDetails;
+                _prWsCleanup = cleanup;
+                sendEvent('log', {
+                    level: 'INFO',
+                    message: `[PR ingest] Git workspace ready: ${wsDetails.files?.length || 0} changed file(s) at ${wsDetails._workspaceRoot}`
+                });
+            } catch (wsErr) {
+                sendEvent('log', {
+                    level: 'WARN',
+                    message: `[PR ingest] Git workspace failed (${wsErr.message}); falling back to REST file listing.`
+                });
+            }
+        } else {
+            sendEvent('log', {
+                level: 'INFO',
+                message: '[PR ingest] AUTOQA_PR_USE_REST_FILES set — legacy REST listFiles + raw fetches for PR files.'
+            });
+        }
+
+        const prMapping = await attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent, {
+            bootstrapPrDetails
+        });
         sendEvent('phase_update', { phase: 'PR Mapping', status: 'completed' });
 
         const mappedScenarios = prMapping?.mappings || [];
@@ -881,9 +948,12 @@ async function runPipeline(runId, prUrl, repoFullName) {
         runSummary.scenarioCount = mappedScenarios.length;
         emitSummary();
 
-        let prDetails = prMapping?._prDetails || null;
+        let prDetails = prMapping?._prDetails || bootstrapPrDetails || null;
         if (!prDetails) {
             prDetails = await fetchPRDetails(prUrl);
+        }
+        if (prDetails && typeof prDetails === 'object' && !prDetails._prUrl) {
+            prDetails._prUrl = prUrl;
         }
 
         const classifiedAll = classifyChangedFiles(prDetails.files || []);
@@ -995,7 +1065,14 @@ async function runPipeline(runId, prUrl, repoFullName) {
             })
         ].join('\n\n');
 
+        const NON_CODE_EXTS_DIFF = new Set(['.md', '.txt', '.rst', '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.lock', '.log', '.webm', '.mp4', '.zip']);
+        const codeContextPaths = new Set((codeContext.fullFiles || []).map(f => f.path));
         const prDiffSection = (prDetails.files || [])
+            .filter(f => {
+                const ext = f.filename.includes('.') ? '.' + f.filename.split('.').pop().toLowerCase() : '';
+                return !NON_CODE_EXTS_DIFF.has(ext);
+            })
+            .filter(f => !codeContextPaths.has(f.filename))
             .map(f => `--- ${f.filename} ---\n${f.patch || '(no patch)'}`)
             .join('\n\n');
 
@@ -1358,6 +1435,13 @@ async function runPipeline(runId, prUrl, repoFullName) {
             cleanupSandboxPool(runId, _sandboxPool);
         }
     } finally {
+        try {
+            if (typeof _prWsCleanup === 'function') {
+                await _prWsCleanup();
+            }
+        } catch (cleanupErr) {
+            console.warn('[Pipeline] PR workspace cleanup failed:', cleanupErr.message);
+        }
         setLlmRunContext(null);
     }
 }

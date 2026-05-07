@@ -66,11 +66,12 @@ const sandboxEnvPutSchema = z.object({
                 path: ['env', key]
             });
         }
-        if (key.startsWith('AUTOQA_')) {
+        const AUTOQA_WHITELIST = new Set(['AUTOQA_E2E_BASE_URL']);
+        if (key.startsWith('AUTOQA_') && !AUTOQA_WHITELIST.has(key)) {
             ctx.addIssue({
                 code: z.ZodIssueCode.custom,
                 message:
-                    'Keys prefixed with AUTOQA_ are reserved for the AutoQA harness and must not be set as project sandbox env (they would override Playwright/base URL and other behavior inside the container).',
+                    'Keys prefixed with AUTOQA_ are reserved for the AutoQA harness and must not be set as project sandbox env (they would override Playwright/base URL and other behavior inside the container). Exception: AUTOQA_E2E_BASE_URL is allowed.',
                 path: ['env', key]
             });
         }

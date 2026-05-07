@@ -137,7 +137,7 @@ function getDockerBaseImagePullTimeoutMs() {
     return 1_200_000; // 20 minutes default for cold pull
 }
 
-const PLAYWRIGHT_WAIT_ON_MS = 30000;
+const PLAYWRIGHT_WAIT_ON_MS = Math.max(15000, parseInt(process.env.AUTOQA_WAIT_ON_TIMEOUT_MS || '60000', 10) || 60000);
 
 /** Written into the clone so executeTest uses the same app root as createSandboxPool */
 const APP_ROOT_MARKER = '.autoqa-app-root';
@@ -551,12 +551,33 @@ async function readVitePortFromSandbox(appRootAbs) {
 }
 
 /**
+ * Read a .env.local file into a key/value object (best-effort, ignores comments/empty lines).
+ */
+async function readEnvLocalAsObject(filePath) {
+    try {
+        const text = await fs.readFile(filePath, 'utf8');
+        const obj = {};
+        for (const line of text.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const eq = trimmed.indexOf('=');
+            if (eq < 1) continue;
+            obj[trimmed.slice(0, eq)] = trimmed.slice(eq + 1);
+        }
+        return obj;
+    } catch {
+        return {};
+    }
+}
+
+/**
  * @param {string} appRootAbs directory containing the app package.json + vite configs (host path)
  * @param {object|null} pkg
+ * @param {{ sandboxEnv?: Record<string, string> }} [opts]
  * @returns {Promise<{ devShellCmd: string | null, port: number, targetUrl: string }>}
  */
-async function resolveDevCommandAndTargetUrl(appRootAbs, pkg) {
-    const envBase = process.env.AUTOQA_E2E_BASE_URL;
+async function resolveDevCommandAndTargetUrl(appRootAbs, pkg, opts = {}) {
+    const envBase = (opts.sandboxEnv && opts.sandboxEnv.AUTOQA_E2E_BASE_URL) || process.env.AUTOQA_E2E_BASE_URL;
     const trimmed = typeof envBase === 'string' ? envBase.trim() : '';
     if (trimmed) {
         const targetUrl = trimmed.replace(/\/$/, '');
@@ -649,31 +670,61 @@ function releaseSandboxCreationSlot() {
  *
  * Returns an array of { sandboxDir, containerName } objects.
  */
-async function clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs) {
+async function clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs, options = {}) {
     if (!prDetails.headRepoFullName || !prDetails.headRef) {
         throw new Error('clonePrRepoToSandbox: missing headRepoFullName/headRef');
     }
     const token = process.env.GITHUB_TOKEN;
     const shallowUrl = `https://github.com/${prDetails.headRepoFullName}.git`;
+    const refGitRaw = options.referenceGitDir ? String(options.referenceGitDir) : '';
+    const refGitForGitArg = refGitRaw ? refGitRaw.replace(/\\/g, '/') : '';
+    const useReference =
+        (String(process.env.AUTOQA_SANDBOX_GIT_REFERENCE || 'true').toLowerCase() === 'true' ||
+            process.env.AUTOQA_SANDBOX_GIT_REFERENCE === '1') &&
+        !!refGitRaw &&
+        fssync.existsSync(refGitRaw);
+
+    const extraRefArgs = [];
+    if (useReference) {
+        extraRefArgs.push('--dissociate', '--reference-if-available', refGitForGitArg);
+    }
+
     if (token) {
         const b64 = Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64');
         await spawnCapture(
             'git',
             [
                 '-c', `http.extraHeader=AUTHORIZATION: basic ${b64}`,
-                'clone', '--depth', '1',
+                'clone',
+                ...extraRefArgs,
+                '--depth', '1',
                 '-b', prDetails.headRef,
                 shallowUrl,
-                sandboxDir
+                sandboxDir,
             ],
             { timeout: timeoutMs }
         );
     } else {
-        await execPromise(`git clone --depth 1 -b ${prDetails.headRef} "${shallowUrl}" "${sandboxDir}"`, { timeout: timeoutMs });
+        await spawnCapture(
+            'git',
+            ['clone', ...extraRefArgs, '--depth', '1', '-b', prDetails.headRef, shallowUrl, sandboxDir],
+            { timeout: timeoutMs }
+        );
     }
 }
 
 async function createSandboxPool(runId, prDetails, concurrency = 2, options = {}) {
+    const refCandidate = prDetails._workspaceRoot
+        ? path.join(prDetails._workspaceRoot, '.git')
+        : null;
+    const isShallowRef = refCandidate && fssync.existsSync(path.join(refCandidate, 'shallow'));
+    const referenceGitDir =
+        refCandidate && !isShallowRef && fssync.existsSync(refCandidate)
+            ? refCandidate
+            : null;
+    if (isShallowRef) {
+        console.log('[Sandbox] Skipping --reference-if-available: PR workspace is a shallow clone');
+    }
     const createPromises = [];
 
     for (let i = 1; i <= concurrency; i++) {
@@ -691,32 +742,58 @@ async function createSandboxPool(runId, prDetails, concurrency = 2, options = {}
             try {
                 if (prDetails.headRepoFullName && prDetails.headRef) {
                     const timeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
-                    await clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs);
+                    await clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs, {
+                        referenceGitDir,
+                    });
                     console.log(`[Sandbox] Cloned repo into pool ${i}`);
 
                     // Overlay mock data if present
                     await Promise.all((prDetails.files || []).map(async file => {
                         if (file.filename === 'mock_data.json') {
-                            await fs.writeFile(path.join(sandboxDir, 'mock_data.json'), file.content, 'utf8');
+                            let body = file.content;
+                            const wsRoot = prDetails._workspaceRoot;
+                            if (wsRoot && fssync.existsSync(wsRoot)) {
+                                const absMock = path.join(wsRoot, ...String(file.filename || '').split('/').filter(Boolean));
+                                try {
+                                    body = await fs.readFile(absMock, 'utf8');
+                                } catch {
+                                    /* keep API/git row content */
+                                }
+                            }
+                            await fs.writeFile(path.join(sandboxDir, 'mock_data.json'), body, 'utf8');
                         }
                     }));
                 } else {
                     await Promise.all((prDetails.files || []).map(async file => {
-                        const filePath = path.join(sandboxDir, path.basename(file.filename));
-                        await fs.writeFile(filePath, file.content, 'utf8');
+                        const filePath = path.join(sandboxDir, ...file.filename.split('/').filter(Boolean));
+                        await fs.mkdir(path.dirname(filePath), { recursive: true });
+                        await fs.writeFile(filePath, file.content || '', 'utf8');
                     }));
                 }
             } catch (err) {
                 console.error(`[Sandbox] Clone failed for pool ${i}, falling back to flat file drop:`, err.message);
+                if (err.stderr) console.error(`[Sandbox] git stderr: ${String(err.stderr).slice(0, 500)}`);
+                if (err.code) console.error(`[Sandbox] git exit code: ${err.code}`);
                 await Promise.all((prDetails.files || []).map(async file => {
-                    const filePath = path.join(sandboxDir, path.basename(file.filename));
-                    await fs.writeFile(filePath, file.content, 'utf8');
+                    const filePath = path.join(sandboxDir, ...file.filename.split('/').filter(Boolean));
+                    await fs.mkdir(path.dirname(filePath), { recursive: true });
+                    await fs.writeFile(filePath, file.content || '', 'utf8');
                 }));
             }
 
             const appRel = discoverAppRootRelative(sandboxDir);
             await writeAppRootMarker(sandboxDir, appRel);
             console.log(`[Sandbox] App root for npm/dev: ${dockerAppWorkdir(appRel)}`);
+
+            // Write project sandbox-env as .env.local so Next.js picks up NEXT_PUBLIC_* for client compilation
+            const sandboxEnvEntries = Object.entries(options.sandboxEnv || {}).filter(([, v]) => v != null);
+            if (sandboxEnvEntries.length > 0) {
+                const envLocalPath = path.join(sandboxDir, appRel || '', '.env.local');
+                await fs.mkdir(path.dirname(envLocalPath), { recursive: true });
+                const envLocalContent = sandboxEnvEntries.map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+                await fs.writeFile(envLocalPath, envLocalContent, 'utf8');
+                console.log(`[Sandbox] Wrote .env.local (${sandboxEnvEntries.length} key(s)) into ${dockerAppWorkdir(appRel)}`);
+            }
 
             // -- Start ONE persistent container ------------------------------------
             const volumeDir = sandboxDir.replace(/\\/g, '/');
@@ -924,7 +1001,8 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                 const appAbs = appDirAbs(sandboxDir, appRel);
                 const appWorkdir = dockerAppWorkdir(appRel);
                 const pkg = await loadPackageJsonAt(appAbs);
-                const { devShellCmd, targetUrl } = await resolveDevCommandAndTargetUrl(appAbs, pkg);
+                const sandboxEnvFromFile = await readEnvLocalAsObject(path.join(appAbs, '.env.local'));
+                const { devShellCmd, targetUrl } = await resolveDevCommandAndTargetUrl(appAbs, pkg, { sandboxEnv: sandboxEnvFromFile });
                 if (!devShellCmd) {
                     throw new Error('Dev server failed to start: missing scripts.dev or scripts.start in package.json');
                 }
@@ -951,7 +1029,24 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                             { timeout: PLAYWRIGHT_WAIT_ON_MS + 10000 }
                         );
                     } catch (waitErr) {
-                        console.warn(`[Sandbox] wait-on timeout for ${targetUrl} in ${containerName} (assuming dev server booted but didn't open expected port). Ignoring warning and attempting test...`);
+                        console.warn(`[Sandbox] wait-on timeout for ${targetUrl} in ${containerName} after ${PLAYWRIGHT_WAIT_ON_MS}ms`);
+                        let devLog = '';
+                        try {
+                            const { stdout } = await spawnCapture('docker',
+                                ['exec', containerName, 'sh', '-c', 'tail -30 /tmp/autoqa-dev.log 2>/dev/null'],
+                                { timeout: 5000 });
+                            devLog = (stdout || '').trim();
+                        } catch { /* ignore */ }
+                        const pidCheck = await spawnCapture('docker',
+                            ['exec', containerName, 'sh', '-c', '[ -s /tmp/autoqa-dev.pid ] && kill -0 "$(cat /tmp/autoqa-dev.pid)" 2>/dev/null && echo ALIVE || echo DEAD'],
+                            { timeout: 5000 }).then(r => (r.stdout || '').trim()).catch(() => 'UNKNOWN');
+                        if (pidCheck === 'DEAD') {
+                            const crashMsg = `[Sandbox] Dev server crashed in ${containerName}. Log tail:\n${devLog || '(empty)'}`;
+                            console.error(crashMsg);
+                            throw new Error(`Dev server not running (process exited). Tail of /tmp/autoqa-dev.log:\n${devLog.slice(0, 1000) || '(no output)'}`);
+                        }
+                        console.warn(`[Sandbox] Dev server PID=${pidCheck} — proceeding with test despite wait-on timeout`);
+                        if (devLog) console.warn(`[Sandbox] Dev log tail:\n${devLog.slice(0, 500)}`);
                     }
 
                     const execEnvArgs = ['exec', '-w', '/app'];
@@ -1017,7 +1112,15 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                         const stdout = spawnErr.stdout || '';
                         const stderr = spawnErr.stderr || '';
                         const combined = (stdout + '\n' + stderr).trim();
-                        const output = combined || spawnErr.message;
+                        let output = combined || spawnErr.message;
+                        try {
+                            const { stdout: devLog } = await spawnCapture('docker',
+                                ['exec', containerName, 'sh', '-c', 'tail -50 /tmp/autoqa-dev.log 2>/dev/null'],
+                                { timeout: 5000 });
+                            if (devLog && devLog.trim()) {
+                                output += '\n\n[DEV SERVER LOG]:\n' + devLog.trim().slice(0, 2000);
+                            }
+                        } catch { /* dev log unavailable */ }
                         return {
                             success: false,
                             output,
@@ -1191,5 +1294,6 @@ module.exports = {
     executeTest,
     validateSyntaxLocal,
     cleanupSandboxPool,
-    sanitizeArtifactSegment
+    sanitizeArtifactSegment,
+    discoverAppRootRelative
 };

@@ -36,7 +36,10 @@ const client = new OpenAI({
 const DEFAULT_MODEL = process.env.OPENAI_MODEL || 'gpt-5.4-mini';
 const SCENARIO_EFFORT = process.env.OPENAI_SCENARIO_EFFORT || 'low';
 const TESTCASE_EFFORT = process.env.OPENAI_TESTCASE_EFFORT || 'medium';
-const HEAL_EFFORT     = process.env.OPENAI_HEAL_EFFORT     || 'high';
+const HEAL_EFFORT     = process.env.OPENAI_HEAL_EFFORT     || 'medium';
+
+const MAX_OUTPUT_TOKENS_GEN  = Math.max(4000, parseInt(process.env.OPENAI_MAX_OUTPUT_TOKENS || '16000', 10) || 16000);
+const MAX_OUTPUT_TOKENS_HEAL = Math.max(2000, parseInt(process.env.OPENAI_HEAL_MAX_OUTPUT_TOKENS || '8000', 10) || 8000);
 
 // Stateful mode options:
 //   'conversation' (default) — use the Conversations API, one conversation per chain.
@@ -851,6 +854,39 @@ Rules:
 - epicId must exactly match the epic key.
 Output shape is enforced by the API schema — no markdown or explanation, only the structured response.`;
 
+const FEW_SHOT_EXAMPLES = {
+    javascript: `const { test, expect } = require('@playwright/test');
+
+test.describe('StructuralExample_FrontendFirst', () => {
+  test('creates a record through the UI and verifies it appears', async ({ page }) => {
+    await page.goto('/');
+    await page.getByPlaceholder('Enter title').fill(testData.item.title);
+    await page.getByRole('button', { name: /add/i }).click();
+    await expect(page.getByText(testData.item.title)).toBeVisible();
+  });
+
+  test('validates required field shows error on empty submit', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: /add/i }).click();
+    await expect(page.getByText(/required/i)).toBeVisible();
+  });
+});`,
+    python: `import pytest
+from unittest.mock import MagicMock
+
+@pytest.fixture
+def test_data():
+    return {"req": {"id": "stub-001"}, "expected_ok": True}
+
+def test_structural_fixture_and_mock(test_data):
+    mock_widget = MagicMock()
+    mock_widget.load.return_value = {"id": "mock-record", "ok": test_data["expected_ok"]}
+    out = mock_widget.load(test_data["req"]["id"])
+    assert mock_widget.load.called
+    assert out["ok"] is test_data["expected_ok"]
+`
+};
+
 const TESTCASE_GENERATION_INSTRUCTIONS = `You are an expert QA engineer generating concrete, executable test cases for an isolated Docker sandbox.
 
 TESTING STRATEGY — FRONTEND-FIRST (strictly enforced):
@@ -919,7 +955,17 @@ STEPS (dashboard / RTM):
 - Each "action" is a short imperative line describing what the user or automation does; "expectedResult" is what should be observable after that step when helpful.
 - Do NOT emit bare strings inside "steps" — only objects { "action": "...", "expectedResult": "..." }.
 
-Produce 2–4 test cases per scenario; required fields and object shape are defined by the API response schema — do not echo the schema in prose.`;
+Produce 2–4 test cases per scenario; required fields and object shape are defined by the API response schema — do not echo the schema in prose.
+
+[REFERENCE EXAMPLES — FORMATTING AND STYLE ONLY]
+These snippets illustrate structure only. They are not the repository under review; do not copy paths or mocks literally—adapt the patterns to the PR's actual modules and filenames.
+At runtime JavaScript scripts receive an injected preamble: const testData = {"..."}; — reference testData the same way (never declare const testData yourself).
+
+--- JavaScript structural example ---
+${FEW_SHOT_EXAMPLES.javascript}
+
+--- Python structural example ---
+${FEW_SHOT_EXAMPLES.python}`;
 
 const HEAL_INSTRUCTIONS = `You are an expert test engineer fixing a failing test script for an isolated Docker sandbox.
 The testData variable is already injected as the first line at runtime — do NOT redeclare it.
@@ -930,56 +976,10 @@ If the script uses app._router, manual middleware walking, or fake req/res mocks
 If the app uses file-based storage (JSON files), the data files are reset to empty ([] or {}) before each test run. The test must create all data it needs (signup, login, create records) — never assume pre-existing data.
 Ensure no open handles (servers, intervals, sockets) remain after tests — add afterAll cleanup if needed.
 If you already tried a similar approach in a previous turn and it failed, use a completely different strategy.
+If the error is ERR_CONNECTION_REFUSED, ECONNREFUSED, or net::ERR_CONNECTION_RESET, the dev server is not running or listening on the wrong port. Do NOT rewrite selectors or add waits — instead ensure page.goto uses the correct baseURL (process.env.AUTOQA_E2E_BASE_URL or the framework default port: Next.js=3000, Vite=5173). If a [DEV SERVER LOG] section is present in the failure output, use it to diagnose the root cause.
 Return structured output only: JSON object with one key "testScript" whose value is the full corrected script body as a string (raw executable code, no markdown fences, no commentary outside the string).`;
 
-/**
- * Few-shot structural templates for JSON testScript output (style/layout only — not runnable against a specific repo).
- * Injected only into generateTestCasesForScenario user input ([REFERENCE EXAMPLES] block).
- */
-const FEW_SHOT_EXAMPLES = {
-    javascript: `const { test, expect } = require('@playwright/test');
-
-test.describe('StructuralExample_FrontendFirst', () => {
-  test('creates a record through the UI and verifies it appears', async ({ page }) => {
-    // Navigate to the app
-    await page.goto('/');
-
-    // Interact with the real UI using accessibility-driven selectors
-    await page.getByPlaceholder('Enter title').fill(testData.item.title);
-    await page.getByRole('button', { name: /add/i }).click();
-
-    // Verify the result is visible in the UI
-    await expect(page.getByText(testData.item.title)).toBeVisible();
-  });
-
-  test('validates required field shows error on empty submit', async ({ page }) => {
-    await page.goto('/');
-
-    // Submit empty form
-    await page.getByRole('button', { name: /add/i }).click();
-
-    // Verify error feedback appears
-    await expect(page.getByText(/required/i)).toBeVisible();
-  });
-});`,
-    python: `import pytest
-from unittest.mock import MagicMock
-
-
-@pytest.fixture
-def test_data():
-    return {"req": {"id": "stub-001"}, "expected_ok": True}
-
-
-def test_structural_fixture_and_mock(test_data):
-    mock_widget = MagicMock()
-    mock_widget.load.return_value = {"id": "mock-record", "ok": test_data["expected_ok"]}
-
-    out = mock_widget.load(test_data["req"]["id"])
-    assert mock_widget.load.called
-    assert out["ok"] is test_data["expected_ok"]
-`
-};
+// FEW_SHOT_EXAMPLES moved above TESTCASE_GENERATION_INSTRUCTIONS (used in instructions for better prompt caching)
 
 // ---------------------------------------------------------------------------
 // Test case generation
@@ -1116,15 +1116,6 @@ ${codeContextSection || 'No additional context.'}
 [DEPENDENCIES / PACKAGE INFO]:
 ${dependenciesSection || 'Not available.'}
 
-[REFERENCE EXAMPLES]
-These snippets illustrate FORMATTING AND STYLE ONLY. They are not the repository under review; do not copy paths or mocks literally—adapt the patterns to this PR's actual modules and filenames.
-At runtime JavaScript scripts receive an injected preamble: const testData = {"..."}; — the examples below reference testData the same way your testScript must (never declare const testData yourself).
-
---- JavaScript structural example ---
-${FEW_SHOT_EXAMPLES.javascript}
-
---- Python structural example ---
-${FEW_SHOT_EXAMPLES.python}
 ${(() => {
         try {
             const rows = [
@@ -1183,6 +1174,7 @@ ${hasFrontendSignals ? '\nCRITICAL OVERRIDE: This codebase has frontend files. G
                 model: DEFAULT_MODEL,
                 instructions: TESTCASE_GENERATION_INSTRUCTIONS,
                 input: finalInput,
+                max_output_tokens: MAX_OUTPUT_TOKENS_GEN,
                 text: {
                     format: {
                         type: 'json_schema',
@@ -1377,6 +1369,7 @@ If you already tried an approach in a previous attempt and it failed, use a diff
                     model: DEFAULT_MODEL,
                     instructions: HEAL_INSTRUCTIONS,
                     input: inputPayload,
+                    max_output_tokens: MAX_OUTPUT_TOKENS_HEAL,
                     text: {
                         format: {
                             type: 'json_schema',

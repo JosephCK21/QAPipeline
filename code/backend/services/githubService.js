@@ -1,5 +1,7 @@
 const { Octokit } = require('@octokit/rest');
 const path = require('path');
+const fs = require('fs/promises');
+const fssync = require('fs');
 require('dotenv').config();
 
 const octokit = new Octokit({
@@ -104,10 +106,17 @@ async function fetchPRDetails(url) {
         headRef: pr.head.ref,
         headRepoFullName: pr.head.repo.full_name,
         files: changedFiles,
+        _prUrl: url,
     };
 }
 
-async function fetchPRDependencies(url) {
+async function fetchPRDependencies(url, options = {}) {
+    const workspaceRoot = options.workspaceRoot;
+    if (workspaceRoot && typeof workspaceRoot === 'string' && fssync.existsSync(workspaceRoot)) {
+        const { readDepsFromWorkspace } = require('./prGitWorkspace');
+        return readDepsFromWorkspace(workspaceRoot);
+    }
+
     const { owner, repo, pull_number } = parsePRUrl(url);
 
     // Get PR details (for head and base branch)
@@ -341,5 +350,6 @@ module.exports = {
     fetchRepoBranchTree,
     fetchStagingCodebase,
     fetchFullFileContents,
-    inferTestFilePaths
+    inferTestFilePaths,
+    parsePRUrl,
 };
