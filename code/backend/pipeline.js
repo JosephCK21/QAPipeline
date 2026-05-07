@@ -2,6 +2,7 @@ const { fetchPRDetails, fetchFullFileContents, inferTestFilePaths, fetchPRDepend
 const { cleanupSandboxPool, createSandboxPool, executeTest, validateSyntaxLocal } = require('./services/sandboxService');
 const { findProjectByGithubRepo } = require('./services/projectStore');
 const { readSandboxEnv } = require('./services/sandboxEnvStore');
+const { getDefaultTestAccountsForPipeline } = require('./services/defaultTestAccountsStore');
 const { getDocsForProject } = require('./services/documentAssociationStore');
 const { extractTextFromFiles } = require('./services/documentParserService');
 const { mapPrChangesToScenarios } = require('./services/prScenarioMappingService');
@@ -339,7 +340,8 @@ async function executeTestCaseWithRetries({
     linkedProject, refinementCandidates, sendEvent,
     runSummary,
     regressionMode = false,
-    scenarioDescription = ''
+    scenarioDescription = '',
+    configuredTestAccounts = null
 }) {
     let currentScript = testCase.testScript;
     let finalStatus = 'fail';
@@ -567,7 +569,8 @@ async function executeTestCaseWithRetries({
                     previousInteractionId: currentInteractionId,
                     attemptHistory,
                     priorReasoningItems: currentReasoningItems,
-                    scenarioDescription
+                    scenarioDescription,
+                    configuredTestAccounts
                 });
                 currentScript = healResult.repairedScript;
                 currentInteractionId = healResult.interactionId || currentInteractionId;
@@ -663,7 +666,8 @@ async function executeTestCaseWithRetries({
 // ---------------------------------------------------------------------------
 async function runEpicRegression({
     runId, prUrl, mappedScenarios, linkedProject, prDetails,
-    codeContextSection, sandboxPool, sendEvent, runSummary
+    codeContextSection, sandboxPool, sendEvent, runSummary,
+    configuredTestAccounts = null
 }) {
     // 1. Resolve which epic(s) the PR touches via the mapped scenarios.
     const projectKey = linkedProject?.jiraProjectKey || linkedProject?.id;
@@ -771,7 +775,8 @@ async function runEpicRegression({
             sendEvent,
             runSummary,
             regressionMode: true,
-            scenarioDescription: scenario.description || ''
+            scenarioDescription: scenario.description || '',
+            configuredTestAccounts
         });
 
         if (tcStatus === 'pass') {
@@ -843,6 +848,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
     const linkedProject = findProjectByGithubRepo(repoFullName);
     const localProjectId = linkedProject?.id || null;
+    const configuredTestAccounts = localProjectId ? getDefaultTestAccountsForPipeline(localProjectId) : null;
 
     // Shared counters emitted to UI as compact summary on each row
     const runSummary = {
@@ -1029,7 +1035,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 codeContextSection,
                 sandboxPool,
                 sendEvent,
-                runSummary
+                runSummary,
+                configuredTestAccounts
             });
 
             overallSuccess = regressionResult.success;
@@ -1103,7 +1110,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
                             refinementCandidates,
                             sendEvent,
                             runSummary,
-                            scenarioDescription
+                            scenarioDescription,
+                            configuredTestAccounts
                         });
 
                         if (tcStatus === 'pass') {
@@ -1199,7 +1207,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
                     refinementContext,
                     alreadyGeneratedSummary,
                     conversationId: priorConversationId,
-                    previousInteractionId: priorResponseId
+                    previousInteractionId: priorResponseId,
+                    configuredTestAccounts
                 });
                 generatedTestCases = genResult.testCases;
                 generationInteractionId = genResult.interactionId;

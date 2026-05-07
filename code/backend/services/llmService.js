@@ -2,6 +2,7 @@ const OpenAI = require('openai');
 const crypto = require('crypto');
 const dotenv = require('dotenv');
 const db = require('../db');
+const { buildAccountFixtureMap } = require('./defaultTestAccountsStore');
 
 dotenv.config();
 
@@ -522,8 +523,52 @@ const FIXTURE_DEFAULTS = {
     sort:        'priority'
 };
 
-function inferTestDataFromScript(testScript) {
+function buildLoginUserFixtureTemplates(accountFixtureMap, defaultAccountId) {
+    const keys = accountFixtureMap && typeof accountFixtureMap === 'object' ? Object.keys(accountFixtureMap) : [];
+    if (keys.length === 0) {
+        return {
+            user:  { name: 'Test User', email: 'testuser@example.com', password: 'Password123!' },
+            login: { email: 'testuser@example.com', password: 'Password123!' }
+        };
+    }
+    const id =
+        defaultAccountId && accountFixtureMap[defaultAccountId]
+            ? defaultAccountId
+            : keys[0];
+    const acc = accountFixtureMap[id];
+    const name = (acc.displayName && String(acc.displayName).trim()) || 'Test User';
+    return {
+        user:  { name, email: acc.email, password: acc.password },
+        login: { email: acc.email, password: acc.password }
+    };
+}
+
+function pickFixtureValueForRef(group, key, accountFixtureMap) {
+    const acc = accountFixtureMap && accountFixtureMap[group];
+    if (!acc) {
+        return FIXTURE_DEFAULTS[key] !== undefined ? FIXTURE_DEFAULTS[key] : `test_${key}`;
+    }
+    if (key === 'email') return acc.email;
+    if (key === 'password') return acc.password;
+    if (key === 'name' || key === 'displayName') {
+        return (acc.displayName && String(acc.displayName).trim()) || FIXTURE_DEFAULTS[key];
+    }
+    return FIXTURE_DEFAULTS[key] !== undefined ? FIXTURE_DEFAULTS[key] : `test_${key}`;
+}
+
+/**
+ * @param {string} testScript
+ * @param {{ accountFixtureMap: Record<string, object>, defaultAccountId: string|null }|null} fixtureContext
+ */
+function inferTestDataFromScript(testScript, fixtureContext = null) {
     if (!testScript) return {};
+
+    const accountFixtureMap =
+        fixtureContext && fixtureContext.accountFixtureMap && typeof fixtureContext.accountFixtureMap === 'object'
+            ? fixtureContext.accountFixtureMap
+            : null;
+    const defaultAccountId =
+        fixtureContext && fixtureContext.defaultAccountId != null ? fixtureContext.defaultAccountId : null;
 
     const refs = new Set();
     const pattern = /testData\.(\w+)\.(\w+)/g;
@@ -547,13 +592,15 @@ function inferTestDataFromScript(testScript) {
     for (const ref of refs) {
         const [group, key] = ref.split('.');
         if (!data[group]) data[group] = {};
-        data[group][key] = FIXTURE_DEFAULTS[key] !== undefined ? FIXTURE_DEFAULTS[key] : `test_${key}`;
+        data[group][key] = pickFixtureValueForRef(group, key, accountFixtureMap);
     }
 
+    const loginUserTemplates = buildLoginUserFixtureTemplates(accountFixtureMap, defaultAccountId);
+
     const ENTITY_TEMPLATES = {
-        user:  { name: 'Test User', email: 'testuser@example.com', password: 'Password123!' },
+        user:  { name: loginUserTemplates.user.name, email: loginUserTemplates.user.email, password: loginUserTemplates.user.password },
         todo:  { title: 'Test Todo Item', description: 'This is a test item', priority: 'high', completed: false },
-        login: { email: 'testuser@example.com', password: 'Password123!' }
+        login: { email: loginUserTemplates.login.email, password: loginUserTemplates.login.password }
     };
 
     for (const group of wholeGroups) {
@@ -578,6 +625,24 @@ function inferTestDataFromScript(testScript) {
             }
         }
 
+        if (accountFixtureMap && accountFixtureMap[group]) {
+            const acc = accountFixtureMap[group];
+            const accTemplate = {
+                email: acc.email,
+                password: acc.password,
+                displayName: acc.displayName || '',
+                name: (acc.displayName && String(acc.displayName).trim()) || 'Test User'
+            };
+            if (data[group]) {
+                for (const [k, v] of Object.entries(accTemplate)) {
+                    if (data[group][k] === undefined) data[group][k] = v;
+                }
+            } else {
+                data[group] = { ...accTemplate };
+            }
+            continue;
+        }
+
         if (data[group]) {
             if (template) {
                 for (const [k, v] of Object.entries(template)) {
@@ -594,11 +659,47 @@ function inferTestDataFromScript(testScript) {
     return data;
 }
 
-function enforceTestData(testCases) {
+function formatConfiguredAccountsPromptSection(config) {
+    if (!config?.accounts?.length) return '';
+
+    const lines = config.accounts.map((a) => {
+        const label = a.label ? ` (${a.label})` : '';
+        const hasDn = !!(a.displayName && String(a.displayName).trim());
+        const dnHint = hasDn ? ` / testData.${a.id}.displayName` : '';
+        return `- id="${a.id}"${label}: use testData.${a.id}.email / testData.${a.id}.password${dnHint} — values email=${a.email} password=${a.password}${hasDn ? ` displayName="${String(a.displayName).replace(/"/g, '\\"')}"` : ''}`;
+    });
+
+    let defLine = '';
+    if (config.defaultAccountId && config.accounts.some((a) => a.id === config.defaultAccountId)) {
+        defLine =
+            `\nWhen the scenario needs a generic user without naming a role, prefer testData.${config.defaultAccountId} (the configured default).\n`;
+        defLine +=
+            `If you use testData.login or testData.user, fill them with the SAME values as testData.${config.defaultAccountId}.\n`;
+    }
+
+    return (
+        `\n[CONFIGURED TEST ACCOUNTS — USE ONLY THESE FOR SIGN-IN AND USER FIXTURES]:\n` +
+        `${lines.join('\n')}` +
+        defLine +
+        `Pick the account id that fits the scenario (e.g. privileged flows use an admin id when listed). Do NOT invent random emails/passwords unless the scenario explicitly requires a user outside this list. Prefer configured accounts for logged-in behavior.\n`
+    );
+}
+
+function formatConfiguredAccountsHealReminder(config) {
+    if (!config?.accounts?.length) return '';
+    const ids = config.accounts.map((a) => a.id).join(', ');
+    const extra = config.defaultAccountId ? ` Default for generic login/user: "${config.defaultAccountId}".` : '';
+    return (
+        `\n[CONFIGURED TEST ACCOUNTS]: Allowed credential groups: ${ids}.${extra}` +
+        ` Do NOT replace with placeholders (example.com, Password123!, etc.).`
+    );
+}
+
+function enforceTestData(testCases, fixtureContext = null) {
     for (const tc of testCases) {
         const hasData = tc.testData && typeof tc.testData === 'object' && Object.keys(tc.testData).length > 0;
         if (!hasData && tc.testScript) {
-            const inferred = inferTestDataFromScript(tc.testScript);
+            const inferred = inferTestDataFromScript(tc.testScript, fixtureContext);
             if (Object.keys(inferred).length > 0) {
                 console.warn(`[testData-enforce] ${tc.testCaseId}: LLM returned empty testData — inferred ${Object.keys(inferred).length} group(s) from script: ${Object.keys(inferred).join(', ')}`);
                 tc.testData = inferred;
@@ -945,7 +1046,8 @@ async function generateTestCasesForScenario({
     alreadyGeneratedSummary = [],
     conversationId = null,
     previousInteractionId = null,
-    priorReasoningItems = []
+    priorReasoningItems = [],
+    configuredTestAccounts = null
 }) {
     if (!scenario?.id) {
         throw new Error('generateTestCasesForScenario: scenario.id is required');
@@ -972,6 +1074,16 @@ async function generateTestCasesForScenario({
           ).join('\n') + '\n'
         : '';
 
+    let fixtureContext = null;
+    let configuredAccountsSection = '';
+    if (configuredTestAccounts?.accounts?.length) {
+        fixtureContext = {
+            accountFixtureMap: buildAccountFixtureMap(configuredTestAccounts),
+            defaultAccountId: configuredTestAccounts.defaultAccountId || null
+        };
+        configuredAccountsSection = formatConfiguredAccountsPromptSection(configuredTestAccounts);
+    }
+
     // Variable-only portion (scenario-specific); the static rules live in
     // TESTCASE_GENERATION_INSTRUCTIONS for prompt caching.
     const acRef = Array.isArray(scenario.acceptanceCriteriaRef) && scenario.acceptanceCriteriaRef.length > 0
@@ -994,7 +1106,7 @@ Frontend files detected in this codebase: ${frontendFiles.slice(0, 5).join(', ')
   Type: ${scenario.type || '(unspecified)'}
   Priority: ${scenario.priority || 'Medium'}${acRef}
 ${frontendDetectionSection}
-${refinementHint}${alreadyCoveredSection}
+${refinementHint}${alreadyCoveredSection}${configuredAccountsSection}
 [CHANGED CODE DIFF]:
 ${prDiffSection || 'No diff available.'}
 
@@ -1120,7 +1232,7 @@ ${hasFrontendSignals ? '\nCRITICAL OVERRIDE: This codebase has frontend files. G
     if (!testCases) throw new Error('generateTestCasesForScenario: expected testCases array from LLM');
 
     normalizeTestCaseSteps(testCases);
-    enforceTestData(testCases);
+    enforceTestData(testCases, fixtureContext);
 
     return {
         testCases,
@@ -1160,7 +1272,8 @@ async function repairTestCaseScript({
     previousInteractionId = null,
     priorReasoningItems = [],
     attemptHistory = [],
-    scenarioDescription = ''
+    scenarioDescription = '',
+    configuredTestAccounts = null
 }) {
     if (!testCase?.testCaseId) {
         throw new Error('repairTestCaseScript: testCase.testCaseId is required');
@@ -1182,6 +1295,8 @@ async function repairTestCaseScript({
         healPatternSection = '';
     }
 
+    const configuredAccountsHealReminder = formatConfiguredAccountsHealReminder(configuredTestAccounts || null);
+
     let input;
     const hasState = Boolean(conversationId) || Boolean(previousInteractionId);
 
@@ -1196,7 +1311,7 @@ ${failureOutput}
 The failed script that produced this output:
 ${testCase.testScript}
 
-Fix the script.${healPatternSection}`;
+Fix the script.${configuredAccountsHealReminder}${healPatternSection}`;
     } else {
         // Stateless fallback — self-contained prompt with manual history injection.
         const historySection = attemptHistory.length > 0
@@ -1229,7 +1344,7 @@ ${codeContextSection || 'Not available.'}
 [TEST DATA]:
 ${JSON.stringify(testCase.testData, null, 2)}
 
-If you already tried an approach in a previous attempt and it failed, use a different strategy this time.`;
+If you already tried an approach in a previous attempt and it failed, use a different strategy this time.${configuredAccountsHealReminder}`;
     }
 
     // Soft-trim before token guard — heal prompts can be large when the
@@ -1321,7 +1436,7 @@ ${codeContextSection || 'Not available.'}
 [TEST DATA]:
 ${JSON.stringify(testCase.testData, null, 2)}
 
-If you already tried an approach in a previous attempt and it failed, use a different strategy this time.`;
+If you already tried an approach in a previous attempt and it failed, use a different strategy this time.${configuredAccountsHealReminder}`;
             fallbackInput = ensureWithinBudget(fallbackInput, PROMPT_TOKEN_BUDGET, 'repairTestCaseScript:fallback');
             await assertTokenLimit(fallbackInput, DEFAULT_MODEL);
             const statelessParams = buildStatefulParams({}); // no conversation, no previous_response_id

@@ -1214,6 +1214,17 @@ function ProjectDashboard() {
             Variables are passed to PR sandbox containers at <code className={`text-xs px-1 rounded ${darkMode ? 'bg-[#21262D]' : 'bg-[#EBECF0]'}`}>docker run</code> (dev server, Jest, Playwright, pytest). Same storage as Project Settings. Keys starting with{' '}
             <code className={`text-xs px-1 rounded ${darkMode ? 'bg-[#21262D]' : 'bg-[#EBECF0]'}`}>AUTOQA_</code> are not allowed. Do not commit secrets to git.
           </div>
+          <p className={`mb-4 text-sm ${darkMode ? 'text-[#8B949E]' : 'text-[#5E6C84]'}`}>
+            For <strong className={darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}>UI login credentials</strong> in generated tests (<code className={`text-xs px-1 rounded ${darkMode ? 'bg-[#21262D]' : 'bg-[#EBECF0]'}`}>testData</code>),
+            configure{' '}
+            <Link
+              to={`/projects/${projectId}/settings`}
+              className={`font-medium ${darkMode ? 'text-[#58A6FF] hover:text-[#79B8FF]' : 'text-indigo-600 hover:text-indigo-800'}`}
+            >
+              Default test accounts
+            </Link>
+            {' '}in Project Settings (not stored as Docker env vars).
+          </p>
 
           <div className={`mb-6 rounded-lg border p-4 ${darkMode ? 'border-[#30363D] bg-[#0D1117]' : 'border-[#DFE1E6] bg-white'}`}>
             <h4 className={`text-sm font-semibold mb-2 ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>Currently stored</h4>

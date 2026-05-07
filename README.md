@@ -451,7 +451,7 @@ Numbers map **path → responsibility** (production code and tooling).
 
 | Path | Used for |
 |------|----------|
-| [`llmService.js`](code/backend/services/llmService.js) | Shared OpenAI **Responses** client: stateful modes (**`OPENAI_STATEFUL_MODE`**: `conversation` \| `chain` \| `zdr`), **`buildCacheParams`**, **`ensureWithinBudget`**, tracing (**`emitLlmTrace`**, **`llm_trace_rows`** when **`setLlmRunContext`**), token rollups. **PR pipeline exports:** **`generateTestCasesForScenario`**, **`repairTestCaseScript`**. **Jira pipeline exports:** **`generateTestScenarios`**, **`generateTestScenariosForEpic`**. Instruction constants include **`SCENARIO_SYSTEM_INSTRUCTION`**, **`TESTCASE_GENERATION_INSTRUCTIONS`**, **`HEAL_INSTRUCTIONS`**. Mapping and classifier live in sibling modules but use the same utilities. |
+| [`llmService.js`](code/backend/services/llmService.js) | Shared OpenAI **Responses** client: stateful modes (**`OPENAI_STATEFUL_MODE`**: `conversation` \| `chain` \| `zdr`), **`buildCacheParams`**, **`ensureWithinBudget`**, tracing (**`emitLlmTrace`**, **`llm_trace_rows`** when **`setLlmRunContext`**), token rollups. **PR pipeline exports:** **`generateTestCasesForScenario`** (optional **`[CONFIGURED TEST ACCOUNTS]`** in variable prompt + **`enforceTestData`** inferred fixtures), **`repairTestCaseScript`** (configured-account heal reminder). **Jira pipeline exports:** **`generateTestScenarios`**, **`generateTestScenariosForEpic`**. Instruction constants include **`SCENARIO_SYSTEM_INSTRUCTION`**, **`TESTCASE_GENERATION_INSTRUCTIONS`**, **`HEAL_INSTRUCTIONS`**. Mapping and classifier live in sibling modules but use the same utilities. |
 | [`githubService.js`](code/backend/services/githubService.js) | Octokit: PR metadata, diff, file contents, dependency discovery, inferred test companion paths. |
 | [`jiraService.js`](code/backend/services/jiraService.js) | Jira REST wrappers, ADF helpers, connectivity checks. |
 | [`jiraWebhookQueueService.js`](code/backend/services/jiraWebhookQueueService.js) | Serialized async queue for Jira-triggered jobs. |
@@ -461,7 +461,9 @@ Numbers map **path → responsibility** (production code and tooling).
 | [`astPrunerService.js`](code/backend/services/astPrunerService.js) | Structural pruning/summarization of large files before **`[FULL FILE CONTENTS]`** prompts. |
 | [`documentParserService.js`](code/backend/services/documentParserService.js) | Text extraction pipeline for PDF/Markdown/Office uploads used in Jira/sync flows. |
 | [`documentAssociationStore.js`](code/backend/services/documentAssociationStore.js) | Read/write **`jiraDocuments.json`** associations keyed by AutoQA project id. |
-| [`projectStore.js`](code/backend/services/projectStore.js) | CRUD for **`projects.json`** (names, GitHub slug, Jira key). |
+| [`projectStore.js`](code/backend/services/projectStore.js) | CRUD for **`projects.json`**; **`deleteProject`** also removes sandbox-env and default-test-accounts files for that id. |
+| [`sandboxEnvStore.js`](code/backend/services/sandboxEnvStore.js) | **`readSandboxEnv`**, **`writeSandboxEnv`**, **`deleteSandboxEnv`** — per-project env under **`data/sandbox-env/`**. |
+| [`defaultTestAccountsStore.js`](code/backend/services/defaultTestAccountsStore.js) | **Default test accounts** under **`data/default-test-accounts/`** — PR pipeline **`testData.<id>`** logins (**`GET/PUT /api/projects/:id/default-test-accounts`**). |
 
 ### `code/devscripts` (manual operator tools)
 
@@ -505,7 +507,7 @@ Numbers map **path → responsibility** (production code and tooling).
 | [`src/App.jsx`](code/frontend/src/App.jsx) | Router, **`AppContext`** (`activeRuns`, `settings`, `toast`, `sidebarCollapsed`, `refreshKey`, `llmTraces`, `darkMode`, …), Socket.IO wiring, route table, toast UI. |
 | [`src/pages/ProjectsHub.jsx`](code/frontend/src/pages/ProjectsHub.jsx) | `/` — list/create projects (`GET/POST /api/projects`). |
 | [`src/pages/ProjectDashboard.jsx`](code/frontend/src/pages/ProjectDashboard.jsx) | `/projects/:projectId` — RTM dashboards, epic metrics, PR run workspace via query params, **Sandbox env** tab (.env import into `sandbox-env` store), scenario rows may show mapping / sandbox outcome badges sourced from **`rtm_scenarios`**. |
-| [`src/pages/ProjectSettings.jsx`](code/frontend/src/pages/ProjectSettings.jsx) | `/projects/:projectId/settings` — Jira/GitHub linking, **per-project sandbox env** (full-map PUT), **`BranchPolicyMatrix`**, sync button. |
+| [`src/pages/ProjectSettings.jsx`](code/frontend/src/pages/ProjectSettings.jsx) | `/projects/:projectId/settings` — Jira/GitHub linking, **per-project sandbox env**, **Default test accounts** (multi-row `testData` logins), **`BranchPolicyMatrix`**, sync button. |
 | [`src/pages/PipelineRunsList.jsx`](code/frontend/src/pages/PipelineRunsList.jsx) | `/pipelines` — runs table navigation into dashboard + **`runId`**; renders per-run token totals when present on **`run_history`**. |
 | [`src/pages/ScriptDetail.jsx`](code/frontend/src/pages/ScriptDetail.jsx) | Generated script inspector; **Heal exhausted** when **`heal_exhausted`**; neutral **`smoke`** pill when **`source === 'fallback'`** (legacy **`FALLBACK`** data). |
 | [`src/pages/AgentChatDebug.jsx`](code/frontend/src/pages/AgentChatDebug.jsx) | `/llm-traces` — rolling **`llm_trace`** from context; append **`?run=<runId>`** to load **`GET /api/runs/:runId/llm-traces`**. |
@@ -725,6 +727,9 @@ Base URL **`http://localhost:3001`** unless `PORT` changed.
 | GET | `/api/projects/:projectId/sandbox-env` | Per-project env map injected into PR sandboxes (**not** returned from list projects). Trusted/local operator model — add auth before exposing to tenants. |
 | PUT | `/api/projects/:projectId/sandbox-env` | Replace full map: body `{ "env": { "KEY": "value" } }` (string values only). **`AUTOQA_` prefix keys rejected (400).** |
 | DELETE | `/api/projects/:projectId/sandbox-env` | Remove stored sandbox env file |
+| GET | `/api/projects/:projectId/default-test-accounts` | Per-project default UI **testData** logins (multiple named accounts). Passwords not returned; each row includes **`passwordSet`**. |
+| PUT | `/api/projects/:projectId/default-test-accounts` | Body **`{ enabled, defaultAccountId?, accounts: [{ id, label?, email, password?, displayName? }] }`**. Empty **`password`** on PUT keeps the previous password for that **`id`**. When **`enabled`** and more than one account, **`defaultAccountId`** is required. Max 20 accounts. |
+| DELETE | `/api/projects/:projectId/default-test-accounts` | Delete stored configuration |
 | DELETE | `/api/projects/:projectId` | Delete |
 | PATCH | `/api/projects/:projectId/jira-link` | Attach Jira project |
 | PATCH | `/api/projects/:projectId/github-link` | Attach GitHub slug |
@@ -817,6 +822,11 @@ Copy **`code/backend/.env.example` → `.env`** and fill secrets.
 | `JIRA_WEBHOOK_SECRET` | Optional signature validation |
 | `OPENAI_*` cluster | Models, reasoning effort tiers, verbosity, caching retention, **`OPENAI_STATEFUL_MODE`**, classifier effort |
 | `REGRESSION_*` | Regression classifier toggles/threshold |
+
+### Per-project settings (dashboard, not `.env`)
+
+- **Sandbox env** (**`GET/PUT /api/projects/:id/sandbox-env`**) — string map injected as **`docker run -e`** (API keys, **Supabase** URL, `DATABASE_URL`, etc.).
+- **Default test accounts** (**`GET/PUT /api/projects/:id/default-test-accounts`**) — named UI logins used in generated **`testData.<id>`** for Playwright/scripts; stored under **`code/backend/data/default-test-accounts/`**. The PR pipeline passes them into **`generateTestCasesForScenario`** and **`inferTestDataFromScript`** / heal reminders. Configure in **Project Settings**; passwords are plaintext on disk (same trust model as sandbox env).
 
 ### Sandbox & Playwright forwarding
 
@@ -981,8 +991,9 @@ Pipeline-critical exports:
 
 | Module | Pipeline use |
 |--------|----------------|
-| [`projectStore.js`](code/backend/services/projectStore.js) | **`findProjectByGithubRepo`** → **`jiraProjectKey`**, **`id`**. **`deleteProject`** removes **`sandbox-env/<id>.json`**. |
+| [`projectStore.js`](code/backend/services/projectStore.js) | **`findProjectByGithubRepo`** → **`jiraProjectKey`**, **`id`**. **`deleteProject`** removes **`sandbox-env/<id>.json`** and **`default-test-accounts/<id>.json`**. |
 | [`sandboxEnvStore.js`](code/backend/services/sandboxEnvStore.js) | **`readSandboxEnv`**, **`writeSandboxEnv`**, **`deleteSandboxEnv`** — per-project env files under **`data/sandbox-env/`** (not merged into **`GET /api/projects`**). |
+| [`defaultTestAccountsStore.js`](code/backend/services/defaultTestAccountsStore.js) | **`getDefaultTestAccountsForPipeline`** / **`getDefaultTestAccountsForApi`**, **`writeDefaultTestAccounts`**, **`deleteDefaultTestAccounts`** — **`data/default-test-accounts/`** for **`testData.<id>`** logins (not **`docker -e`**). |
 | [`documentAssociationStore.js`](code/backend/services/documentAssociationStore.js) | **`getDocsForProject`** → **`extractTextFromFiles`**. |
 | [`documentParserService.js`](code/backend/services/documentParserService.js) | **`extractTextFromFiles`** for mapping prompt slices. |
 
@@ -995,7 +1006,7 @@ Pipeline-critical exports:
 | File | Role |
 |------|------|
 | [`App.jsx`](code/frontend/src/App.jsx) | **`run_updated`**, **`llm_trace`**, **`pr_opened`**, **`test_execution_started` / `test_execution_ended`** for live run UI. |
-| [`ProjectDashboard.jsx`](code/frontend/src/pages/ProjectDashboard.jsx) | Run/scenario workspace; **Sandbox env** tab imports `.env` files into the same store as **`GET/PUT /api/projects/:id/sandbox-env`**. |
+| [`ProjectDashboard.jsx`](code/frontend/src/pages/ProjectDashboard.jsx) | Run/scenario workspace; **Sandbox env** tab imports `.env` into the sandbox-env store (**`GET/PUT /api/projects/:id/sandbox-env`**) and links to **Project Settings** for **Default test accounts**. |
 | [`PipelineRunsList.jsx`](code/frontend/src/pages/PipelineRunsList.jsx) | Run list + token totals. |
 | [`ScriptDetail.jsx`](code/frontend/src/pages/ScriptDetail.jsx) | Per-test-case script, heal exhaustion, legacy **smoke** pill. |
 | [`AgentChatDebug.jsx`](code/frontend/src/pages/AgentChatDebug.jsx) | **`GET /api/runs/:runId/llm-traces`**. |
@@ -1011,6 +1022,7 @@ Pipeline-critical exports:
 
 - Never commit real **`.env`**
 - **Per-project sandbox secrets** are stored as **plain JSON on disk** under **`code/backend/data/sandbox-env/`** with **no encryption at rest**. That is intentional for a typical **single-operator local** deployment; multi-tenant or regulated environments should use a **secrets manager** or **encrypted volume**, not this store alone.
+- **Default test account** passwords are stored similarly under **`code/backend/data/default-test-accounts/`** (for **`testData`** in generated tests — not **`docker -e`**).
 - **Reserved keys:** environment variable names prefixed with **`AUTOQA_`** are **rejected** for project sandbox env (server-enforced) so they cannot override harness behavior (e.g. Playwright base URL) inside the container.
 - **`GET/PUT /api/projects/:id/sandbox-env`** return the full env map — treat as **trusted-operator / local** only until authentication gates exist; **`GET /api/projects`** does **not** embed these values.
 - Webhook URLs on **smee** are demo-grade—use locked-down endpoints in prod

@@ -9,6 +9,8 @@ code/backend/data/*.json
 !code/backend/data/.gitkeep
 code/backend/data/sandbox-env/*
 !code/backend/data/sandbox-env/.gitkeep
+code/backend/data/default-test-accounts/*
+!code/backend/data/default-test-accounts/.gitkeep
 code/backend/uploads/
 code/backend/data/artifacts/
 

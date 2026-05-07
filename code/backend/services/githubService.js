@@ -6,6 +6,54 @@ const octokit = new Octokit({
     auth: process.env.GITHUB_TOKEN || undefined,
 });
 
+/** Max parallel raw content fetches per PR (avoids thousands of sockets at once). */
+const PR_RAW_FETCH_CONCURRENCY = 10;
+
+/**
+ * GitHub paginates pull file lists (default page size 30). Fetch all pages.
+ * @returns {{ files: object[], pagesFetched: number }}
+ */
+async function listAllPullFiles({ owner, repo, pull_number }) {
+    const files = [];
+    const per_page = 100;
+    let page = 1;
+    while (true) {
+        const { data } = await octokit.rest.pulls.listFiles({
+            owner,
+            repo,
+            pull_number,
+            page,
+            per_page,
+        });
+        files.push(...data);
+        if (data.length < per_page) {
+            return { files, pagesFetched: page };
+        }
+        page += 1;
+    }
+}
+
+async function enrichPullFileFromRaw(file) {
+    if (file.status === 'removed') return null;
+    try {
+        const response = await fetch(file.raw_url);
+        const content = await response.text();
+        return {
+            filename: file.filename,
+            status: file.status,
+            content,
+            patch: file.patch || 'No patch available',
+        };
+    } catch {
+        return {
+            filename: file.filename,
+            status: file.status,
+            content: '// Could not fetch content',
+            patch: file.patch || 'No patch available',
+        };
+    }
+}
+
 // Parse GitHub URL: https://github.com/owner/repo/pull/123
 function parsePRUrl(url) {
     try {
@@ -34,33 +82,19 @@ async function fetchPRDetails(url) {
         pull_number,
     });
 
-    // Fetch changed files in the PR
-    const { data: files } = await octokit.rest.pulls.listFiles({
-        owner,
-        repo,
-        pull_number,
-    });
-
-    const changedFiles = await Promise.all(
-        files.map(async (file) => {
-            if (file.status === 'removed') return null;
-
-            // Fetch file contents if code is small enough, this requires raw content from another endpoint if not included
-            // For simplicity in a public repo, we can fetch via raw URL
-            try {
-                const response = await fetch(file.raw_url);
-                const content = await response.text();
-                return {
-                    filename: file.filename,
-                    status: file.status,
-                    content: content,
-                    patch: file.patch || 'No patch available'
-                };
-            } catch {
-                return { filename: file.filename, status: file.status, content: '// Could not fetch content', patch: file.patch || 'No patch available' };
-            }
-        })
+    const { files, pagesFetched } = await listAllPullFiles({ owner, repo, pull_number });
+    console.log(
+        `[GitHub] PR ${owner}/${repo}#${pull_number}: ${files.length} changed file(s) across ${pagesFetched} listFiles page(s)`
     );
+
+    const changedFiles = [];
+    for (let i = 0; i < files.length; i += PR_RAW_FETCH_CONCURRENCY) {
+        const slice = files.slice(i, i + PR_RAW_FETCH_CONCURRENCY);
+        const batch = await Promise.all(slice.map((file) => enrichPullFileFromRaw(file)));
+        for (const entry of batch) {
+            if (entry !== null) changedFiles.push(entry);
+        }
+    }
 
     return {
         title: pr.title,
@@ -69,7 +103,7 @@ async function fetchPRDetails(url) {
         branch: `${pr.head.ref} -> ${pr.base.ref}`,
         headRef: pr.head.ref,
         headRepoFullName: pr.head.repo.full_name,
-        files: changedFiles.filter((f) => f !== null),
+        files: changedFiles,
     };
 }
 

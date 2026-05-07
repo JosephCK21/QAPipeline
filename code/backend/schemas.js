@@ -41,6 +41,20 @@ const projectCreateSchema = z.object({
 
 const SANDBOX_ENV_KEY_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+const defaultTestAccountRowSchema = z.object({
+    id: z.string().min(1).max(64),
+    label: z.string().max(200).optional().nullable(),
+    email: z.string().max(320).optional().nullable(),
+    password: z.string().max(512).optional().nullable(),
+    displayName: z.string().max(200).optional().nullable()
+});
+
+const defaultTestAccountsPutSchema = z.object({
+    enabled: z.boolean(),
+    defaultAccountId: z.union([z.string().min(1).max(64), z.null()]).optional(),
+    accounts: z.array(defaultTestAccountRowSchema).max(20)
+});
+
 const sandboxEnvPutSchema = z.object({
     env: z.record(z.string(), z.string())
 }).superRefine((data, ctx) => {
@@ -78,6 +92,7 @@ module.exports = {
     githubWebhookSchema,
     jiraWebhookSchema,
     projectCreateSchema,
+    defaultTestAccountsPutSchema,
     sandboxEnvPutSchema,
     validateBody
 };

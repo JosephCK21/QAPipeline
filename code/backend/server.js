@@ -17,7 +17,7 @@ const {
     listLlmTracesByRun, listDlqEvents, getDlqEvent, updateDlqStatus,
     getHealExhaustedByProject
 } = require('./db');
-const { githubWebhookSchema, jiraWebhookSchema, projectCreateSchema, sandboxEnvPutSchema, validateBody } = require('./schemas');
+const { githubWebhookSchema, jiraWebhookSchema, projectCreateSchema, sandboxEnvPutSchema, defaultTestAccountsPutSchema, validateBody } = require('./schemas');
 
 initDb();
 
@@ -39,6 +39,11 @@ const {
     findProjectByJiraProjectKey
 } = require('./services/projectStore');
 const { readSandboxEnv, writeSandboxEnv, deleteSandboxEnv } = require('./services/sandboxEnvStore');
+const {
+    getDefaultTestAccountsForApi,
+    writeDefaultTestAccounts,
+    deleteDefaultTestAccounts
+} = require('./services/defaultTestAccountsStore');
 const { sanitizeArtifactSegment } = require('./services/sandboxService');
 
 // Storage for uploaded requirements
@@ -244,6 +249,45 @@ app.delete('/api/projects/:projectId/sandbox-env', (req, res) => {
         if (!project) return res.status(404).json({ error: 'Project not found' });
         deleteSandboxEnv(projectId);
         res.json({ ok: true, env: {} });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/projects/:projectId/default-test-accounts', (req, res) => {
+    try {
+        const { projectId } = req.params;
+        const project = getProjectById(projectId);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+        res.json(getDefaultTestAccountsForApi(projectId));
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/projects/:projectId/default-test-accounts', validateBody(defaultTestAccountsPutSchema), (req, res) => {
+    try {
+        const { projectId } = req.params;
+        const project = getProjectById(projectId);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+        writeDefaultTestAccounts(projectId, req.body);
+        res.json(getDefaultTestAccountsForApi(projectId));
+    } catch (error) {
+        if (error.statusCode === 400) {
+            return res.status(400).json({ error: error.message });
+        }
+        console.error('[default-test-accounts PUT]', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/projects/:projectId/default-test-accounts', (req, res) => {
+    try {
+        const { projectId } = req.params;
+        const project = getProjectById(projectId);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+        deleteDefaultTestAccounts(projectId);
+        res.json({ ok: true, enabled: false, defaultAccountId: null, accounts: [] });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
