@@ -4,7 +4,7 @@ const {
     readFilesFromWorkspace,
     readDepsFromWorkspace
 } = require('./services/prGitWorkspace');
-const { cleanupSandboxPool, createSandboxPool, executeTest, validateSyntaxLocal } = require('./services/sandboxService');
+const { cleanupSandboxPool, createSandboxPool } = require('./services/sandboxService');
 const { findProjectByGithubRepo } = require('./services/projectStore');
 const { readSandboxEnv } = require('./services/sandboxEnvStore');
 const { getDefaultTestAccountsForPipeline } = require('./services/defaultTestAccountsStore');
@@ -13,75 +13,26 @@ const { extractTextFromFiles } = require('./services/documentParserService');
 const { mapPrChangesToScenarios } = require('./services/prScenarioMappingService');
 const { classifyPrAsBugFix } = require('./services/prClassificationService');
 const { pruneFileContentForContext } = require('./services/astPrunerService');
-const { generateTestCasesForScenario, repairTestCaseScript, setLlmRunContext } = require('./services/llmService');
+const { generateTestCasesForScenario, setLlmRunContext } = require('./services/llmService');
 const { CURRENT_SCHEMA_VERSION } = require('./schemas');
+const {
+    MAX_HEAL_ATTEMPTS, mapPool, buildGenerationSummaryEntry,
+    createEventLogger, executeWithPool, executeTestCaseWithRetries
+} = require('./pipelineHelpers');
 
-const crypto = require('crypto');
 const fssync = require('fs');
 const {
-    updateRun, createRun, getScenariosByProject,
+    createRun, getScenariosByProject,
     getTestCasesByProject, getTestCasesByScenario, markTestCaseSuperseded,
-    upsertTestCase, updateTestCaseStatus,
-    incrementScenarioMappingStats,
-    incrementScenarioTestOutcome,
-    upsertHealPattern,
-    bumpReferenceExample
+    upsertTestCase,
+    incrementScenarioMappingStats
 } = require('./db');
-
-const MAX_HEAL_ATTEMPTS = 3;
 
 /** Max concurrent OpenAI test-case generation calls per run (improves prompt-cache routing vs unbounded fan-out). */
 const LLM_GEN_MAX_CONCURRENT = Math.max(1, parseInt(process.env.AUTOQA_LLM_MAX_CONCURRENT_GENERATION || '4', 10) || 4);
 
 /** Recent completed scenarios passed as alreadyGeneratedSummary (0 = disable). */
 const LLM_ALREADY_GENERATED_MAX = Math.max(0, parseInt(process.env.AUTOQA_LLM_ALREADY_GENERATED_MAX_ENTRIES || '12', 10) || 12);
-
-/**
- * Run async work over items with at most `limit` in flight (pool / semaphore).
- * @template T, R
- * @param {T[]} items
- * @param {number} limit
- * @param {(item: T, index: number) => Promise<R>} fn
- * @returns {Promise<R[]>}
- */
-async function mapPool(items, limit, fn) {
-    const results = new Array(items.length);
-    let next = 0;
-    const worker = async () => {
-        for (;;) {
-            const i = next++;
-            if (i >= items.length) return;
-            results[i] = await fn(items[i], i);
-        }
-    };
-    const n = Math.min(Math.max(1, limit), Math.max(1, items.length));
-    await Promise.all(Array.from({ length: n }, worker));
-    return results;
-}
-
-/**
- * Compact summary for [ALREADY COVERED IN THIS RUN] in test-case generation.
- * @param {string} scenarioId
- * @param {string} scenarioTitle
- * @param {string} scenarioType
- * @param {Array<{ title?: string, testData?: object }>} generatedTestCases
- */
-function buildGenerationSummaryEntry(scenarioId, scenarioTitle, scenarioType, generatedTestCases) {
-    const coveredInputs = [];
-    for (const tc of generatedTestCases || []) {
-        if (tc?.title) coveredInputs.push(String(tc.title).slice(0, 120));
-        const td = tc?.testData;
-        if (td && typeof td === 'object') {
-            for (const [g, obj] of Object.entries(td)) {
-                if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
-                    for (const k of Object.keys(obj)) coveredInputs.push(`${g}.${k}`);
-                }
-            }
-        }
-    }
-    const uniq = [...new Set(coveredInputs)].slice(0, 24);
-    return { scenarioId, title: scenarioTitle || scenarioId, type: scenarioType || '', coveredInputs: uniq };
-}
 
 // ---------------------------------------------------------------------------
 // PR file classification
@@ -140,69 +91,6 @@ function classifyChangedFiles(prFiles) {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// Event logger: writes to DB and broadcasts via Socket.IO
-// ---------------------------------------------------------------------------
-function createEventLogger(runId) {
-    return (type, data) => {
-        const updateParams = {};
-        let logsMsg = null;
-
-        if (type === 'phase_update') {
-            // Do not write data.status onto run_history.status — phase "completed"
-            // is not the same as run completed; only `complete` / `error` set run status.
-            logsMsg = `[Phase] ${data.phase}: ${data.status}`;
-        } else if (type === 'log') {
-            console.log(`[Pipeline] ${data.level}: ${data.message}`);
-            logsMsg = data.message;
-        } else if (type === 'pr_details') {
-            updateParams.prDetails = data;
-        } else if (type === 'init') {
-            updateParams.repoFullName = data.repoFullName;
-        } else if (type === 'complete') {
-            updateParams.status = data.success ? 'completed' : 'failed';
-            updateParams.completedAt = new Date().toISOString();
-            updateParams.overall_success = data.success ? 1 : 0;
-            if (typeof data.passedCount === 'number') {
-                updateParams.finished_passed_count = data.passedCount;
-            }
-            if (typeof data.failedCount === 'number') {
-                updateParams.finished_failed_count = data.failedCount;
-            }
-            if (typeof data.testCaseCount === 'number') {
-                updateParams.finished_test_case_count = data.testCaseCount;
-            }
-        } else if (type === 'error') {
-            updateParams.status = 'failed';
-            logsMsg = `[ERROR] ${data.message}`;
-        } else if (type === 'run_summary_updated') {
-            // Store compact summary in events list for fast row rendering
-            updateParams.events = [{ type: 'run_summary_updated', data, timestamp: new Date().toISOString() }];
-        } else if (type === 'test_case_attempt') {
-            // Store each attempt as a detailed event for View Details
-            updateParams.events = [{ type: 'test_case_attempt', data, timestamp: new Date().toISOString() }];
-        } else if (type === 'scenario_execution_updated') {
-            updateParams.events = [{ type: 'scenario_execution_updated', data, timestamp: new Date().toISOString() }];
-        } else if (type === 'test_execution_started' || type === 'test_execution_ended') {
-            // Live browser tracking events — emit via Socket.IO only, no DB persistence needed
-            if (global.io) {
-                global.io.emit(type, { runId, ...data });
-            }
-            return; // Skip DB update for ephemeral execution tracking events
-        }
-
-        if (logsMsg) {
-            updateParams.logs = [{ timestamp: new Date().toISOString(), level: data.level || 'INFO', message: logsMsg }];
-        }
-
-        updateRun(runId, updateParams);
-
-        if (global.io) {
-            global.io.emit('run_updated', { runId, type, data });
-            global.io.emit('refresh_data');
-        }
-    };
-}
 
 // ---------------------------------------------------------------------------
 // PR scenario mapping (unchanged from previous version)
@@ -326,364 +214,7 @@ function detectRefinementCandidates(repoFullName, prChangedFilenames) {
         .map(tc => ({ testCase: tc, scenarioId: tc.scenarioId }));
 }
 
-// ---------------------------------------------------------------------------
-// Concurrent Sandbox Pool Execution Queue
-// ---------------------------------------------------------------------------
-async function executeWithPool(tasks, pool, executeFn) {
-    if (!pool || pool.length === 0) throw new Error('No containers in pool');
-    const availableContainers = [...pool];
-    const executing = [];
 
-    for (const task of tasks) {
-        const processTask = async (taskItem) => {
-            while (availableContainers.length === 0) {
-                await new Promise(r => setTimeout(r, 50));
-            }
-            const container = availableContainers.pop();
-            try {
-                await executeFn(taskItem, container);
-            } finally {
-                availableContainers.push(container);
-            }
-        };
-
-        const p = processTask(task).then(() => {
-            executing.splice(executing.indexOf(p), 1);
-        });
-        executing.push(p);
-
-        if (executing.length >= pool.length) {
-            await Promise.race(executing);
-        }
-    }
-
-    await Promise.all(executing);
-}
-
-// ---------------------------------------------------------------------------
-// Hard-limit retry controller — the core of the new stateful approach
-// ---------------------------------------------------------------------------
-async function executeTestCaseWithRetries({
-    testCase, containerName, sandboxDir, runId, prUrl, codeContextSection,
-    linkedProject, refinementCandidates, sendEvent,
-    runSummary,
-    regressionMode = false,
-    scenarioDescription = '',
-    configuredTestAccounts = null
-}) {
-    let currentScript = testCase.testScript;
-    let finalStatus = 'fail';
-    let healAttempts = 0;
-
-    // Regression mode only: capture the pristine script + the first failure output
-    // so we can surface them as a potential-regression signal even when healing succeeds.
-    const originalScriptSnapshot = regressionMode ? (testCase.testScript || '') : null;
-    let firstFailureOutput = null;
-
-    // Stateful bookkeeping for the conversation between the pipeline and the LLM:
-    //   - conversationId: shared Conversations API id for this test case (preferred chain mechanism)
-    //   - currentInteractionId: latest response.id, used as fallback/zdr-mode chain
-    // Both are populated from the initial test-case generation call and mutated after every heal.
-    let conversationId = testCase.conversationId || null;
-    let currentInteractionId = testCase.latestResponseId || testCase.generationInteractionId || null;
-
-    // Manual history — used only as a fallback when neither conversation nor previous_response_id is available.
-    const attemptHistory = [];
-
-    // Encrypted reasoning items (ZDR mode only). Passed back in each subsequent
-    // heal call so the model retains its chain-of-thought across attempts even
-    // when the Conversations API / previous_response_id path is unavailable.
-    let currentReasoningItems = null;
-
-    for (let attempt = 1; attempt <= MAX_HEAL_ATTEMPTS; attempt++) {
-        const attemptStartedAt = new Date().toISOString();
-
-        updateTestCaseStatus(testCase.testCaseId, 'running', attemptStartedAt);
-        testCase.status = 'running';
-
-        sendEvent('test_case_attempt', {
-            testCaseId: testCase.testCaseId,
-            scenarioId: testCase.scenarioId,
-            attempt,
-            status: 'running',
-            startedAt: attemptStartedAt
-        });
-        sendEvent('log', { level: 'INFO', message: `[Sandbox] ${testCase.testCaseId} attempt ${attempt}/${MAX_HEAL_ATTEMPTS}` });
-
-        const syntaxCheck = validateSyntaxLocal(currentScript, testCase.language || 'javascript');
-
-        let sandboxResult;
-        if (!syntaxCheck.valid) {
-            sendEvent('phase_update', { phase: 'Syntax Validation', status: 'failed' });
-            sendEvent('log', {
-                level: 'WARN',
-                message: `[Syntax validation] ${testCase.testCaseId} attempt ${attempt}: ${syntaxCheck.error}`
-            });
-            sandboxResult = {
-                success: false,
-                output: `[Syntax validation] ${syntaxCheck.error}`,
-                error: syntaxCheck.error,
-                failureScreenshots: [],
-                traces: [],
-                videos: []
-            };
-        } else {
-            // Emit live execution tracking event for the browser viewer
-            sendEvent('test_execution_started', {
-                testCaseId: testCase.testCaseId,
-                scenarioId: testCase.scenarioId,
-                title: testCase.title,
-                attempt,
-                containerName
-            });
-
-            try {
-                sandboxResult = await executeTest(
-                    containerName,
-                    sandboxDir,
-                    testCase.language || 'javascript',
-                    currentScript,
-                    `test_${testCase.testCaseId}_attempt${attempt}.spec.${testCase.language === 'python' ? 'py' : 'js'}`,
-                    testCase.testData || {},
-                    {
-                        runId,
-                        testCaseId: testCase.testCaseId,
-                        attempt
-                    }
-                );
-            } catch (execErr) {
-                sandboxResult = {
-                    success: false,
-                    output: `[Sandbox executor error] ${execErr.message}`,
-                    error: execErr.message,
-                    failureScreenshots: [],
-                    traces: [],
-                    videos: []
-                };
-            } finally {
-                sendEvent('test_execution_ended', {
-                    testCaseId: testCase.testCaseId,
-                    scenarioId: testCase.scenarioId,
-                    status: sandboxResult?.success ? 'pass' : 'fail',
-                    containerName
-                });
-            }
-        }
-
-        const attemptEndedAt = new Date().toISOString();
-
-        if (sandboxResult.success) {
-            runSummary.passedCount++;
-            runSummary.runningCount = Math.max(0, runSummary.runningCount - 1);
-        }
-        const genLeft = runSummary.scenariosGeneratingLeft ?? 0;
-        const progressLine = `[Sandbox][${testCase.runId || runId}] ${testCase.testCaseId} attempt ${attempt}/${MAX_HEAL_ATTEMPTS}: ${sandboxResult.success ? 'PASS' : 'FAIL'}. Tests still without final verdict: ${runSummary.runningCount}; scenario(s) still generating: ${genLeft}`;
-        console.log(progressLine);
-        sendEvent('log', { level: 'INFO', message: progressLine });
-
-        if (sandboxResult.success) {
-            finalStatus = 'pass';
-
-            // Regression stamping: clean_pass when the pristine script passed first try,
-            // 'adapted' when healing had to change it to make it green.
-            const regressionStamp = regressionMode
-                ? (healAttempts === 0 ? 'clean_pass' : 'adapted')
-                : null;
-
-            // Persist final passing script back onto the test case
-            upsertTestCase({
-                ...testCase,
-                testScript: currentScript,
-                status: 'pass',
-                healAttempts,
-                heal_exhausted: 0,
-                conversationId,
-                latestResponseId: currentInteractionId,
-                regression:            regressionStamp,
-                originalScript:        regressionStamp === 'adapted' ? originalScriptSnapshot : null,
-                originalFailureOutput: regressionStamp === 'adapted' ? firstFailureOutput : null,
-                lastRunAt: attemptEndedAt
-            });
-
-            sendEvent('test_case_attempt', {
-                testCaseId: testCase.testCaseId,
-                scenarioId: testCase.scenarioId,
-                attempt,
-                status: 'pass',
-                output: sandboxResult.output,
-                failureScreenshots: sandboxResult.failureScreenshots || [],
-                traces: sandboxResult.traces || [],
-                videos: sandboxResult.videos || [],
-                regression: regressionStamp,
-                startedAt: attemptStartedAt,
-                endedAt: attemptEndedAt
-            });
-            sendEvent('log', {
-                level: 'INFO',
-                message: regressionStamp === 'adapted'
-                    ? `[Sandbox] ${testCase.testCaseId}: PASS on attempt ${attempt} (adapted — original failure retained as potential regression)`
-                    : `[Sandbox] ${testCase.testCaseId}: PASS on attempt ${attempt}`
-            });
-            try {
-                if (healAttempts > 0 && attemptHistory.length > 0) {
-                    const lastFail = String(attemptHistory[attemptHistory.length - 1]?.failureOutput || '').slice(-2400);
-                    const failureSignature = crypto.createHash('sha256').update(lastFail).digest('hex').slice(0, 48);
-                    upsertHealPattern({
-                        scenarioId: testCase.scenarioId,
-                        failureSignature,
-                        workingFixSummary: `Recovered after ${healAttempts} heal(s)`
-                    });
-                }
-                const fw = testCase.language === 'python' ? 'pytest' : 'jest';
-                bumpReferenceExample(fw, '', currentScript);
-            } catch (persistErr) {
-                sendEvent('log', { level: 'WARN', message: `[Pipeline] Pattern/reference promotion skipped: ${persistErr.message}` });
-            }
-            break;
-        }
-
-        // Record this failure in the history before healing
-        const failureOutput = sandboxResult.output || sandboxResult.error || 'No output';
-        // Keep the TAIL of the failure output, not the head — stack traces and
-        // "expected X got Y" lines are almost always at the end. Older code
-        // kept the first 1500 chars which usually showed only boot/log noise.
-        attemptHistory.push({
-            attemptNumber: attempt,
-            scriptUsed: currentScript,
-            failureOutput: failureOutput.slice(-3500)
-        });
-
-        // Regression mode: remember the very first failure so we can retain it
-        // alongside an adapted/healed script as a potential-regression signal.
-        if (regressionMode && firstFailureOutput === null) {
-            firstFailureOutput = failureOutput;
-        }
-
-        // Failed — record the attempt
-        sendEvent('test_case_attempt', {
-            testCaseId: testCase.testCaseId,
-            scenarioId: testCase.scenarioId,
-            attempt,
-            status: 'fail',
-            failureOutput,
-            scriptSnapshot: currentScript,
-            failureScreenshots: sandboxResult.failureScreenshots || [],
-            traces: sandboxResult.traces || [],
-            videos: sandboxResult.videos || [],
-            regression: regressionMode ? 'pending' : null,
-            startedAt: attemptStartedAt,
-            endedAt: attemptEndedAt
-        });
-        const failureSnippet = failureOutput.slice(0, 2000);
-        sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId}: FAIL on attempt ${attempt}` });
-        sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId} failure output: ${failureSnippet}` });
-
-        const INFRA_FAILURE_PATTERNS = /ERR_CONNECTION_REFUSED|ECONNREFUSED|ERR_CONNECTION_RESET|net::ERR_ABORTED|Dev server not running/i;
-        const isInfraFailure = INFRA_FAILURE_PATTERNS.test(failureOutput);
-        if (isInfraFailure) {
-            sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId}: Infrastructure failure detected (dev server unreachable) — skipping heal, marking as fail.` });
-            break;
-        }
-
-        if (attempt < MAX_HEAL_ATTEMPTS) {
-            healAttempts++;
-            runSummary.retryCount++;
-            const healMode = conversationId
-                ? `stateful (conversation=${conversationId})`
-                : (currentInteractionId ? `stateful (previous_response_id=${currentInteractionId})` : 'stateless (manual history)');
-            sendEvent('log', { level: 'INFO', message: `[Healing] Requesting patch for ${testCase.testCaseId} (attempt ${attempt + 1}, ${healMode})...` });
-            updateTestCaseStatus(testCase.testCaseId, 'healing');
-            testCase.status = 'healing';
-            try {
-                const healResult = await repairTestCaseScript({
-                    testCase: { ...testCase, testScript: currentScript },
-                    failureOutput,
-                    codeContextSection,
-                    attemptNumber: attempt + 1,
-                    conversationId,
-                    previousInteractionId: currentInteractionId,
-                    attemptHistory,
-                    priorReasoningItems: currentReasoningItems,
-                    scenarioDescription,
-                    configuredTestAccounts
-                });
-                currentScript = healResult.repairedScript;
-                currentInteractionId = healResult.interactionId || currentInteractionId;
-                // Refresh encrypted reasoning items for the next heal (ZDR mode).
-                // Non-ZDR modes return [] here, which harmlessly overrides nothing.
-                if (Array.isArray(healResult.reasoningItems) && healResult.reasoningItems.length > 0) {
-                    currentReasoningItems = healResult.reasoningItems;
-                }
-                // Stale-chain signal from llmService — the stored conversationId
-                // is invalid (expired/deleted). Drop it so we don't keep trying
-                // the same dead anchor on every subsequent heal.
-                if (healResult.chainWasStale) {
-                    sendEvent('log', { level: 'WARN', message: `[Healing] Stored conversation/response anchor was stale — continuing stateless.` });
-                    conversationId = null;
-                    currentInteractionId = healResult.interactionId || null;
-                }
-
-                // Persist the latest response id so a server restart can resume the chain.
-                upsertTestCase({
-                    ...testCase,
-                    testScript: currentScript,
-                    healAttempts,
-                    conversationId,
-                    latestResponseId: currentInteractionId,
-                    status: 'running'
-                });
-                testCase.status = 'running';
-            } catch (healErr) {
-                sendEvent('log', { level: 'ERROR', message: `[Healing] LLM repair failed: ${healErr.message}` });
-                break;
-            }
-        }
-    }
-
-    if (finalStatus === 'fail') {
-        runSummary.failedCount++;
-        runSummary.runningCount = Math.max(0, runSummary.runningCount - 1);
-
-        const regressionStamp = regressionMode ? 'regression_fail' : null;
-
-        upsertTestCase({
-            ...testCase,
-            testScript: currentScript,
-            status: 'fail',
-            healAttempts,
-            heal_exhausted: 1,
-            conversationId,
-            latestResponseId: currentInteractionId,
-            regression:            regressionStamp,
-            originalScript:        regressionMode ? originalScriptSnapshot : null,
-            originalFailureOutput: regressionMode ? firstFailureOutput : null,
-            lastRunAt: new Date().toISOString()
-        });
-
-        sendEvent('test_case_attempt', {
-            testCaseId: testCase.testCaseId,
-            scenarioId: testCase.scenarioId,
-            attempt: MAX_HEAL_ATTEMPTS,
-            status: 'final_fail',
-            regression: regressionStamp,
-            endedAt: new Date().toISOString()
-        });
-        sendEvent('log', {
-            level: 'ERROR',
-            message: regressionMode
-                ? `[Regression] ${testCase.testCaseId}: REGRESSION FAIL — existing script could not be made green after ${MAX_HEAL_ATTEMPTS} attempts (${healAttempts} heal(s))`
-                : `[Sandbox] ${testCase.testCaseId}: FINAL FAIL after ${MAX_HEAL_ATTEMPTS} attempts (${healAttempts} heal(s))`
-        });
-    }
-
-    updateTestCaseStatus(testCase.testCaseId, finalStatus);
-    try {
-        incrementScenarioTestOutcome(testCase.scenarioId, finalStatus === 'pass');
-    } catch (e) {
-        console.warn('[Pipeline] incrementScenarioTestOutcome skipped:', e.message);
-    }
-    return finalStatus;
-}
 
 // ---------------------------------------------------------------------------
 // Epic-wide regression runner
@@ -1211,14 +742,11 @@ async function runPipeline(runId, prUrl, repoFullName) {
                         });
                     } finally {
                         availableContainers.push(container);
-                        executing.splice(executing.indexOf(p), 1);
+                        const idx = executing.indexOf(p);
+                        if (idx !== -1) executing.splice(idx, 1);
                     }
                 })();
-                
-                // Clear out from executing array when done
-                p.finally(() => {
-                    executing.splice(executing.indexOf(p), 1);
-                });
+
                 executing.push(p);
             }
         })();

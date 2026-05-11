@@ -977,50 +977,57 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                 const pkg = await loadPackageJsonAt(appAbs);
                 const sandboxEnvFromFile = await readEnvLocalAsObject(path.join(appAbs, '.env.local'));
                 const { devShellCmd, targetUrl } = await resolveDevCommandAndTargetUrl(appAbs, pkg, { sandboxEnv: sandboxEnvFromFile });
-                if (!devShellCmd) {
+
+                const isExternalUrl = targetUrl && !/localhost|127\.0\.0\.1/i.test(targetUrl);
+
+                if (!isExternalUrl && !devShellCmd) {
                     throw new Error('Dev server failed to start: missing scripts.dev or scripts.start in package.json');
                 }
 
                 let didStartDevServer = false;
                 try {
-                    const startCmd =
-                        '(' + devShellCmd + ') > /tmp/autoqa-dev.log 2>&1 & echo $! > /tmp/autoqa-dev.pid';
-                    await execFilePromise(
-                        'docker',
-                        ['exec', '-d', '-w', appWorkdir, containerName, 'sh', '-c', startCmd],
-                        { timeout: testTimeout }
-                    );
-                    didStartDevServer = true;
-
-                    try {
+                    if (!isExternalUrl) {
+                        const startCmd =
+                            '(' + devShellCmd + ') > /tmp/autoqa-dev.log 2>&1 & echo $! > /tmp/autoqa-dev.pid';
                         await execFilePromise(
                             'docker',
-                            [
-                                'exec', containerName,
-                                'npx', 'wait-on', targetUrl,
-                                '-t', String(PLAYWRIGHT_WAIT_ON_MS)
-                            ],
-                            { timeout: PLAYWRIGHT_WAIT_ON_MS + 10000 }
+                            ['exec', '-d', '-w', appWorkdir, containerName, 'sh', '-c', startCmd],
+                            { timeout: testTimeout }
                         );
-                    } catch (waitErr) {
-                        console.warn(`[Sandbox] wait-on timeout for ${targetUrl} in ${containerName} after ${PLAYWRIGHT_WAIT_ON_MS}ms`);
-                        let devLog = '';
+                        didStartDevServer = true;
+
                         try {
-                            const { stdout } = await spawnCapture('docker',
-                                ['exec', containerName, 'sh', '-c', 'tail -30 /tmp/autoqa-dev.log 2>/dev/null'],
-                                { timeout: 5000 });
-                            devLog = (stdout || '').trim();
-                        } catch { /* ignore */ }
-                        const pidCheck = await spawnCapture('docker',
-                            ['exec', containerName, 'sh', '-c', '[ -s /tmp/autoqa-dev.pid ] && kill -0 "$(cat /tmp/autoqa-dev.pid)" 2>/dev/null && echo ALIVE || echo DEAD'],
-                            { timeout: 5000 }).then(r => (r.stdout || '').trim()).catch(() => 'UNKNOWN');
-                        if (pidCheck === 'DEAD') {
-                            const crashMsg = `[Sandbox] Dev server crashed in ${containerName}. Log tail:\n${devLog || '(empty)'}`;
-                            console.error(crashMsg);
-                            throw new Error(`Dev server not running (process exited). Tail of /tmp/autoqa-dev.log:\n${devLog.slice(0, 1000) || '(no output)'}`);
+                            await execFilePromise(
+                                'docker',
+                                [
+                                    'exec', containerName,
+                                    'npx', 'wait-on', targetUrl,
+                                    '-t', String(PLAYWRIGHT_WAIT_ON_MS)
+                                ],
+                                { timeout: PLAYWRIGHT_WAIT_ON_MS + 10000 }
+                            );
+                        } catch (waitErr) {
+                            console.warn(`[Sandbox] wait-on timeout for ${targetUrl} in ${containerName} after ${PLAYWRIGHT_WAIT_ON_MS}ms`);
+                            let devLog = '';
+                            try {
+                                const { stdout } = await spawnCapture('docker',
+                                    ['exec', containerName, 'sh', '-c', 'tail -30 /tmp/autoqa-dev.log 2>/dev/null'],
+                                    { timeout: 5000 });
+                                devLog = (stdout || '').trim();
+                            } catch { /* ignore */ }
+                            const pidCheck = await spawnCapture('docker',
+                                ['exec', containerName, 'sh', '-c', '[ -s /tmp/autoqa-dev.pid ] && kill -0 "$(cat /tmp/autoqa-dev.pid)" 2>/dev/null && echo ALIVE || echo DEAD'],
+                                { timeout: 5000 }).then(r => (r.stdout || '').trim()).catch(() => 'UNKNOWN');
+                            if (pidCheck === 'DEAD') {
+                                const crashMsg = `[Sandbox] Dev server crashed in ${containerName}. Log tail:\n${devLog || '(empty)'}`;
+                                console.error(crashMsg);
+                                throw new Error(`Dev server not running (process exited). Tail of /tmp/autoqa-dev.log:\n${devLog.slice(0, 1000) || '(no output)'}`);
+                            }
+                            console.warn(`[Sandbox] Dev server PID=${pidCheck} — proceeding with test despite wait-on timeout`);
+                            if (devLog) console.warn(`[Sandbox] Dev log tail:\n${devLog.slice(0, 500)}`);
                         }
-                        console.warn(`[Sandbox] Dev server PID=${pidCheck} — proceeding with test despite wait-on timeout`);
-                        if (devLog) console.warn(`[Sandbox] Dev log tail:\n${devLog.slice(0, 500)}`);
+                    } else {
+                        console.log(`[Sandbox] External URL detected (${targetUrl}) — skipping dev server startup`);
                     }
 
                     const execEnvArgs = ['exec', '-w', '/app'];
@@ -1263,8 +1270,130 @@ function cleanupSandboxPool(runId, pool) {
     }
 }
 
+/**
+ * Lightweight sandbox pool for live-site testing. Skips repo cloning — the
+ * containers just need Playwright pointing at an external URL.
+ *
+ * @param {string} runId
+ * @param {string} targetUrl - The live site URL to test against
+ * @param {number} [concurrency=2]
+ * @param {object} [options]
+ * @returns {Promise<Array<{ sandboxDir: string, containerName: string, vncPort: number|null }>>}
+ */
+async function createLiveSiteSandboxPool(runId, targetUrl, concurrency = 2, options = {}) {
+    const createPromises = [];
+
+    for (let i = 1; i <= concurrency; i++) {
+        createPromises.push((async () => {
+            await acquireSandboxCreationSlot();
+            try {
+                const baseTmp = process.platform === 'win32' ? 'C:\\tmp' : '/tmp';
+                const sandboxDir = path.join(baseTmp, 'autoqa-sandbox', `${runId}-${i}`);
+                const containerName = `autoqa-sandbox-${runId}-${i}`;
+
+                await fs.mkdir(sandboxDir, { recursive: true });
+
+                const volumeDir = sandboxDir.replace(/\\/g, '/');
+                const runTimeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
+                const dockerRunTimeoutMs = getDockerBaseImagePullTimeoutMs();
+                const installTimeoutMs = Math.max(runTimeoutMs, 300000);
+                const liveMode = isLiveBrowserEnabled();
+                const vncPort = liveMode ? VNC_BASE_PORT + (i - 1) : null;
+
+                try {
+                    await execFilePromise('docker', ['rm', '-f', containerName]).catch(() => {});
+
+                    const dockerRunArgs = [
+                        'run', '-d',
+                        '--name', containerName,
+                        '-v', `${volumeDir}:/app`,
+                        '-w', '/app',
+                        '-e', `AUTOQA_E2E_BASE_URL=${targetUrl}`
+                    ];
+
+                    if (liveMode && vncPort) {
+                        dockerRunArgs.push('-p', `${vncPort}:6080`);
+                        dockerRunArgs.push('-e', 'DISPLAY=:99');
+                        dockerRunArgs.push('-e', 'AUTOQA_LIVE_BROWSER=true');
+                        dockerRunArgs.push('-e', `AUTOQA_LIVE_SLOWMO_MS=${LIVE_SLOWMO_MS}`);
+                    }
+
+                    const sandboxEnv = options.sandboxEnv && typeof options.sandboxEnv === 'object'
+                        ? options.sandboxEnv : {};
+                    for (const [envKey, envVal] of Object.entries(sandboxEnv)) {
+                        if (envVal == null) continue;
+                        dockerRunArgs.push('-e', `${envKey}=${String(envVal)}`);
+                    }
+
+                    dockerRunArgs.push(
+                        `mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-jammy`,
+                        'tail', '-f', '/dev/null'
+                    );
+
+                    await dockerRun(dockerRunArgs, dockerRunTimeoutMs);
+                    console.log(`[Sandbox] Live-site container started: ${containerName}${liveMode ? ` (VNC port ${vncPort})` : ''}`);
+
+                    if (liveMode) {
+                        const vncInstallTimeoutMs = Math.max(installTimeoutMs, 600000);
+                        try {
+                            await spawnCapture('docker', [
+                                'exec', containerName, 'sh', '-c',
+                                'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc python3-websockify && rm -rf /var/lib/apt/lists/*'
+                            ], { timeout: vncInstallTimeoutMs });
+                        } catch (vncInstErr) {
+                            try {
+                                await execFilePromise('docker', [
+                                    'exec', containerName, 'which', 'x11vnc'
+                                ], { timeout: 10000 });
+                            } catch {
+                                throw vncInstErr;
+                            }
+                        }
+
+                        const vncStartScript = [
+                            '#!/bin/sh', 'export DISPLAY=:99',
+                            'Xvfb :99 -screen 0 1280x720x24 &', 'sleep 1',
+                            'x11vnc -display :99 -forever -nopw -shared -rfbport 5900 &',
+                            'websockify --web=/usr/share/novnc/ 6080 localhost:5900 &',
+                            'echo "VNC stack started"', 'wait'
+                        ].join('\n');
+                        await fs.writeFile(path.join(sandboxDir, '.autoqa-vnc-start.sh'), vncStartScript, 'utf8');
+                        await execFilePromise('docker', ['exec', containerName, 'chmod', '+x', '/app/.autoqa-vnc-start.sh'], { timeout: 10000 });
+                        await execFilePromise('docker', ['exec', '-d', containerName, '/app/.autoqa-vnc-start.sh'], { timeout: 10000 });
+                        await new Promise(r => setTimeout(r, 3000));
+
+                        if (typeof global !== 'undefined' && global.io) {
+                            global.io.emit('sandbox_vnc_ready', {
+                                runId, containerId: i, containerName, vncPort,
+                                vncUrl: `http://localhost:${vncPort}/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000`
+                            });
+                        }
+                    }
+
+                    await dockerRun([
+                        'exec', containerName,
+                        'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock',
+                        `@playwright/test@${PLAYWRIGHT_VERSION}`, 'wait-on'
+                    ], installTimeoutMs);
+                    console.log(`[Sandbox] Pre-installed @playwright/test and wait-on in ${containerName}.`);
+                } catch (err) {
+                    console.error(`[Sandbox] Live-site container startup failed for ${containerName}:`, err.message);
+                    throw err;
+                }
+
+                return { sandboxDir, containerName, vncPort };
+            } finally {
+                releaseSandboxCreationSlot();
+            }
+        })());
+    }
+
+    return await Promise.all(createPromises);
+}
+
 module.exports = {
     createSandboxPool,
+    createLiveSiteSandboxPool,
     executeTest,
     validateSyntaxLocal,
     cleanupSandboxPool,

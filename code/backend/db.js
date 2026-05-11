@@ -131,6 +131,19 @@ function initDb() {
         // Columns already exist or table doesn't exist yet — both fine.
     }
 
+    // Safe migration: add runType to run_history for distinguishing PR / Jira / live-site runs.
+    try {
+        const columns = db.pragma('table_info(run_history)');
+        if (!columns.find(c => c.name === 'runType')) {
+            db.exec("ALTER TABLE run_history ADD COLUMN runType TEXT DEFAULT 'pr'");
+        }
+        if (!columns.find(c => c.name === 'targetUrl')) {
+            db.exec('ALTER TABLE run_history ADD COLUMN targetUrl TEXT');
+        }
+    } catch (e) {
+        // Column already exists or table doesn't exist yet — both fine.
+    }
+
     // Safe migration: add regression bookkeeping to test_cases so bug-fix
     // regression runs can record a clean pass vs adapted (healed) vs regression_fail,
     // and keep the original failing script + output as a potential regression signal.
@@ -565,11 +578,13 @@ function markScenariosObsolete(projectKey, epicId, activeIds = []) {
 function createRun(runId, data) {
     const stmt = db.prepare(`
         INSERT INTO run_history (
-            runId, repoFullName, prUrl, status, createdAt, completedAt, 
-            events, logs, llm_traces, scenario_statuses, localProjectId
+            runId, repoFullName, prUrl, status, createdAt, completedAt,
+            events, logs, llm_traces, scenario_statuses, localProjectId,
+            runType, targetUrl
         ) VALUES (
             @runId, @repoFullName, @prUrl, @status, @createdAt, @completedAt,
-            @events, @logs, @llm_traces, @scenario_statuses, @localProjectId
+            @events, @logs, @llm_traces, @scenario_statuses, @localProjectId,
+            @runType, @targetUrl
         )
     `);
     stmt.run({
@@ -583,7 +598,9 @@ function createRun(runId, data) {
         logs: JSON.stringify(data.logs || []),
         llm_traces: JSON.stringify(data.llm_traces || []),
         scenario_statuses: JSON.stringify(data.scenario_statuses || {}),
-        localProjectId: data.localProjectId || null
+        localProjectId: data.localProjectId || null,
+        runType: data.runType || 'pr',
+        targetUrl: data.targetUrl || null
     });
 }
 
@@ -609,7 +626,9 @@ function updateRun(runId, patch) {
             overall_success = @overall_success,
             finished_passed_count = @finished_passed_count,
             finished_failed_count = @finished_failed_count,
-            finished_test_case_count = @finished_test_case_count
+            finished_test_case_count = @finished_test_case_count,
+            runType = @runType,
+            targetUrl = @targetUrl
         WHERE runId = @runId
     `);
     
@@ -637,7 +656,9 @@ function updateRun(runId, patch) {
             : Number(merged.finished_failed_count),
         finished_test_case_count: merged.finished_test_case_count === undefined || merged.finished_test_case_count === null
             ? null
-            : Number(merged.finished_test_case_count)
+            : Number(merged.finished_test_case_count),
+        runType: merged.runType || 'pr',
+        targetUrl: merged.targetUrl || null
     });
 }
 function getRun(runId) {

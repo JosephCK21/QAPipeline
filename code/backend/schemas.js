@@ -78,6 +78,11 @@ const sandboxEnvPutSchema = z.object({
     }
 });
 
+const liveSiteRunSchema = z.object({
+    url: z.string().url(),
+    frdText: z.string().optional()
+}).passthrough();
+
 const validateBody = (schema) => (req, res, next) => {
     try {
         schema.parse(req.body);
@@ -95,5 +100,6 @@ module.exports = {
     projectCreateSchema,
     defaultTestAccountsPutSchema,
     sandboxEnvPutSchema,
+    liveSiteRunSchema,
     validateBody
 };

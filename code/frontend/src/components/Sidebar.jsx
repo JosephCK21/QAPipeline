@@ -6,7 +6,8 @@ import {
   Play,
   ChevronLeft,
   ChevronRight,
-  Zap
+  Zap,
+  Globe
 } from 'lucide-react';
 
 function Sidebar() {
@@ -16,6 +17,7 @@ function Sidebar() {
   const navItems = [
     { path: '/', icon: FolderKanban, label: 'Projects' },
     { path: '/pipelines', icon: Play, label: 'Pipeline Runs', badge: activeRuns.filter(r => r.status === 'Running').length },
+    { path: '/live-site-testing', icon: Globe, label: 'Live Site Testing' },
     { path: '/llm-traces', icon: Zap, label: 'Agent Console' }
   ];
 

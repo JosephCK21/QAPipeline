@@ -17,7 +17,8 @@ const {
     listLlmTracesByRun, listDlqEvents, getDlqEvent, updateDlqStatus,
     getHealExhaustedByProject
 } = require('./db');
-const { githubWebhookSchema, jiraWebhookSchema, projectCreateSchema, sandboxEnvPutSchema, defaultTestAccountsPutSchema, validateBody } = require('./schemas');
+const { githubWebhookSchema, jiraWebhookSchema, projectCreateSchema, sandboxEnvPutSchema, defaultTestAccountsPutSchema, liveSiteRunSchema, validateBody } = require('./schemas');
+const { runLiveSitePipeline } = require('./liveSitePipeline');
 
 initDb();
 
@@ -1168,6 +1169,88 @@ app.delete('/api/runs/:runId', (req, res) => {
         res.json({ success: true, runId: req.params.runId });
     } catch (error) {
         console.error('[Delete Run] Failed:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Live Site Testing routes
+// ---------------------------------------------------------------------------
+
+const liveSiteFrdStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        const uploadPath = path.join(__dirname, 'uploads', 'live-site-frd');
+        if (!fs.existsSync(uploadPath)) {
+            fs.mkdirSync(uploadPath, { recursive: true });
+        }
+        cb(null, uploadPath);
+    },
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, uniqueSuffix + '-' + file.originalname);
+    }
+});
+const liveSiteFrdUpload = multer({ storage: liveSiteFrdStorage });
+
+app.post('/api/projects/:projectId/live-site-runs', liveSiteFrdUpload.fields([
+    { name: 'frdFile', maxCount: 1 }
+]), (req, res) => {
+    try {
+        const project = getProjectById(req.params.projectId);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+
+        const url = String(req.body?.url || '').trim();
+        if (!url) return res.status(400).json({ error: 'url is required' });
+        try { new URL(url); } catch { return res.status(400).json({ error: 'Invalid URL format' }); }
+
+        const frdText = req.body?.frdText || '';
+        const frdFiles = req.files?.frdFile
+            ? req.files.frdFile.map(f => ({
+                path: path.resolve(f.path),
+                mimeType: f.mimetype,
+                originalName: f.originalname
+            }))
+            : [];
+
+        const runId = uuidv4();
+        res.status(202).json({ accepted: true, runId });
+
+        process.nextTick(() => {
+            if (global.io) {
+                global.io.emit('live_site_run_started', {
+                    runId,
+                    targetUrl: url,
+                    localProjectId: project.id,
+                    localProjectName: project.name
+                });
+                global.io.emit('refresh_data');
+            }
+            runLiveSitePipeline(runId, {
+                targetUrl: url,
+                frdText,
+                frdFiles,
+                projectId: project.id
+            }).catch(err => {
+                console.error(`[Live Site Pipeline Error] Run ${runId}:`, err);
+            });
+        });
+    } catch (error) {
+        console.error('[Live Site Run] Failed:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/projects/:projectId/live-site-runs', (req, res) => {
+    try {
+        const project = getProjectById(req.params.projectId);
+        if (!project) return res.status(404).json({ error: 'Project not found' });
+
+        const allRuns = listRuns();
+        const liveSiteRuns = allRuns.filter(r => {
+            return r.localProjectId === project.id && r.runType === 'live_site';
+        });
+        res.json(liveSiteRuns);
+    } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });

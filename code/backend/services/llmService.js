@@ -378,6 +378,9 @@ function extractResponseText(response) {
         if (item.type !== 'message') continue;
         const content = Array.isArray(item.content) ? item.content : [];
         for (const c of content) {
+            if (c.type === 'refusal') {
+                throw new Error(`LLM refused the request: ${c.refusal || '(no reason given)'}`);
+            }
             if (typeof c.text === 'string') chunks.push(c.text);
             else if (c.text && typeof c.text.value === 'string') chunks.push(c.text.value);
         }
@@ -1644,6 +1647,211 @@ Structured response shape is enforced by the API — include every story via val
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live Site Testing — scenario + test-case generation from a live website
+// ---------------------------------------------------------------------------
+
+const LIVE_SITE_SCENARIO_INSTRUCTIONS = `You are an expert QA engineer. You are given:
+1. An FRD (Functional Requirements Document) describing what a website should do.
+2. An accessibility snapshot / DOM snapshot of the live website.
+
+Your task: generate a comprehensive set of test scenarios that cover the FRD requirements
+against the actual website structure. Each scenario should be concrete and testable via
+browser automation (Playwright).
+
+Focus on:
+- Happy-path flows described in the FRD
+- Edge cases and boundary conditions
+- Negative tests (invalid input, unauthorized access, etc.)
+- UI-specific behaviors visible in the site snapshot (forms, navigation, modals, etc.)
+
+Return ONLY valid JSON — a single object with a "scenarios" array containing the scenario objects.`;
+
+const LIVE_SITE_SCENARIO_SCHEMA = {
+    type: 'object',
+    properties: {
+        scenarios: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    id:          { type: 'string' },
+                    title:       { type: 'string' },
+                    description: { type: 'string' },
+                    type:        { type: 'string', enum: ['Happy Path', 'Edge Case', 'Negative', 'Boundary'] },
+                    priority:    { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }
+                },
+                required: ['id', 'title', 'description', 'type', 'priority'],
+                additionalProperties: false
+            }
+        }
+    },
+    required: ['scenarios'],
+    additionalProperties: false
+};
+
+/**
+ * Generate test scenarios from an FRD + live site snapshot.
+ */
+async function generateLiveSiteScenarios({ frdText, siteSnapshot, baseUrl }) {
+    const prompt = `Generate 5–15 test scenarios that thoroughly cover the requirements against this live site.
+Each scenario needs a unique id (format: LST-<index>), a title, description, type, and priority.
+
+[TARGET URL]: ${baseUrl || '(unknown)'}
+
+[FRD — Functional Requirements Document]:
+${frdText || '(No FRD provided — generate exploratory test scenarios based on what you observe on the site.)'}
+
+[LIVE SITE SNAPSHOT — accessibility tree / DOM structure]:
+${siteSnapshot || '(No snapshot available.)'}`;
+
+    const trimmed = ensureWithinBudget(prompt, PROMPT_TOKEN_BUDGET, 'generateLiveSiteScenarios');
+    await assertTokenLimit(trimmed, DEFAULT_MODEL);
+
+    const _startMs = Date.now();
+    emitLlmTrace({ caller: 'generateLiveSiteScenarios', model: DEFAULT_MODEL, phase: 'request', prompt: trimmed });
+
+    const response = await client.responses.create({
+        model: DEFAULT_MODEL,
+        instructions: LIVE_SITE_SCENARIO_INSTRUCTIONS,
+        input: trimmed,
+        max_output_tokens: MAX_OUTPUT_TOKENS_GEN,
+        store: true,
+        text: {
+            format: {
+                type: 'json_schema',
+                name: 'LiveSiteScenarios',
+                schema: LIVE_SITE_SCENARIO_SCHEMA,
+                strict: true
+            },
+            verbosity: OUTPUT_VERBOSITY
+        },
+        reasoning: { effort: SCENARIO_EFFORT, summary: REASONING_SUMMARY },
+        ...buildCacheParams('qa:livesite:scenarios')
+    });
+
+    const text = extractResponseText(response);
+    const usage = extractUsage(response);
+    emitLlmTrace({
+        caller: 'generateLiveSiteScenarios', model: DEFAULT_MODEL, phase: 'response',
+        response: text, durationMs: Date.now() - _startMs, usage
+    });
+
+    const parsed = safeParseJSON(text);
+    const scenarios = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.scenarios) ? parsed.scenarios : []);
+    return { scenarios, usage };
+}
+
+const LIVE_SITE_TESTCASE_INSTRUCTIONS = `You are an expert QA automation engineer writing Playwright test scripts.
+You are given a test scenario, the accessibility snapshot of a live website, and the target URL.
+
+Rules:
+- Write a COMPLETE, self-contained Playwright test using @playwright/test (import { test, expect } from '@playwright/test').
+- The test will run against the live site via baseURL config — use page.goto('/') or relative paths.
+- Use accessibility-friendly selectors: getByRole, getByText, getByLabel, getByPlaceholder, getByTestId.
+- Include meaningful assertions that verify the scenario's expected behavior.
+- Handle loading states with waitForSelector or expect(...).toBeVisible().
+- The script must be raw JavaScript code, NOT wrapped in markdown fences.
+- Do NOT hardcode absolute URLs — rely on baseURL from Playwright config.
+
+Return ONLY valid JSON.`;
+
+const LIVE_SITE_TESTCASE_SCHEMA = {
+    type: 'object',
+    properties: {
+        testCases: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    testCaseId:  { type: 'string' },
+                    title:       { type: 'string' },
+                    steps: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                action:         { type: 'string' },
+                                expectedResult: { type: 'string' }
+                            },
+                            required: ['action', 'expectedResult'],
+                            additionalProperties: false
+                        }
+                    },
+                    testScript:  { type: 'string' },
+                    language:    { type: 'string', enum: ['javascript'] },
+                    testData:    { type: 'object', additionalProperties: { type: 'string' } }
+                },
+                required: ['testCaseId', 'title', 'steps', 'testScript', 'language', 'testData'],
+                additionalProperties: false
+            }
+        }
+    },
+    required: ['testCases'],
+    additionalProperties: false
+};
+
+/**
+ * Generate Playwright test scripts for a single scenario against a live site.
+ */
+async function generateLiveSiteTestCases({ scenario, siteSnapshot, baseUrl }) {
+    const prompt = `Generate 1-3 concrete Playwright test cases for this scenario. Each test case must:
+- Have a unique testCaseId in format: TCN-${scenario.id}-<index>
+- Have clear steps as objects with "action" and "expectedResult" string fields
+- Have a complete, runnable testScript (raw JS code using @playwright/test)
+- Set language to "javascript"
+- Include testData as a flat object of key-value string pairs (empty {} if none)
+- Use page.goto('/') to start (baseURL is configured)
+
+[TARGET URL]: ${baseUrl || '(unknown)'}
+
+Scenario to cover:
+  ID: ${scenario.id}
+  Title: ${scenario.title}
+  Description: ${scenario.description || '(no description)'}
+  Type: ${scenario.type || 'Happy Path'}
+  Priority: ${scenario.priority || 'Medium'}
+
+[LIVE SITE SNAPSHOT — accessibility tree / DOM structure]:
+${siteSnapshot || '(No snapshot available.)'}`;
+
+    const trimmed = ensureWithinBudget(prompt, PROMPT_TOKEN_BUDGET, 'generateLiveSiteTestCases');
+    await assertTokenLimit(trimmed, DEFAULT_MODEL);
+
+    const _startMs = Date.now();
+    emitLlmTrace({ caller: 'generateLiveSiteTestCases', model: DEFAULT_MODEL, phase: 'request', prompt: trimmed });
+
+    const response = await client.responses.create({
+        model: DEFAULT_MODEL,
+        instructions: LIVE_SITE_TESTCASE_INSTRUCTIONS,
+        input: trimmed,
+        max_output_tokens: MAX_OUTPUT_TOKENS_GEN,
+        store: true,
+        text: {
+            format: {
+                type: 'json_schema',
+                name: 'LiveSiteTestCases',
+                schema: LIVE_SITE_TESTCASE_SCHEMA,
+                strict: true
+            },
+            verbosity: OUTPUT_VERBOSITY
+        },
+        reasoning: { effort: TESTCASE_EFFORT, summary: REASONING_SUMMARY },
+        ...buildCacheParams('qa:livesite:testcases')
+    });
+
+    const text = extractResponseText(response);
+    const usage = extractUsage(response);
+    emitLlmTrace({
+        caller: 'generateLiveSiteTestCases', model: DEFAULT_MODEL, phase: 'response',
+        response: text, durationMs: Date.now() - _startMs, responseId: response.id, usage
+    });
+
+    const parsed = safeParseJSON(text);
+    const testCases = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.testCases) ? parsed.testCases : []);
+    return { testCases, interactionId: response.id || null, usage };
+}
+
 module.exports = {
     client,
     setLlmRunContext,
@@ -1677,5 +1885,8 @@ module.exports = {
     generateTestScenarios,
     generateTestScenariosForEpic,
     generateTestCasesForScenario,
-    repairTestCaseScript
+    repairTestCaseScript,
+    normalizeTestCaseSteps,
+    generateLiveSiteScenarios,
+    generateLiveSiteTestCases
 };

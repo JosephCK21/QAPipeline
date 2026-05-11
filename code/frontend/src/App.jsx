@@ -9,6 +9,7 @@ import ProjectSettings from './pages/ProjectSettings';
 import PipelineRunsList from './pages/PipelineRunsList';
 import ScriptDetail from './pages/ScriptDetail';
 import AgentChatDebug from './pages/AgentChatDebug';
+import LiveSiteTesting from './pages/LiveSiteTesting';
 
 // Create context for global state
 export const AppContext = createContext();
@@ -81,6 +82,11 @@ function App() {
         setToast({ message: `Jira run failed for ${data.issueKey}`, type: 'error' });
         setTimeout(() => setToast(null), 5000);
       }
+    });
+
+    socket.on('live_site_run_started', (data) => {
+        setToast({ message: `Live site testing started for ${data.targetUrl}`, type: 'info' });
+        setTimeout(() => setToast(null), 5000);
     });
 
     socket.on('refresh_data', () => {
@@ -166,6 +172,7 @@ function App() {
                 <Route path="/projects/:projectId/settings" element={<ProjectSettings />} />
                 <Route path="/pipelines" element={<PipelineRunsList />} />
                 <Route path="/projects/:projectId/run/:runId/scripts" element={<ScriptDetail />} />
+                <Route path="/live-site-testing" element={<LiveSiteTesting />} />
                 <Route path="/llm-traces" element={<AgentChatDebug />} />
               </Routes>
             </main>
