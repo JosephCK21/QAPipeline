@@ -670,24 +670,12 @@ function releaseSandboxCreationSlot() {
  *
  * Returns an array of { sandboxDir, containerName } objects.
  */
-async function clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs, options = {}) {
+async function clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs) {
     if (!prDetails.headRepoFullName || !prDetails.headRef) {
         throw new Error('clonePrRepoToSandbox: missing headRepoFullName/headRef');
     }
     const token = process.env.GITHUB_TOKEN;
     const shallowUrl = `https://github.com/${prDetails.headRepoFullName}.git`;
-    const refGitRaw = options.referenceGitDir ? String(options.referenceGitDir) : '';
-    const refGitForGitArg = refGitRaw ? refGitRaw.replace(/\\/g, '/') : '';
-    const useReference =
-        (String(process.env.AUTOQA_SANDBOX_GIT_REFERENCE || 'true').toLowerCase() === 'true' ||
-            process.env.AUTOQA_SANDBOX_GIT_REFERENCE === '1') &&
-        !!refGitRaw &&
-        fssync.existsSync(refGitRaw);
-
-    const extraRefArgs = [];
-    if (useReference) {
-        extraRefArgs.push('--dissociate', '--reference-if-available', refGitForGitArg);
-    }
 
     if (token) {
         const b64 = Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64');
@@ -696,7 +684,6 @@ async function clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs, options = 
             [
                 '-c', `http.extraHeader=AUTHORIZATION: basic ${b64}`,
                 'clone',
-                ...extraRefArgs,
                 '--depth', '1',
                 '-b', prDetails.headRef,
                 shallowUrl,
@@ -707,24 +694,13 @@ async function clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs, options = 
     } else {
         await spawnCapture(
             'git',
-            ['clone', ...extraRefArgs, '--depth', '1', '-b', prDetails.headRef, shallowUrl, sandboxDir],
+            ['clone', '--depth', '1', '-b', prDetails.headRef, shallowUrl, sandboxDir],
             { timeout: timeoutMs }
         );
     }
 }
 
 async function createSandboxPool(runId, prDetails, concurrency = 2, options = {}) {
-    const refCandidate = prDetails._workspaceRoot
-        ? path.join(prDetails._workspaceRoot, '.git')
-        : null;
-    const isShallowRef = refCandidate && fssync.existsSync(path.join(refCandidate, 'shallow'));
-    const referenceGitDir =
-        refCandidate && !isShallowRef && fssync.existsSync(refCandidate)
-            ? refCandidate
-            : null;
-    if (isShallowRef) {
-        console.log('[Sandbox] Skipping --reference-if-available: PR workspace is a shallow clone');
-    }
     const createPromises = [];
 
     for (let i = 1; i <= concurrency; i++) {
@@ -742,9 +718,7 @@ async function createSandboxPool(runId, prDetails, concurrency = 2, options = {}
             try {
                 if (prDetails.headRepoFullName && prDetails.headRef) {
                     const timeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
-                    await clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs, {
-                        referenceGitDir,
-                    });
+                    await clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs);
                     console.log(`[Sandbox] Cloned repo into pool ${i}`);
 
                     // Overlay mock data if present

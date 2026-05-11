@@ -13,7 +13,7 @@ const {
     safeParseJSON,
     assertTokenLimit,
     ensureWithinBudget,
-    PROMPT_TOKEN_BUDGET
+    MAPPING_TOKEN_BUDGET
 } = require('./llmService');
 
 const MAPPING_RESPONSE_SCHEMA = {
@@ -186,7 +186,7 @@ ${JSON.stringify(documentTexts.slice(0, 5), null, 2)}`;
     // Even with the per-file 6k char cap above, mass file changes can blow
     // past the budget — soft-trim from the middle (scenario catalog is at the
     // top; instructions are the priority for caching).
-    const prompt = ensureWithinBudget(rawPrompt, PROMPT_TOKEN_BUDGET, 'mapPrChangesToScenarios');
+    const prompt = ensureWithinBudget(rawPrompt, MAPPING_TOKEN_BUDGET, 'mapPrChangesToScenarios');
     await assertTokenLimit(prompt, model);
 
     console.log(`[prScenarioMappingService] Calling LLM (${model}) with ${enrichedFiles.length} file(s) and ${scenarios.length} scenario(s)`);

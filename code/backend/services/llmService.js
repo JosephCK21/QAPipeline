@@ -218,7 +218,8 @@ function safeParseJSON(text) {
 // ---------------------------------------------------------------------------
 // Local token pre-flight (tiktoken) — replaces Gemini's countTokens network call
 // ---------------------------------------------------------------------------
-const MAX_TOKENS_ALLOWED = 30000;
+const MODEL_CONTEXT_WINDOW = Math.max(30000, parseInt(process.env.OPENAI_MODEL_CONTEXT_WINDOW || '128000', 10) || 128000);
+const MAX_TOKENS_ALLOWED = MODEL_CONTEXT_WINDOW;
 
 let _encoder = null;
 function getEncoder() {
@@ -319,6 +320,16 @@ const PROMPT_TOKEN_BUDGET = (() => {
     const raw = Number(process.env.OPENAI_PROMPT_BUDGET);
     if (Number.isFinite(raw) && raw > 0) return raw;
     return Math.floor(MAX_TOKENS_ALLOWED * 0.9);
+})();
+
+/**
+ * Budget specifically for PR-to-scenario mapping — needs more room because
+ * large PRs have many files+scenarios. Defaults to 50% of model context.
+ */
+const MAPPING_TOKEN_BUDGET = (() => {
+    const raw = Number(process.env.OPENAI_MAPPING_BUDGET);
+    if (Number.isFinite(raw) && raw > 0) return raw;
+    return Math.floor(MODEL_CONTEXT_WINDOW * 0.5);
 })();
 
 /**
@@ -1657,6 +1668,7 @@ module.exports = {
     assertTokenLimit,
     ensureWithinBudget,
     PROMPT_TOKEN_BUDGET,
+    MAPPING_TOKEN_BUDGET,
     isStaleChainError,
     createConversation,
     buildStatefulParams,

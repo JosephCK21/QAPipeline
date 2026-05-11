@@ -965,8 +965,13 @@ async function runPipeline(runId, prUrl, repoFullName) {
             )
         );
 
-        if (!hasMappedScenarios && classifiedAll.length === 0) {
-            sendEvent('log', { level: 'WARN', message: 'No scenarios mapped and no testable PR files — nothing to run.' });
+        if (!hasMappedScenarios) {
+            const reason = classifiedAll.length === 0
+                ? 'No scenarios mapped and no testable PR files — nothing to run.'
+                : `No scenarios mapped (0/${mappedScenarios.length}) despite ${classifiedAll.length} testable file(s). The mapping LLM could not link PR changes to any known scenario. Verify scenario descriptions cover the changed functionality, or reduce PR scope.`;
+            sendEvent('log', { level: 'WARN', message: reason });
+            sendEvent('phase_update', { phase: 'Test Generation', status: 'skipped' });
+            sendEvent('phase_update', { phase: 'Sandbox Testing', status: 'skipped' });
             sendEvent('complete', {
                 success: true,
                 passedCount: runSummary.passedCount,
