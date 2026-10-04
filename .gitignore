@@ -7,7 +7,13 @@
 # AutoQA Dynamic Data & Artifacts
 code/backend/data/*.json
 !code/backend/data/.gitkeep
+code/backend/data/sandbox-env/*
+!code/backend/data/sandbox-env/.gitkeep
+code/backend/data/default-test-accounts/*
+!code/backend/data/default-test-accounts/.gitkeep
 code/backend/uploads/
+code/backend/data/artifacts/
+
 code/backend/.env
 node_modules
 
@@ -17,4 +23,12 @@ code/backend/data/autoqa.db-wal
 
 # Frontend build output
 code/frontend/dist/
-code/backend/scripts/seedSayaratJiraIssues.js
+
+# Integration test temp DBs (created at runtime by pipeline.integration.test.js)
+code/backend/__tests__/fixture-autoqa-smoke-db-*.db
+
+# Playwright output (e2e helper package)
+code/e2e/test-results/
+
+code/devscripts/
+

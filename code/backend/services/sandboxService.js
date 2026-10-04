@@ -1,7 +1,7 @@
 const fs = require('fs/promises');
 const fssync = require('fs');
 const path = require('path');
-const { exec, execFile, spawn } = require('child_process');
+const { exec, execFile, execFileSync, spawn } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 const execFilePromise = util.promisify(execFile);
@@ -119,17 +119,550 @@ function extractDependencies(code, language) {
 // DOCKER HELPERS — use execFile to avoid shell quoting issues on Windows
 // ---------------------------------------------------------------------------
 
-function dockerArgs(...args) {
-    return args;
-}
-
 async function dockerRun(args, timeoutMs = 120000) {
     return execFilePromise('docker', args, { timeout: timeoutMs });
+}
+
+/**
+ * `docker run` against mcr.microsoft.com/playwright pulls a multi‑GB image on first use.
+ * A short timeout (SANDBOX_TIMEOUT_MS) SIGTERM‑kills the pull mid‑stream → misleading
+ * "Container startup failed" errors. Override with SANDBOX_DOCKER_PULL_TIMEOUT_MS only for that step.
+ */
+function getDockerBaseImagePullTimeoutMs() {
+    const raw = process.env.SANDBOX_DOCKER_PULL_TIMEOUT_MS;
+    if (raw !== undefined && String(raw).trim() !== '') {
+        const n = parseInt(raw, 10);
+        return Number.isFinite(n) && n >= 60000 ? n : 1_200_000;
+    }
+    return 1_200_000; // 20 minutes default for cold pull
+}
+
+const PLAYWRIGHT_WAIT_ON_MS = Math.max(15000, parseInt(process.env.AUTOQA_WAIT_ON_TIMEOUT_MS || '60000', 10) || 60000);
+
+/** Written into the clone so executeTest uses the same app root as createSandboxPool */
+const APP_ROOT_MARKER = '.autoqa-app-root';
+const MAX_APP_DISCOVERY_DEPTH = 6;
+const SKIP_APP_SCAN_DIRS = new Set([
+    'node_modules', '.git', '.next', 'dist', 'build', 'coverage', '.nuxt',
+    'out', '__pycache__', 'venv', '.venv', 'target', 'playwright-report'
+]);
+
+/**
+ * @param {object|null} pkg
+ * @returns {boolean}
+ */
+function isWebAppPackageJson(pkg) {
+    if (!pkg || typeof pkg !== 'object') return false;
+    const scripts = pkg.scripts || {};
+    if (!scripts.dev && !scripts.start) return false;
+    const d = { ...pkg.dependencies, ...pkg.devDependencies };
+    if (!d || typeof d !== 'object') return false;
+    if (d.next || d.vite || d['react-scripts']) return true;
+    for (const k of Object.keys(d)) {
+        if (k.startsWith('@next/')) return true;
+    }
+    return false;
+}
+
+/**
+ * @param {string} absDir
+ * @returns {object|null}
+ */
+function tryReadPackageJsonSync(absDir) {
+    const p = path.join(absDir, 'package.json');
+    try {
+        const raw = fssync.readFileSync(p, 'utf8');
+        return JSON.parse(raw);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Host-side scan: shallowest dir under sandboxDir whose package.json qualifies as a web app.
+ * @param {string} sandboxDir
+ * @returns {string} POSIX relative path from clone root, or '' for root.
+ */
+function discoverAppRootRelative(sandboxDir) {
+    const override = String(process.env.AUTOQA_APP_SUBPATH || '').trim()
+        .replace(/^\/+/, '')
+        .replace(/\\/g, '/');
+    if (override) {
+        const abs = path.join(sandboxDir, ...override.split('/').filter(Boolean));
+        const pkg = tryReadPackageJsonSync(abs);
+        if (isWebAppPackageJson(pkg)) {
+            return override;
+        }
+        console.warn(`[Sandbox] AUTOQA_APP_SUBPATH="${override}" is not a valid web app root; scanning instead.`);
+    }
+
+    /** @type {{ rel: string, depth: number }[]} */
+    const candidates = [];
+
+    /**
+     * @param {string} relPosix segments joined by /
+     * @param {number} depth directory depth from root
+     */
+    function walk(relPosix, depth) {
+        if (depth > MAX_APP_DISCOVERY_DEPTH) return;
+        const abs = relPosix ? path.join(sandboxDir, ...relPosix.split('/')) : sandboxDir;
+        const pkg = tryReadPackageJsonSync(abs);
+        if (isWebAppPackageJson(pkg)) {
+            candidates.push({
+                rel: relPosix,
+                depth: relPosix ? relPosix.split('/').length : 0
+            });
+        }
+        let entries;
+        try {
+            entries = fssync.readdirSync(abs, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const ent of entries) {
+            if (!ent.isDirectory()) continue;
+            const name = ent.name;
+            if (SKIP_APP_SCAN_DIRS.has(name)) continue;
+            const nextRel = relPosix ? `${relPosix}/${name}` : name;
+            walk(nextRel, depth + 1);
+        }
+    }
+
+    walk('', 0);
+    if (candidates.length === 0) return '';
+    candidates.sort((a, b) => {
+        if (a.depth !== b.depth) return a.depth - b.depth;
+        return a.rel.localeCompare(b.rel);
+    });
+    return candidates[0].rel;
+}
+
+/**
+ * @param {string} sandboxDir
+ * @param {string} relPosix
+ */
+async function writeAppRootMarker(sandboxDir, relPosix) {
+    const line = (relPosix || '').trim().replace(/\\/g, '/');
+    await fs.writeFile(
+        path.join(sandboxDir, APP_ROOT_MARKER),
+        line ? `${line}\n` : '\n',
+        'utf8'
+    );
+}
+
+/**
+ * @param {string} sandboxDir
+ * @returns {Promise<string|null>} null if marker missing
+ */
+async function readAppRootMarker(sandboxDir) {
+    try {
+        const raw = await fs.readFile(path.join(sandboxDir, APP_ROOT_MARKER), 'utf8');
+        return raw.trim().replace(/\\/g, '/');
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * @param {string} sandboxDir
+ * @param {string} relPosix
+ */
+function appDirAbs(sandboxDir, relPosix) {
+    const r = (relPosix || '').trim();
+    if (!r) return sandboxDir;
+    return path.join(sandboxDir, ...r.split('/').filter(Boolean));
+}
+
+/**
+ * Docker -w path for npm run dev (Linux mount /app).
+ * @param {string} relPosix '' or 'sayarat-web' or 'apps/web'
+ */
+function dockerAppWorkdir(relPosix) {
+    const r = (relPosix || '').trim().replace(/^\/+|\/+$/g, '').replace(/\\/g, '/');
+    return r ? `/app/${r}` : '/app';
+}
+
+/**
+ * Keep in sync with mcr.microsoft.com/playwright Docker tag (v{VER}-jammy)
+ * and devDependency @playwright/test in createSandboxPool.
+ */
+const PLAYWRIGHT_VERSION = '1.59.1';
+
+/** Playwright traces allowed by env AUTOQA_PLAYWRIGHT_TRACE */
+const PLAYWRIGHT_TRACE_MODES = new Set(['on', 'retain-on-failure', 'on-first-retry']);
+
+/** Playwright video modes allowed by env AUTOQA_PLAYWRIGHT_VIDEO */
+const PLAYWRIGHT_VIDEO_MODES = new Set(['on', 'off', 'retain-on-failure', 'on-first-retry']);
+
+/** Whether live browser streaming (VNC) is enabled */
+function isLiveBrowserEnabled() {
+    const v = (process.env.AUTOQA_LIVE_BROWSER || 'true').trim().toLowerCase();
+    return v === 'true' || v === '1';
+}
+
+/** Base port for noVNC WebSocket connections */
+const VNC_BASE_PORT = Math.max(1024, parseInt(process.env.AUTOQA_VNC_BASE_PORT || '6080', 10));
+
+/** SlowMo when live browser is active (makes tests watchable) */
+const LIVE_SLOWMO_MS = Math.max(0, parseInt(process.env.AUTOQA_LIVE_SLOWMO_MS || '300', 10));
+
+/** @returns {string} */
+function sanitizeArtifactSegment(id) {
+    return String(id || 'unknown').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 160);
+}
+
+/**
+ * @returns {string}
+ */
+function buildPlaywrightAutoqaConfigSource() {
+    return `'use strict';
+const { defineConfig, devices } = require('@playwright/test');
+const TRACE = process.env.AUTOQA_PLAYWRIGHT_TRACE || 'off';
+const TRACE_OK = new Set(${JSON.stringify([...PLAYWRIGHT_TRACE_MODES])});
+const VIDEO = process.env.AUTOQA_PLAYWRIGHT_VIDEO || 'on';
+const VIDEO_OK = new Set(${JSON.stringify([...PLAYWRIGHT_VIDEO_MODES])});
+const LIVE = process.env.AUTOQA_LIVE_BROWSER === '1' || process.env.AUTOQA_LIVE_BROWSER === 'true';
+const HEADED = LIVE || process.env.AUTOQA_PLAYWRIGHT_HEADED === '1' || process.env.AUTOQA_PLAYWRIGHT_HEADED === 'true';
+const SLOWMO = LIVE
+    ? parseInt(process.env.AUTOQA_LIVE_SLOWMO_MS || '300', 10) || 300
+    : parseInt(process.env.AUTOQA_PLAYWRIGHT_SLOWMO_MS || '0', 10) || 0;
+function parsePositive(ms) {
+    const n = parseInt(ms || '', 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+}
+function parseRetries(v) {
+    const n = parseInt(v ?? '', 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+}
+const ROOT_TIMEOUT = parsePositive(process.env.AUTOQA_PLAYWRIGHT_TEST_TIMEOUT_MS);
+const EXPECT_MS = parsePositive(process.env.AUTOQA_PLAYWRIGHT_EXPECT_TIMEOUT_MS);
+const ACTION_MS = parsePositive(process.env.AUTOQA_PLAYWRIGHT_ACTION_TIMEOUT_MS);
+const RETRIES = parseRetries(process.env.AUTOQA_PLAYWRIGHT_RETRIES);
+const _baseRaw = (process.env.AUTOQA_E2E_BASE_URL || '').trim();
+const BASE = _baseRaw.endsWith('/') ? _baseRaw.slice(0, -1) : _baseRaw;
+module.exports = defineConfig({
+    testDir: '.',
+    testMatch: /autoqa\\.spec\\.js$/,
+    forbidOnly: true,
+    fullyParallel: false,
+    workers: 1,
+    ...(ROOT_TIMEOUT !== null ? { timeout: ROOT_TIMEOUT } : {}),
+    ...(RETRIES !== null ? { retries: RETRIES } : {}),
+    reporter: process.env.AUTOQA_PLAYWRIGHT_HTML_REPORT === '1'
+        ? [['list'], ['html', { outputFolder: 'test-results/playwright-html', open: 'never' }]]
+        : [['list']],
+    outputDir: 'test-results/playwright-autoqa',
+    ...(EXPECT_MS !== null ? { expect: { timeout: EXPECT_MS } } : {}),
+    use: {
+        ...devices['Desktop Chrome'],
+        headless: !HEADED,
+        screenshot: 'only-on-failure',
+        video: VIDEO_OK.has(VIDEO) ? VIDEO : 'on',
+        trace: TRACE_OK.has(TRACE) ? TRACE : 'off',
+        ...(BASE ? { baseURL: BASE } : {}),
+        ...(ACTION_MS !== null ? { actionTimeout: ACTION_MS } : {}),
+        ...(HEADED ? {
+            launchOptions: {
+                ...(SLOWMO > 0 ? { slowMo: SLOWMO } : {}),
+                args: [
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-gpu',
+                    '--window-size=1280,720'
+                ]
+            }
+        } : (SLOWMO > 0 ? { launchOptions: { slowMo: SLOWMO } } : {}))
+    }
+});
+`;
+}
+
+/**
+ * @param {string} dir
+ * @param {{ ext: Set<string>, out: string[] }} acc
+ */
+async function collectFilesByExtension(dir, acc) {
+    let entries = [];
+    try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+        return;
+    }
+    for (const ent of entries) {
+        const p = path.join(dir, ent.name);
+        if (ent.isDirectory()) {
+            await collectFilesByExtension(p, acc);
+        } else {
+            const ext = path.extname(ent.name).toLowerCase();
+            if (acc.ext.has(ext)) acc.out.push(p);
+        }
+    }
+}
+
+/**
+ * Copy Playwright output (screenshots, traces) into backend data/artifacts for the UI.
+ * @param {string} sandboxDir
+ * @param {{ runId: string, testCaseId: string, attempt: number }} ctx
+ */
+async function persistPlaywrightArtifacts(sandboxDir, ctx) {
+    const empty = { failureScreenshots: [], traces: [], videos: [] };
+    if (!ctx?.runId || !ctx.testCaseId) return empty;
+
+    const pwRoot = path.join(sandboxDir, 'test-results', 'playwright-autoqa');
+    const acc = { ext: new Set(['.png', '.zip', '.webm']), out: [] };
+    await collectFilesByExtension(pwRoot, acc);
+
+    /** @type {string[]} */
+    const pngFiles = acc.out.filter(f => f.endsWith('.png')).sort();
+    /** @type {string[]} */
+    const zipFiles = acc.out.filter(f => f.endsWith('.zip')).sort();
+    /** @type {string[]} */
+    const webmFiles = acc.out.filter(f => f.endsWith('.webm')).sort();
+
+    if (pngFiles.length === 0 && zipFiles.length === 0 && webmFiles.length === 0) return empty;
+
+    const safeTc = sanitizeArtifactSegment(ctx.testCaseId);
+    const artifactsRoot = path.join(__dirname, '..', 'data', 'artifacts');
+    const destDir = path.join(artifactsRoot, ctx.runId, safeTc);
+
+    await fs.mkdir(destDir, { recursive: true });
+
+    const encodeSeg = (s) => encodeURIComponent(String(s));
+
+    /** @type {{ url: string, fileName: string }[]} */
+    const failureScreenshots = [];
+    pngFiles.forEach((src, idx) => {
+        const destName = `attempt-${ctx.attempt}-screenshot-${idx}.png`;
+        const destAbs = path.join(destDir, destName);
+        try {
+            require('fs').copyFileSync(src, destAbs);
+        } catch (e) {
+            console.warn(`[Sandbox] Copy screenshot failed ${src}: ${e.message}`);
+            return;
+        }
+        failureScreenshots.push({
+            fileName: destName,
+            url: `/api/runs/${encodeSeg(ctx.runId)}/artifacts/${encodeSeg(safeTc)}/${encodeSeg(destName)}`
+        });
+    });
+
+    /** @type {{ url: string, fileName: string }[]} */
+    const traces = [];
+    zipFiles.forEach((src, idx) => {
+        const destName = `attempt-${ctx.attempt}-trace-${idx}.zip`;
+        const destAbs = path.join(destDir, destName);
+        try {
+            require('fs').copyFileSync(src, destAbs);
+        } catch (e) {
+            console.warn(`[Sandbox] Copy trace failed ${src}: ${e.message}`);
+            return;
+        }
+        traces.push({
+            fileName: destName,
+            url: `/api/runs/${encodeSeg(ctx.runId)}/artifacts/${encodeSeg(safeTc)}/${encodeSeg(destName)}`
+        });
+    });
+
+    /** @type {{ url: string, fileName: string }[]} */
+    const videos = [];
+    webmFiles.forEach((src, idx) => {
+        const destName = `attempt-${ctx.attempt}-video-${idx}.webm`;
+        const destAbs = path.join(destDir, destName);
+        try {
+            require('fs').copyFileSync(src, destAbs);
+        } catch (e) {
+            console.warn(`[Sandbox] Copy video failed ${src}: ${e.message}`);
+            return;
+        }
+        videos.push({
+            fileName: destName,
+            url: `/api/runs/${encodeSeg(ctx.runId)}/artifacts/${encodeSeg(safeTc)}/${encodeSeg(destName)}`
+        });
+    });
+
+    return { failureScreenshots, traces, videos };
+}
+
+/**
+ * @param {string} absDir directory containing package.json (clone root or nested app)
+ * @returns {Promise<object|null>}
+ */
+async function loadPackageJsonAt(absDir) {
+    const p = path.join(absDir, 'package.json');
+    try {
+        const raw = await fs.readFile(p, 'utf8');
+        return JSON.parse(raw);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * @param {string | undefined} script
+ * @returns {number | null}
+ */
+function extractPortFromNpmScript(script) {
+    if (!script || typeof script !== 'string') return null;
+    const patterns = [
+        /--port(?:=|\s+)(\d+)/i,
+        /(?:^|\s)-p\s+(\d+)(?=\s|$)/,
+        /\bPORT\s*=\s*(\d+)/i
+    ];
+    for (const re of patterns) {
+        const m = script.match(re);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (Number.isFinite(n) && n > 0 && n < 65536) return n;
+        }
+    }
+    return null;
+}
+
+/**
+ * Best-effort read of Vite `server.port` from common config filenames.
+ * @param {string} appRootAbs clone root or nested app directory on the host
+ * @returns {Promise<number | null>}
+ */
+async function readVitePortFromSandbox(appRootAbs) {
+    const names = [
+        'vite.config.js', 'vite.config.mjs', 'vite.config.cjs',
+        'vite.config.ts', 'vite.config.mts', 'vite.config.cts'
+    ];
+    for (const name of names) {
+        const fp = path.join(appRootAbs, name);
+        try {
+            const text = await fs.readFile(fp, 'utf8');
+            const serverPort = text.match(/\bserver\s*:\s*\{[^}]*\bport\s*:\s*(\d+)/);
+            if (serverPort) {
+                const n = parseInt(serverPort[1], 10);
+                if (Number.isFinite(n) && n > 0 && n < 65536) return n;
+            }
+            const anyPort = text.match(/\bport\s*:\s*(\d{2,5})\b/);
+            if (anyPort) {
+                const n = parseInt(anyPort[1], 10);
+                if (Number.isFinite(n) && n > 0 && n < 65536) return n;
+            }
+        } catch {
+            continue;
+        }
+    }
+    return null;
+}
+
+/**
+ * Read a .env.local file into a key/value object (best-effort, ignores comments/empty lines).
+ */
+async function readEnvLocalAsObject(filePath) {
+    try {
+        const text = await fs.readFile(filePath, 'utf8');
+        const obj = {};
+        for (const line of text.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const eq = trimmed.indexOf('=');
+            if (eq < 1) continue;
+            obj[trimmed.slice(0, eq)] = trimmed.slice(eq + 1);
+        }
+        return obj;
+    } catch {
+        return {};
+    }
+}
+
+/**
+ * @param {string} appRootAbs directory containing the app package.json + vite configs (host path)
+ * @param {object|null} pkg
+ * @param {{ sandboxEnv?: Record<string, string> }} [opts]
+ * @returns {Promise<{ devShellCmd: string | null, port: number, targetUrl: string }>}
+ */
+async function resolveDevCommandAndTargetUrl(appRootAbs, pkg, opts = {}) {
+    const envBase = (opts.sandboxEnv && opts.sandboxEnv.AUTOQA_E2E_BASE_URL) || process.env.AUTOQA_E2E_BASE_URL;
+    const trimmed = typeof envBase === 'string' ? envBase.trim() : '';
+    if (trimmed) {
+        const targetUrl = trimmed.replace(/\/$/, '');
+        let port = 5173;
+        try {
+            const u = new URL(targetUrl);
+            if (u.port) port = parseInt(u.port, 10);
+            else if (u.protocol === 'https:') port = 443;
+            else if (u.protocol === 'http:') port = 80;
+        } catch {
+            /* keep default */
+        }
+        const scripts = pkg?.scripts || {};
+        const devShellCmd = scripts.dev ? 'npm run dev' : scripts.start ? 'npm run start' : 'node todoServer.js || node server.js';
+        return { devShellCmd, port, targetUrl };
+    }
+
+    if (!pkg || typeof pkg !== 'object') {
+        const fromVite = await readVitePortFromSandbox(appRootAbs);
+        const port = fromVite ?? 3000; // default to 3000 if not vite
+        return { devShellCmd: 'node todoServer.js || node server.js', port, targetUrl: `http://localhost:${port}` };
+    }
+
+    const scripts = pkg.scripts || {};
+    let devShellCmd = null;
+    if (scripts.dev) devShellCmd = 'npm run dev';
+    else if (scripts.start) devShellCmd = 'npm run start';
+    else devShellCmd = 'node todoServer.js || node server.js';
+
+    const merged = { ...pkg.dependencies, ...pkg.devDependencies };
+    const keys = Object.keys(merged);
+    const has = (name) => keys.includes(name);
+
+    let port = extractPortFromNpmScript(scripts.dev)
+        ?? extractPortFromNpmScript(scripts.start);
+    if (port == null) {
+        port = await readVitePortFromSandbox(appRootAbs);
+    }
+    if (port == null) {
+        if (has('vite')) port = 5173;
+        else if (has('next') || has('@next/next') || has('react-scripts')) port = 3000;
+        else port = 3000; // Default for Express / unknown
+    }
+
+    const targetUrl = `http://localhost:${port}`;
+    return { devShellCmd, port, targetUrl };
+}
+
+async function killPlaywrightBackgroundProcesses(containerName) {
+    try {
+        await execFilePromise(
+            'docker',
+            ['exec', containerName, 'sh', '-c', '[ -s /tmp/autoqa-dev.pid ] && kill "$(cat /tmp/autoqa-dev.pid)" 2>/dev/null || true; pkill -f node || true; rm -f /tmp/autoqa-dev.pid'],
+            { timeout: 30000 }
+        );
+    } catch (e) {
+        console.warn(`[Sandbox] Playwright dev server cleanup warning: ${e.message}`);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // SANDBOX LIFECYCLE
 // ---------------------------------------------------------------------------
+
+const SANDBOX_MAX_CONCURRENT = Math.max(1, parseInt(process.env.SANDBOX_MAX_CONCURRENT || '3', 10));
+
+let _sandboxActiveCreations = 0;
+const _sandboxCreationWaiters = [];
+
+function acquireSandboxCreationSlot() {
+    if (_sandboxActiveCreations < SANDBOX_MAX_CONCURRENT) {
+        _sandboxActiveCreations++;
+        return Promise.resolve();
+    }
+    return new Promise((resolve) => _sandboxCreationWaiters.push(resolve));
+}
+
+function releaseSandboxCreationSlot() {
+    _sandboxActiveCreations = Math.max(0, _sandboxActiveCreations - 1);
+    const next = _sandboxCreationWaiters.shift();
+    if (next) {
+        _sandboxActiveCreations++;
+        next();
+    }
+}
 
 /**
  * Creates a pool of sandbox directories, clones the repo into each, starts
@@ -137,11 +670,44 @@ async function dockerRun(args, timeoutMs = 120000) {
  *
  * Returns an array of { sandboxDir, containerName } objects.
  */
-async function createSandboxPool(runId, prDetails, concurrency = 2) {
+async function clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs) {
+    if (!prDetails.headRepoFullName || !prDetails.headRef) {
+        throw new Error('clonePrRepoToSandbox: missing headRepoFullName/headRef');
+    }
+    const token = process.env.GITHUB_TOKEN;
+    const shallowUrl = `https://github.com/${prDetails.headRepoFullName}.git`;
+
+    if (token) {
+        const b64 = Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64');
+        await spawnCapture(
+            'git',
+            [
+                '-c', `http.extraHeader=AUTHORIZATION: basic ${b64}`,
+                'clone',
+                '--depth', '1',
+                '-b', prDetails.headRef,
+                shallowUrl,
+                sandboxDir,
+            ],
+            { timeout: timeoutMs }
+        );
+    } else {
+        await spawnCapture(
+            'git',
+            ['clone', '--depth', '1', '-b', prDetails.headRef, shallowUrl, sandboxDir],
+            { timeout: timeoutMs }
+        );
+    }
+}
+
+async function createSandboxPool(runId, prDetails, concurrency = 2, options = {}) {
     const createPromises = [];
 
     for (let i = 1; i <= concurrency; i++) {
         createPromises.push((async () => {
+            await acquireSandboxCreationSlot();
+            try {
+
             const baseTmp = process.platform === 'win32' ? 'C:\\tmp' : '/tmp';
             const sandboxDir = path.join(baseTmp, 'autoqa-sandbox', `${runId}-${i}`);
             const containerName = `autoqa-sandbox-${runId}-${i}`;
@@ -151,77 +717,184 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
             // -- Clone or flat-drop ------------------------------------------------
             try {
                 if (prDetails.headRepoFullName && prDetails.headRef) {
-                    let repoUrl = `https://github.com/${prDetails.headRepoFullName}.git`;
-                    if (process.env.GITHUB_TOKEN) {
-                        repoUrl = `https://${process.env.GITHUB_TOKEN}@github.com/${prDetails.headRepoFullName}.git`;
-                    }
                     const timeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
-                    await execPromise(
-                        `git clone --depth 1 -b ${prDetails.headRef} "${repoUrl}" "${sandboxDir}"`,
-                        { timeout: timeoutMs }
-                    );
+                    await clonePrRepoToSandbox(prDetails, sandboxDir, timeoutMs);
                     console.log(`[Sandbox] Cloned repo into pool ${i}`);
 
                     // Overlay mock data if present
                     await Promise.all((prDetails.files || []).map(async file => {
                         if (file.filename === 'mock_data.json') {
-                            await fs.writeFile(path.join(sandboxDir, 'mock_data.json'), file.content, 'utf8');
+                            let body = file.content;
+                            const wsRoot = prDetails._workspaceRoot;
+                            if (wsRoot && fssync.existsSync(wsRoot)) {
+                                const absMock = path.join(wsRoot, ...String(file.filename || '').split('/').filter(Boolean));
+                                try {
+                                    body = await fs.readFile(absMock, 'utf8');
+                                } catch {
+                                    /* keep API/git row content */
+                                }
+                            }
+                            await fs.writeFile(path.join(sandboxDir, 'mock_data.json'), body, 'utf8');
                         }
                     }));
                 } else {
                     await Promise.all((prDetails.files || []).map(async file => {
-                        const filePath = path.join(sandboxDir, path.basename(file.filename));
-                        await fs.writeFile(filePath, file.content, 'utf8');
+                        const filePath = path.join(sandboxDir, ...file.filename.split('/').filter(Boolean));
+                        await fs.mkdir(path.dirname(filePath), { recursive: true });
+                        await fs.writeFile(filePath, file.content || '', 'utf8');
                     }));
                 }
             } catch (err) {
                 console.error(`[Sandbox] Clone failed for pool ${i}, falling back to flat file drop:`, err.message);
+                if (err.stderr) console.error(`[Sandbox] git stderr: ${String(err.stderr).slice(0, 500)}`);
+                if (err.code) console.error(`[Sandbox] git exit code: ${err.code}`);
                 await Promise.all((prDetails.files || []).map(async file => {
-                    const filePath = path.join(sandboxDir, path.basename(file.filename));
-                    await fs.writeFile(filePath, file.content, 'utf8');
+                    const filePath = path.join(sandboxDir, ...file.filename.split('/').filter(Boolean));
+                    await fs.mkdir(path.dirname(filePath), { recursive: true });
+                    await fs.writeFile(filePath, file.content || '', 'utf8');
                 }));
+            }
+
+            const appRel = discoverAppRootRelative(sandboxDir);
+            await writeAppRootMarker(sandboxDir, appRel);
+            console.log(`[Sandbox] App root for npm/dev: ${dockerAppWorkdir(appRel)}`);
+
+            // Write project sandbox-env as .env.local so Next.js picks up NEXT_PUBLIC_* for client compilation
+            const sandboxEnvEntries = Object.entries(options.sandboxEnv || {}).filter(([, v]) => v != null);
+            if (sandboxEnvEntries.length > 0) {
+                const envLocalPath = path.join(sandboxDir, appRel || '', '.env.local');
+                await fs.mkdir(path.dirname(envLocalPath), { recursive: true });
+                const envLocalContent = sandboxEnvEntries.map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+                await fs.writeFile(envLocalPath, envLocalContent, 'utf8');
+                console.log(`[Sandbox] Wrote .env.local (${sandboxEnvEntries.length} key(s)) into ${dockerAppWorkdir(appRel)}`);
             }
 
             // -- Start ONE persistent container ------------------------------------
             const volumeDir = sandboxDir.replace(/\\/g, '/');
             const runTimeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
+            const dockerRunTimeoutMs = getDockerBaseImagePullTimeoutMs();
             const installTimeoutMs = Math.max(runTimeoutMs, 300000);
+            const liveMode = isLiveBrowserEnabled();
+            const vncPort = liveMode ? VNC_BASE_PORT + (i - 1) : null;
 
             try {
                 await execFilePromise('docker', ['rm', '-f', containerName]).catch(() => { });
 
-                await dockerRun([
+                const dockerRunArgs = [
                     'run', '-d',
                     '--name', containerName,
                     '-v', `${volumeDir}:/app`,
-                    '-w', '/app',
-                    'node:20-slim',
+                    '-w', '/app'
+                ];
+
+                // Map VNC port and set DISPLAY for live browser mode
+                if (liveMode && vncPort) {
+                    dockerRunArgs.push('-p', `${vncPort}:6080`);
+                    dockerRunArgs.push('-e', 'DISPLAY=:99');
+                    dockerRunArgs.push('-e', 'AUTOQA_LIVE_BROWSER=true');
+                    dockerRunArgs.push('-e', `AUTOQA_LIVE_SLOWMO_MS=${LIVE_SLOWMO_MS}`);
+                }
+
+                const sandboxEnv =
+                    options.sandboxEnv && typeof options.sandboxEnv === 'object' && !Array.isArray(options.sandboxEnv)
+                        ? options.sandboxEnv
+                        : {};
+                for (const [envKey, envVal] of Object.entries(sandboxEnv)) {
+                    if (envVal == null) continue;
+                    dockerRunArgs.push('-e', `${envKey}=${String(envVal)}`);
+                }
+
+                dockerRunArgs.push(
+                    `mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-jammy`,
                     'tail', '-f', '/dev/null'
-                ], runTimeoutMs);
+                );
 
-                console.log(`[Sandbox] Container started: ${containerName}`);
+                await dockerRun(dockerRunArgs, dockerRunTimeoutMs);
+                console.log(`[Sandbox] Container started: ${containerName}${liveMode ? ` (VNC port ${vncPort})` : ''}`);
 
-                const pkgJsonPath = path.join(sandboxDir, 'package.json');
-                if (fssync.existsSync(pkgJsonPath)) {
+                // -- Install VNC stack for live browser viewing ----------------------
+                if (liveMode) {
+                    const vncInstallTimeoutMs = Math.max(installTimeoutMs, 600000); // 10 min min for VNC install
+                    console.log(`[Sandbox] Installing VNC stack in ${containerName} (timeout ${Math.round(vncInstallTimeoutMs / 1000)}s)...`);
+                    try {
+                        await spawnCapture('docker', [
+                            'exec', containerName, 'sh', '-c',
+                            'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc python3-websockify && rm -rf /var/lib/apt/lists/*'
+                        ], { timeout: vncInstallTimeoutMs });
+                    } catch (vncInstErr) {
+                        // spawnCapture throws on non-zero exit, but the install may have succeeded
+                        // despite debconf warnings on stderr. Check if x11vnc is actually installed.
+                        try {
+                            await execFilePromise('docker', [
+                                'exec', containerName, 'which', 'x11vnc'
+                            ], { timeout: 10000 });
+                            console.log(`[Sandbox] VNC packages installed (debconf warnings ignored) in ${containerName}`);
+                        } catch {
+                            console.error(`[Sandbox] VNC install truly failed in ${containerName}: ${vncInstErr.message}`);
+                            throw vncInstErr;
+                        }
+                    }
+
+                    // Write VNC startup script into the container
+                    const vncStartScript = [
+                        '#!/bin/sh',
+                        'export DISPLAY=:99',
+                        'Xvfb :99 -screen 0 1280x720x24 &',
+                        'sleep 1',
+                        'x11vnc -display :99 -forever -nopw -shared -rfbport 5900 &',
+                        'websockify --web=/usr/share/novnc/ 6080 localhost:5900 &',
+                        'echo "VNC stack started"',
+                        'wait'
+                    ].join('\n');
+                    await fs.writeFile(path.join(sandboxDir, '.autoqa-vnc-start.sh'), vncStartScript, 'utf8');
+
+                    await execFilePromise('docker', [
+                        'exec', containerName, 'chmod', '+x', '/app/.autoqa-vnc-start.sh'
+                    ], { timeout: 10000 });
+                    await execFilePromise('docker', [
+                        'exec', '-d', containerName, '/app/.autoqa-vnc-start.sh'
+                    ], { timeout: 10000 });
+
+                    // Give VNC services time to start
+                    await new Promise(r => setTimeout(r, 3000));
+                    console.log(`[Sandbox] VNC stack ready in ${containerName} — noVNC at http://localhost:${vncPort}`);
+
+                    // Emit Socket.IO event so frontend knows VNC is available
+                    if (typeof global !== 'undefined' && global.io) {
+                        global.io.emit('sandbox_vnc_ready', {
+                            runId,
+                            containerId: i,
+                            containerName,
+                            vncPort,
+                            vncUrl: `http://localhost:${vncPort}/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000`
+                        });
+                    }
+                }
+
+                const appPkgPath = path.join(sandboxDir, appRel, 'package.json');
+                if (fssync.existsSync(appPkgPath)) {
                     await dockerRun([
-                        'exec', containerName,
+                        'exec', '-w', dockerAppWorkdir(appRel), containerName,
                         'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock'
                     ], installTimeoutMs);
-                    console.log(`[Sandbox] Pre-installed app dependencies in ${containerName}.`);
+                    console.log(`[Sandbox] Pre-installed app dependencies in ${containerName} (cwd ${dockerAppWorkdir(appRel)}).`);
                 }
 
                 await dockerRun([
                     'exec', containerName,
                     'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock',
-                    'jest', 'supertest', 'jest-environment-node'
+                    'jest', 'supertest', 'jest-environment-node', `@playwright/test@${PLAYWRIGHT_VERSION}`, 'wait-on'
                 ], installTimeoutMs);
-                console.log(`[Sandbox] Pre-installed jest in ${containerName}.`);
+                console.log(`[Sandbox] Pre-installed jest, @playwright/test, and wait-on in ${containerName}.`);
             } catch (err) {
                 console.error(`[Sandbox] Container startup failed for ${containerName}:`, err.message);
                 throw err;
             }
 
-            return { sandboxDir, containerName };
+            return { sandboxDir, containerName, vncPort };
+            } finally {
+                releaseSandboxCreationSlot();
+            }
         })());
     }
 
@@ -236,10 +909,14 @@ async function createSandboxPool(runId, prDetails, concurrency = 2) {
  * On Windows, Node.js execFile has a race condition (issue #56430) where
  * stdout/stderr pipes are destroyed before all data is read when the child
  * exits non-zero. spawn with `detached: false` keeps the pipes connected,
- * reliably capturing the full Jest/pytest output even on failure — which is
+ * reliably capturing the full Jest/Playwright/pytest output even on failure — which is
  * critical for the healer to see what went wrong.
  */
-async function executeTest(containerName, sandboxDir, testLanguage, testContent, testFilename, testData = {}) {
+async function executeTest(containerName, sandboxDir, testLanguage, testContent, testFilename, testData = {}, artifactContext = null) {
+    const isPlaywrightTest = testLanguage === 'javascript'
+        && typeof testContent === 'string'
+        && testContent.includes('@playwright/test');
+
     let scriptToRun = testContent;
     if (testLanguage === 'javascript') {
         scriptToRun = `const testData = ${JSON.stringify(testData, null, 2)};\n\n${testContent}`;
@@ -258,7 +935,8 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
         }
     }
 
-    const testPath = path.join(sandboxDir, testFilename);
+    const effectiveTestFilename = isPlaywrightTest ? 'autoqa.spec.js' : testFilename;
+    const testPath = path.join(sandboxDir, effectiveTestFilename);
     await fs.writeFile(testPath, scriptToRun, 'utf8');
 
     const dependencies = extractDependencies(testContent, testLanguage);
@@ -266,7 +944,10 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
 
     try {
         if (testLanguage === 'javascript') {
-            const PREINSTALLED = new Set(['jest', 'supertest', 'jest-environment-node']);
+            // extractDependencies maps '@playwright/test' to '@playwright' (first path segment).
+            const PREINSTALLED = new Set([
+                'jest', 'supertest', 'jest-environment-node', '@playwright/test', '@playwright', 'wait-on'
+            ]);
             const extraDeps = dependencies.filter(d => !PREINSTALLED.has(d));
 
             if (extraDeps.length > 0) {
@@ -277,15 +958,175 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                 );
             }
 
+            if (isPlaywrightTest) {
+                const playwrightConfigPath = path.join(sandboxDir, 'playwright.autoqa.config.cjs');
+                await fs.writeFile(playwrightConfigPath, buildPlaywrightAutoqaConfigSource(), 'utf8');
+
+                const pwOut = path.join(sandboxDir, 'test-results', 'playwright-autoqa');
+                const pwHtml = path.join(sandboxDir, 'test-results', 'playwright-html');
+                await fs.rm(pwOut, { recursive: true, force: true }).catch(() => {});
+                await fs.rm(pwHtml, { recursive: true, force: true }).catch(() => {});
+
+                let appRel = await readAppRootMarker(sandboxDir);
+                if (appRel === null) {
+                    appRel = discoverAppRootRelative(sandboxDir);
+                    await writeAppRootMarker(sandboxDir, appRel);
+                }
+                const appAbs = appDirAbs(sandboxDir, appRel);
+                const appWorkdir = dockerAppWorkdir(appRel);
+                const pkg = await loadPackageJsonAt(appAbs);
+                const sandboxEnvFromFile = await readEnvLocalAsObject(path.join(appAbs, '.env.local'));
+                const { devShellCmd, targetUrl } = await resolveDevCommandAndTargetUrl(appAbs, pkg, { sandboxEnv: sandboxEnvFromFile });
+
+                const isExternalUrl = targetUrl && !/localhost|127\.0\.0\.1/i.test(targetUrl);
+
+                if (!isExternalUrl && !devShellCmd) {
+                    throw new Error('Dev server failed to start: missing scripts.dev or scripts.start in package.json');
+                }
+
+                let didStartDevServer = false;
+                try {
+                    if (!isExternalUrl) {
+                        const startCmd =
+                            '(' + devShellCmd + ') > /tmp/autoqa-dev.log 2>&1 & echo $! > /tmp/autoqa-dev.pid';
+                        await execFilePromise(
+                            'docker',
+                            ['exec', '-d', '-w', appWorkdir, containerName, 'sh', '-c', startCmd],
+                            { timeout: testTimeout }
+                        );
+                        didStartDevServer = true;
+
+                        try {
+                            await execFilePromise(
+                                'docker',
+                                [
+                                    'exec', containerName,
+                                    'npx', 'wait-on', targetUrl,
+                                    '-t', String(PLAYWRIGHT_WAIT_ON_MS)
+                                ],
+                                { timeout: PLAYWRIGHT_WAIT_ON_MS + 10000 }
+                            );
+                        } catch (waitErr) {
+                            console.warn(`[Sandbox] wait-on timeout for ${targetUrl} in ${containerName} after ${PLAYWRIGHT_WAIT_ON_MS}ms`);
+                            let devLog = '';
+                            try {
+                                const { stdout } = await spawnCapture('docker',
+                                    ['exec', containerName, 'sh', '-c', 'tail -30 /tmp/autoqa-dev.log 2>/dev/null'],
+                                    { timeout: 5000 });
+                                devLog = (stdout || '').trim();
+                            } catch { /* ignore */ }
+                            const pidCheck = await spawnCapture('docker',
+                                ['exec', containerName, 'sh', '-c', '[ -s /tmp/autoqa-dev.pid ] && kill -0 "$(cat /tmp/autoqa-dev.pid)" 2>/dev/null && echo ALIVE || echo DEAD'],
+                                { timeout: 5000 }).then(r => (r.stdout || '').trim()).catch(() => 'UNKNOWN');
+                            if (pidCheck === 'DEAD') {
+                                const crashMsg = `[Sandbox] Dev server crashed in ${containerName}. Log tail:\n${devLog || '(empty)'}`;
+                                console.error(crashMsg);
+                                throw new Error(`Dev server not running (process exited). Tail of /tmp/autoqa-dev.log:\n${devLog.slice(0, 1000) || '(no output)'}`);
+                            }
+                            console.warn(`[Sandbox] Dev server PID=${pidCheck} — proceeding with test despite wait-on timeout`);
+                            if (devLog) console.warn(`[Sandbox] Dev log tail:\n${devLog.slice(0, 500)}`);
+                        }
+                    } else {
+                        console.log(`[Sandbox] External URL detected (${targetUrl}) — skipping dev server startup`);
+                    }
+
+                    const execEnvArgs = ['exec', '-w', '/app'];
+                    const forwardKeys = [
+                        'AUTOQA_PLAYWRIGHT_TRACE',
+                        'AUTOQA_PLAYWRIGHT_HEADED',
+                        'AUTOQA_PLAYWRIGHT_SLOWMO_MS',
+                        'AUTOQA_PLAYWRIGHT_HTML_REPORT',
+                        'AUTOQA_PLAYWRIGHT_TEST_TIMEOUT_MS',
+                        'AUTOQA_PLAYWRIGHT_EXPECT_TIMEOUT_MS',
+                        'AUTOQA_PLAYWRIGHT_ACTION_TIMEOUT_MS',
+                        'AUTOQA_PLAYWRIGHT_RETRIES',
+                        'AUTOQA_E2E_BASE_URL',
+                        'AUTOQA_LIVE_BROWSER',
+                        'AUTOQA_LIVE_SLOWMO_MS',
+                        'AUTOQA_PLAYWRIGHT_VIDEO'
+                    ];
+                    for (const key of forwardKeys) {
+                        if (process.env[key] !== undefined && process.env[key] !== '') {
+                            execEnvArgs.push('-e', `${key}=${process.env[key]}`);
+                        }
+                    }
+                    // Forward DISPLAY for headed VNC mode
+                    if (isLiveBrowserEnabled()) {
+                        execEnvArgs.push('-e', 'DISPLAY=:99');
+                    }
+                    const runCmd = 'npx playwright test autoqa.spec.js --workers=1 --config=playwright.autoqa.config.cjs 2>&1';
+                    execEnvArgs.push(containerName, 'sh', '-c', runCmd);
+
+                    /** @type {{ url: string, fileName: string }[]} */
+                    let failureScreenshots = [];
+                    /** @type {{ url: string, fileName: string }[]} */
+                    let traces = [];
+                    /** @type {{ url: string, fileName: string }[]} */
+                    let videos = [];
+
+                    const mergeArtifacts = async () => {
+                        if (!artifactContext) return { failureScreenshots: [], traces: [], videos: [] };
+                        return persistPlaywrightArtifacts(sandboxDir, artifactContext);
+                    };
+
+                    try {
+                        const { stdout, stderr } = await spawnCapture(
+                            'docker', execEnvArgs,
+                            { timeout: testTimeout }
+                        );
+                        const merged = await mergeArtifacts();
+                        failureScreenshots = merged.failureScreenshots;
+                        traces = merged.traces;
+                        videos = merged.videos || [];
+                        return {
+                            success: true,
+                            output: (stdout + '\n' + stderr).trim(),
+                            failureScreenshots,
+                            traces,
+                            videos
+                        };
+                    } catch (spawnErr) {
+                        const mergedArt = await mergeArtifacts();
+                        failureScreenshots = mergedArt.failureScreenshots;
+                        traces = mergedArt.traces;
+                        videos = mergedArt.videos || [];
+                        const stdout = spawnErr.stdout || '';
+                        const stderr = spawnErr.stderr || '';
+                        const combined = (stdout + '\n' + stderr).trim();
+                        let output = combined || spawnErr.message;
+                        try {
+                            const { stdout: devLog } = await spawnCapture('docker',
+                                ['exec', containerName, 'sh', '-c', 'tail -50 /tmp/autoqa-dev.log 2>/dev/null'],
+                                { timeout: 5000 });
+                            if (devLog && devLog.trim()) {
+                                output += '\n\n[DEV SERVER LOG]:\n' + devLog.trim().slice(0, 2000);
+                            }
+                        } catch { /* dev log unavailable */ }
+                        return {
+                            success: false,
+                            output,
+                            error: spawnErr.message,
+                            failureScreenshots,
+                            traces,
+                            videos
+                        };
+                    }
+                } finally {
+                    if (didStartDevServer) {
+                        await killPlaywrightBackgroundProcesses(containerName);
+                    }
+                }
+            }
+
             // Use spawnCapture — reliably captures stdout+stderr on Windows even
             // when the process exits non-zero (unlike execFilePromise which drops them).
             // Merge stderr into stdout via sh -c "... 2>&1" so all output is in one stream.
-            const jestCmd = `./node_modules/.bin/jest ${testFilename} --no-coverage --forceExit --runInBand --testEnvironment=node --testTimeout=30000 2>&1`;
+            const runCmd = `./node_modules/.bin/jest ${testFilename} --no-coverage --forceExit --runInBand --testEnvironment=node --testTimeout=30000 2>&1`;
             const { stdout, stderr } = await spawnCapture(
-                'docker', ['exec', containerName, 'sh', '-c', jestCmd],
+                'docker', ['exec', containerName, 'sh', '-c', runCmd],
                 { timeout: testTimeout }
             );
-            return { success: true, output: (stdout + '\n' + stderr).trim() };
+            return { success: true, output: (stdout + '\n' + stderr).trim(), failureScreenshots: [], traces: [] };
 
         } else if (testLanguage === 'python') {
             const PYTHON_BUILTINS = new Set(['json', 'os', 'sys', 'math', 're', 'datetime', 'time', 'random']);
@@ -303,7 +1144,7 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
                 'docker', ['exec', containerName, 'sh', '-c', pytestCmd],
                 { timeout: testTimeout }
             );
-            return { success: true, output: (stdout + '\n' + stderr).trim() };
+            return { success: true, output: (stdout + '\n' + stderr).trim(), failureScreenshots: [], traces: [] };
 
         } else {
             throw new Error(`Language ${testLanguage} not supported by Sandbox.`);
@@ -315,8 +1156,87 @@ async function executeTest(containerName, sandboxDir, testLanguage, testContent,
         const stderr = error.stderr || '';
         const combined = (stdout + '\n' + stderr).trim();
         const output = combined || error.message;
-        return { success: false, output, error: error.message };
+        return { success: false, output, error: error.message, failureScreenshots: [], traces: [] };
     }
+}
+
+const PYTHON_AST_PARSE_SCRIPT = 'import sys, ast; ast.parse(sys.stdin.read())';
+
+/**
+ * In-memory syntax check before Docker. Does not execute the test body.
+ * @param {string} testScript
+ * @param {string} language - "javascript" | "python" | other (returns valid for unknown)
+ * @returns {{ valid: true } | { valid: false, error: string }}
+ */
+function validateSyntaxLocal(testScript, language) {
+    const script = testScript == null ? '' : String(testScript);
+    const lang = String(language || '').toLowerCase();
+
+    if (lang === 'javascript') {
+        try {
+            // eslint-disable-next-line no-new-func
+            new Function(script);
+            return { valid: true };
+        } catch (e) {
+            return { valid: false, error: e.message || String(e) };
+        }
+    }
+
+    if (lang === 'python') {
+        return validatePythonSyntaxAst(script);
+    }
+
+    return { valid: true };
+}
+
+function validatePythonSyntaxAst(script) {
+    const inputBuf = Buffer.from(script, 'utf8');
+    const maxBuffer = Math.max(2 * 1024 * 1024, (inputBuf.length || 1) * 4);
+
+    /** @type {Array<string[]>} exe plus optional argv prefix (e.g. py -3) */
+    const attempts = [];
+    if (process.env.PYTHON_SYNTAX_BIN && String(process.env.PYTHON_SYNTAX_BIN).trim()) {
+        attempts.push(process.env.PYTHON_SYNTAX_BIN.trim().split(/\s+/));
+    }
+    attempts.push(['python3'], ['python'], ['py', '-3']);
+
+    let lastENOENT = false;
+    const seen = new Set();
+
+    for (const parts of attempts) {
+        const key = parts.join(' ');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const exe = parts[0];
+        const suffix = [...parts.slice(1), '-c', PYTHON_AST_PARSE_SCRIPT];
+        try {
+            execFileSync(exe, suffix, {
+                input: inputBuf,
+                maxBuffer,
+                windowsHide: true
+            });
+            return { valid: true };
+        } catch (e) {
+            if (e.code === 'ENOENT') {
+                lastENOENT = true;
+                continue;
+            }
+            const stderrRaw = e.stderr != null ? e.stderr : '';
+            const stderr = Buffer.isBuffer(stderrRaw)
+                ? stderrRaw.toString('utf8')
+                : String(stderrRaw);
+            const msg = stderr.trim() || e.message || String(e);
+            return { valid: false, error: msg };
+        }
+    }
+
+    const tail = lastENOENT
+        ? ' (no python3/python/py on PATH; set PYTHON_SYNTAX_BIN or install Python)'
+        : '';
+    return {
+        valid: false,
+        error: `Python syntax check failed: no interpreter succeeded${tail}`
+    };
 }
 
 /**
@@ -350,8 +1270,133 @@ function cleanupSandboxPool(runId, pool) {
     }
 }
 
+/**
+ * Lightweight sandbox pool for live-site testing. Skips repo cloning — the
+ * containers just need Playwright pointing at an external URL.
+ *
+ * @param {string} runId
+ * @param {string} targetUrl - The live site URL to test against
+ * @param {number} [concurrency=2]
+ * @param {object} [options]
+ * @returns {Promise<Array<{ sandboxDir: string, containerName: string, vncPort: number|null }>>}
+ */
+async function createLiveSiteSandboxPool(runId, targetUrl, concurrency = 2, options = {}) {
+    const createPromises = [];
+
+    for (let i = 1; i <= concurrency; i++) {
+        createPromises.push((async () => {
+            await acquireSandboxCreationSlot();
+            try {
+                const baseTmp = process.platform === 'win32' ? 'C:\\tmp' : '/tmp';
+                const sandboxDir = path.join(baseTmp, 'autoqa-sandbox', `${runId}-${i}`);
+                const containerName = `autoqa-sandbox-${runId}-${i}`;
+
+                await fs.mkdir(sandboxDir, { recursive: true });
+
+                const volumeDir = sandboxDir.replace(/\\/g, '/');
+                const runTimeoutMs = parseInt(process.env.SANDBOX_TIMEOUT_MS || '120000', 10);
+                const dockerRunTimeoutMs = getDockerBaseImagePullTimeoutMs();
+                const installTimeoutMs = Math.max(runTimeoutMs, 300000);
+                const liveMode = isLiveBrowserEnabled();
+                const vncPort = liveMode ? VNC_BASE_PORT + (i - 1) : null;
+
+                try {
+                    await execFilePromise('docker', ['rm', '-f', containerName]).catch(() => {});
+
+                    const dockerRunArgs = [
+                        'run', '-d',
+                        '--name', containerName,
+                        '-v', `${volumeDir}:/app`,
+                        '-w', '/app',
+                        '-e', `AUTOQA_E2E_BASE_URL=${targetUrl}`
+                    ];
+
+                    if (liveMode && vncPort) {
+                        dockerRunArgs.push('-p', `${vncPort}:6080`);
+                        dockerRunArgs.push('-e', 'DISPLAY=:99');
+                        dockerRunArgs.push('-e', 'AUTOQA_LIVE_BROWSER=true');
+                        dockerRunArgs.push('-e', `AUTOQA_LIVE_SLOWMO_MS=${LIVE_SLOWMO_MS}`);
+                    }
+
+                    const sandboxEnv = options.sandboxEnv && typeof options.sandboxEnv === 'object'
+                        ? options.sandboxEnv : {};
+                    for (const [envKey, envVal] of Object.entries(sandboxEnv)) {
+                        if (envVal == null) continue;
+                        dockerRunArgs.push('-e', `${envKey}=${String(envVal)}`);
+                    }
+
+                    dockerRunArgs.push(
+                        `mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-jammy`,
+                        'tail', '-f', '/dev/null'
+                    );
+
+                    await dockerRun(dockerRunArgs, dockerRunTimeoutMs);
+                    console.log(`[Sandbox] Live-site container started: ${containerName}${liveMode ? ` (VNC port ${vncPort})` : ''}`);
+
+                    if (liveMode) {
+                        const vncInstallTimeoutMs = Math.max(installTimeoutMs, 600000);
+                        try {
+                            await spawnCapture('docker', [
+                                'exec', containerName, 'sh', '-c',
+                                'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc python3-websockify && rm -rf /var/lib/apt/lists/*'
+                            ], { timeout: vncInstallTimeoutMs });
+                        } catch (vncInstErr) {
+                            try {
+                                await execFilePromise('docker', [
+                                    'exec', containerName, 'which', 'x11vnc'
+                                ], { timeout: 10000 });
+                            } catch {
+                                throw vncInstErr;
+                            }
+                        }
+
+                        const vncStartScript = [
+                            '#!/bin/sh', 'export DISPLAY=:99',
+                            'Xvfb :99 -screen 0 1280x720x24 &', 'sleep 1',
+                            'x11vnc -display :99 -forever -nopw -shared -rfbport 5900 &',
+                            'websockify --web=/usr/share/novnc/ 6080 localhost:5900 &',
+                            'echo "VNC stack started"', 'wait'
+                        ].join('\n');
+                        await fs.writeFile(path.join(sandboxDir, '.autoqa-vnc-start.sh'), vncStartScript, 'utf8');
+                        await execFilePromise('docker', ['exec', containerName, 'chmod', '+x', '/app/.autoqa-vnc-start.sh'], { timeout: 10000 });
+                        await execFilePromise('docker', ['exec', '-d', containerName, '/app/.autoqa-vnc-start.sh'], { timeout: 10000 });
+                        await new Promise(r => setTimeout(r, 3000));
+
+                        if (typeof global !== 'undefined' && global.io) {
+                            global.io.emit('sandbox_vnc_ready', {
+                                runId, containerId: i, containerName, vncPort,
+                                vncUrl: `http://localhost:${vncPort}/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000`
+                            });
+                        }
+                    }
+
+                    await dockerRun([
+                        'exec', containerName,
+                        'npm', 'install', '--no-audit', '--no-fund', '--no-package-lock',
+                        `@playwright/test@${PLAYWRIGHT_VERSION}`, 'wait-on'
+                    ], installTimeoutMs);
+                    console.log(`[Sandbox] Pre-installed @playwright/test and wait-on in ${containerName}.`);
+                } catch (err) {
+                    console.error(`[Sandbox] Live-site container startup failed for ${containerName}:`, err.message);
+                    throw err;
+                }
+
+                return { sandboxDir, containerName, vncPort };
+            } finally {
+                releaseSandboxCreationSlot();
+            }
+        })());
+    }
+
+    return await Promise.all(createPromises);
+}
+
 module.exports = {
     createSandboxPool,
+    createLiveSiteSandboxPool,
     executeTest,
+    validateSyntaxLocal,
     cleanupSandboxPool,
+    sanitizeArtifactSegment,
+    discoverAppRootRelative
 };

@@ -1,8 +1,28 @@
 const OpenAI = require('openai');
 const crypto = require('crypto');
 const dotenv = require('dotenv');
+const db = require('../db');
+const { buildAccountFixtureMap } = require('./defaultTestAccountsStore');
 
 dotenv.config();
+
+/** Per-pipeline run id for persisted LLM traces + token rollups (null = don't persist). */
+let _llmTraceRunId = null;
+
+function setLlmRunContext(runId) {
+    _llmTraceRunId = runId || null;
+}
+
+function getLlmRunContext() {
+    return _llmTraceRunId;
+}
+
+/** Request half of a trace, keyed for pairing with the response phase. */
+const _llmPendingRequest = new Map();
+
+function _pendingTraceKey(caller, correlationKey) {
+    return `${caller}::${correlationKey || '__default__'}`;
+}
 
 // ---------------------------------------------------------------------------
 // Client + config
@@ -16,7 +36,10 @@ const client = new OpenAI({
 const DEFAULT_MODEL = process.env.OPENAI_MODEL || 'gpt-5.4-mini';
 const SCENARIO_EFFORT = process.env.OPENAI_SCENARIO_EFFORT || 'low';
 const TESTCASE_EFFORT = process.env.OPENAI_TESTCASE_EFFORT || 'medium';
-const HEAL_EFFORT     = process.env.OPENAI_HEAL_EFFORT     || 'high';
+const HEAL_EFFORT     = process.env.OPENAI_HEAL_EFFORT     || 'medium';
+
+const MAX_OUTPUT_TOKENS_GEN  = Math.max(4000, parseInt(process.env.OPENAI_MAX_OUTPUT_TOKENS || '16000', 10) || 16000);
+const MAX_OUTPUT_TOKENS_HEAL = Math.max(2000, parseInt(process.env.OPENAI_HEAL_MAX_OUTPUT_TOKENS || '8000', 10) || 8000);
 
 // Stateful mode options:
 //   'conversation' (default) — use the Conversations API, one conversation per chain.
@@ -52,8 +75,24 @@ const CACHE_KEYS = {
     TESTCASE_GEN:      'qa:testcases:generate',
     TESTCASE_HEAL:     'qa:testcases:heal',
     PR_MAPPING:        'qa:pr:mapping',
-    PR_CLASSIFICATION: 'qa:pr:classification'
+    PR_CLASSIFICATION: 'qa:pr:classification',
+    FALLBACK_SMOKE:    'qa:fallback:generate'
 };
+
+/**
+ * OpenAI Conversations API rejects concurrent requests on the same conversation id.
+ * All test cases under one scenario share one conversation anchor; parallel sandbox
+ * workers must not heal at the same time.
+ */
+const _healQueueTailByConversation = new Map();
+
+function runHealQueued(conversationId, fn) {
+    if (!conversationId) return fn();
+    const prev = _healQueueTailByConversation.get(conversationId) || Promise.resolve();
+    const next = prev.catch(() => {}).then(fn);
+    _healQueueTailByConversation.set(conversationId, next);
+    return next;
+}
 
 /**
  * Build the prompt-cache params to spread into a responses.create() call.
@@ -79,8 +118,19 @@ function buildCacheParams(cacheKey) {
 function emitLlmTrace({
     caller, model, phase, prompt, response, reasoningSummary,
     durationMs, error, conversationId, responseId,
-    usage
+    usage,
+    correlationKey
 }) {
+    const runId = _llmTraceRunId;
+    const traceKey = _pendingTraceKey(caller, correlationKey);
+
+    if (phase === 'request' && caller) {
+        _llmPendingRequest.set(traceKey, {
+            prompt: (prompt || '').slice(0, 120000),
+            model: model || DEFAULT_MODEL
+        });
+    }
+
     if (global.io) {
         global.io.emit('llm_trace', {
             id: crypto.randomUUID(),
@@ -95,8 +145,38 @@ function emitLlmTrace({
             responseId:         responseId || undefined,
             usage:              phase === 'response' ? (usage || undefined) : undefined,
             error,
+            correlationKey:     correlationKey || undefined,
             timestamp: new Date().toISOString()
         });
+    }
+
+    if (phase === 'response' && runId && runId !== '__jira_sync__' && caller) {
+        const pending = _llmPendingRequest.get(traceKey);
+        _llmPendingRequest.delete(traceKey);
+        try {
+            db.insertLlmTraceRow({
+                runId,
+                traceLabel: caller,
+                phase: 'response',
+                requestPayload: pending?.prompt != null ? pending.prompt : null,
+                responsePayload: [
+                    response != null ? String(response).slice(0, 120000) : '',
+                    reasoningSummary ? `\n--- reasoning ---\n${reasoningSummary}` : '',
+                    error ? `\n--- error ---\n${error}` : ''
+                ].join(''),
+                tokenUsage: usage || null,
+                createdAt: new Date().toISOString()
+            });
+            if (usage && typeof usage.inputTokens === 'number') {
+                db.addRunTokenUsage(runId, {
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens || 0,
+                    cachedTokens: usage.cachedTokens || 0
+                });
+            }
+        } catch (e) {
+            console.warn('[LLM] Failed to persist llm_trace_row:', e.message);
+        }
     }
 
     // Console log cache-hit telemetry so operators can verify that caching is
@@ -138,7 +218,8 @@ function safeParseJSON(text) {
 // ---------------------------------------------------------------------------
 // Local token pre-flight (tiktoken) — replaces Gemini's countTokens network call
 // ---------------------------------------------------------------------------
-const MAX_TOKENS_ALLOWED = 30000;
+const MODEL_CONTEXT_WINDOW = Math.max(30000, parseInt(process.env.OPENAI_MODEL_CONTEXT_WINDOW || '128000', 10) || 128000);
+const MAX_TOKENS_ALLOWED = MODEL_CONTEXT_WINDOW;
 
 let _encoder = null;
 function getEncoder() {
@@ -242,6 +323,16 @@ const PROMPT_TOKEN_BUDGET = (() => {
 })();
 
 /**
+ * Budget specifically for PR-to-scenario mapping — needs more room because
+ * large PRs have many files+scenarios. Defaults to 50% of model context.
+ */
+const MAPPING_TOKEN_BUDGET = (() => {
+    const raw = Number(process.env.OPENAI_MAPPING_BUDGET);
+    if (Number.isFinite(raw) && raw > 0) return raw;
+    return Math.floor(MODEL_CONTEXT_WINDOW * 0.5);
+})();
+
+/**
  * Recognise errors from the Responses API that indicate our stored
  * conversation id or previous_response_id is no longer valid (expired,
  * deleted, or from a different org). Returns true when the caller should
@@ -287,6 +378,9 @@ function extractResponseText(response) {
         if (item.type !== 'message') continue;
         const content = Array.isArray(item.content) ? item.content : [];
         for (const c of content) {
+            if (c.type === 'refusal') {
+                throw new Error(`LLM refused the request: ${c.refusal || '(no reason given)'}`);
+            }
             if (typeof c.text === 'string') chunks.push(c.text);
             else if (c.text && typeof c.text.value === 'string') chunks.push(c.text.value);
         }
@@ -446,8 +540,52 @@ const FIXTURE_DEFAULTS = {
     sort:        'priority'
 };
 
-function inferTestDataFromScript(testScript) {
+function buildLoginUserFixtureTemplates(accountFixtureMap, defaultAccountId) {
+    const keys = accountFixtureMap && typeof accountFixtureMap === 'object' ? Object.keys(accountFixtureMap) : [];
+    if (keys.length === 0) {
+        return {
+            user:  { name: 'Test User', email: 'testuser@example.com', password: 'Password123!' },
+            login: { email: 'testuser@example.com', password: 'Password123!' }
+        };
+    }
+    const id =
+        defaultAccountId && accountFixtureMap[defaultAccountId]
+            ? defaultAccountId
+            : keys[0];
+    const acc = accountFixtureMap[id];
+    const name = (acc.displayName && String(acc.displayName).trim()) || 'Test User';
+    return {
+        user:  { name, email: acc.email, password: acc.password },
+        login: { email: acc.email, password: acc.password }
+    };
+}
+
+function pickFixtureValueForRef(group, key, accountFixtureMap) {
+    const acc = accountFixtureMap && accountFixtureMap[group];
+    if (!acc) {
+        return FIXTURE_DEFAULTS[key] !== undefined ? FIXTURE_DEFAULTS[key] : `test_${key}`;
+    }
+    if (key === 'email') return acc.email;
+    if (key === 'password') return acc.password;
+    if (key === 'name' || key === 'displayName') {
+        return (acc.displayName && String(acc.displayName).trim()) || FIXTURE_DEFAULTS[key];
+    }
+    return FIXTURE_DEFAULTS[key] !== undefined ? FIXTURE_DEFAULTS[key] : `test_${key}`;
+}
+
+/**
+ * @param {string} testScript
+ * @param {{ accountFixtureMap: Record<string, object>, defaultAccountId: string|null }|null} fixtureContext
+ */
+function inferTestDataFromScript(testScript, fixtureContext = null) {
     if (!testScript) return {};
+
+    const accountFixtureMap =
+        fixtureContext && fixtureContext.accountFixtureMap && typeof fixtureContext.accountFixtureMap === 'object'
+            ? fixtureContext.accountFixtureMap
+            : null;
+    const defaultAccountId =
+        fixtureContext && fixtureContext.defaultAccountId != null ? fixtureContext.defaultAccountId : null;
 
     const refs = new Set();
     const pattern = /testData\.(\w+)\.(\w+)/g;
@@ -471,13 +609,15 @@ function inferTestDataFromScript(testScript) {
     for (const ref of refs) {
         const [group, key] = ref.split('.');
         if (!data[group]) data[group] = {};
-        data[group][key] = FIXTURE_DEFAULTS[key] !== undefined ? FIXTURE_DEFAULTS[key] : `test_${key}`;
+        data[group][key] = pickFixtureValueForRef(group, key, accountFixtureMap);
     }
 
+    const loginUserTemplates = buildLoginUserFixtureTemplates(accountFixtureMap, defaultAccountId);
+
     const ENTITY_TEMPLATES = {
-        user:  { name: 'Test User', email: 'testuser@example.com', password: 'Password123!' },
+        user:  { name: loginUserTemplates.user.name, email: loginUserTemplates.user.email, password: loginUserTemplates.user.password },
         todo:  { title: 'Test Todo Item', description: 'This is a test item', priority: 'high', completed: false },
-        login: { email: 'testuser@example.com', password: 'Password123!' }
+        login: { email: loginUserTemplates.login.email, password: loginUserTemplates.login.password }
     };
 
     for (const group of wholeGroups) {
@@ -502,6 +642,24 @@ function inferTestDataFromScript(testScript) {
             }
         }
 
+        if (accountFixtureMap && accountFixtureMap[group]) {
+            const acc = accountFixtureMap[group];
+            const accTemplate = {
+                email: acc.email,
+                password: acc.password,
+                displayName: acc.displayName || '',
+                name: (acc.displayName && String(acc.displayName).trim()) || 'Test User'
+            };
+            if (data[group]) {
+                for (const [k, v] of Object.entries(accTemplate)) {
+                    if (data[group][k] === undefined) data[group][k] = v;
+                }
+            } else {
+                data[group] = { ...accTemplate };
+            }
+            continue;
+        }
+
         if (data[group]) {
             if (template) {
                 for (const [k, v] of Object.entries(template)) {
@@ -518,16 +676,81 @@ function inferTestDataFromScript(testScript) {
     return data;
 }
 
-function enforceTestData(testCases) {
+function formatConfiguredAccountsPromptSection(config) {
+    if (!config?.accounts?.length) return '';
+
+    const lines = config.accounts.map((a) => {
+        const label = a.label ? ` (${a.label})` : '';
+        const hasDn = !!(a.displayName && String(a.displayName).trim());
+        const dnHint = hasDn ? ` / testData.${a.id}.displayName` : '';
+        return `- id="${a.id}"${label}: use testData.${a.id}.email / testData.${a.id}.password${dnHint} — values email=${a.email} password=${a.password}${hasDn ? ` displayName="${String(a.displayName).replace(/"/g, '\\"')}"` : ''}`;
+    });
+
+    let defLine = '';
+    if (config.defaultAccountId && config.accounts.some((a) => a.id === config.defaultAccountId)) {
+        defLine =
+            `\nWhen the scenario needs a generic user without naming a role, prefer testData.${config.defaultAccountId} (the configured default).\n`;
+        defLine +=
+            `If you use testData.login or testData.user, fill them with the SAME values as testData.${config.defaultAccountId}.\n`;
+    }
+
+    return (
+        `\n[CONFIGURED TEST ACCOUNTS — USE ONLY THESE FOR SIGN-IN AND USER FIXTURES]:\n` +
+        `${lines.join('\n')}` +
+        defLine +
+        `Pick the account id that fits the scenario (e.g. privileged flows use an admin id when listed). Do NOT invent random emails/passwords unless the scenario explicitly requires a user outside this list. Prefer configured accounts for logged-in behavior.\n`
+    );
+}
+
+function formatConfiguredAccountsHealReminder(config) {
+    if (!config?.accounts?.length) return '';
+    const ids = config.accounts.map((a) => a.id).join(', ');
+    const extra = config.defaultAccountId ? ` Default for generic login/user: "${config.defaultAccountId}".` : '';
+    return (
+        `\n[CONFIGURED TEST ACCOUNTS]: Allowed credential groups: ${ids}.${extra}` +
+        ` Do NOT replace with placeholders (example.com, Password123!, etc.).`
+    );
+}
+
+function enforceTestData(testCases, fixtureContext = null) {
     for (const tc of testCases) {
         const hasData = tc.testData && typeof tc.testData === 'object' && Object.keys(tc.testData).length > 0;
         if (!hasData && tc.testScript) {
-            const inferred = inferTestDataFromScript(tc.testScript);
+            const inferred = inferTestDataFromScript(tc.testScript, fixtureContext);
             if (Object.keys(inferred).length > 0) {
                 console.warn(`[testData-enforce] ${tc.testCaseId}: LLM returned empty testData — inferred ${Object.keys(inferred).length} group(s) from script: ${Object.keys(inferred).join(', ')}`);
                 tc.testData = inferred;
             }
         }
+    }
+    return testCases;
+}
+
+/** Normalize LLM steps to { action, expectedResult } for DB + dashboard (supports legacy string[]). */
+function normalizeTestCaseSteps(testCases) {
+    for (const tc of testCases || []) {
+        const raw = tc.steps;
+        if (!Array.isArray(raw)) {
+            tc.steps = [];
+            continue;
+        }
+        tc.steps = raw.map((s) => {
+            if (typeof s === 'string') {
+                return { action: s.trim(), expectedResult: '' };
+            }
+            if (s && typeof s === 'object') {
+                const action = String(s.action != null ? s.action : '')
+                    || String(s.description != null ? s.description : '')
+                    || String(s.text != null ? s.text : '');
+                const expectedResult = String(
+                    s.expectedResult != null ? s.expectedResult
+                        : s.expected != null ? s.expected
+                            : ''
+                );
+                return { action: action.trim(), expectedResult: expectedResult.trim() };
+            }
+            return { action: '', expectedResult: '' };
+        });
     }
     return testCases;
 }
@@ -575,20 +798,42 @@ const TESTCASE_RESPONSE_SCHEMA = {
             items: {
                 type: 'object',
                 properties: {
-                    testCaseId:   { type: 'string' },
-                    title:        { type: 'string' },
-                    steps:        { type: 'array', items: { type: 'string' } },
-                    testData:     { type: 'object', additionalProperties: true },
-                    testScript:   { type: 'string' },
-                    language:     { type: 'string', enum: ['javascript', 'python'] },
-                    codeFiles:    { type: 'array', items: { type: 'string' } },
-                    isRefinement: { type: 'boolean' }
+                    testCaseId:    { type: 'string' },
+                    title:         { type: 'string' },
+                    steps: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                action:           { type: 'string' },
+                                expectedResult:  { type: 'string' }
+                            },
+                            required: ['action'],
+                            additionalProperties: false
+                        }
+                    },
+                    testData:      { type: 'object', additionalProperties: true },
+                    testScript:    { type: 'string' },
+                    language:      { type: 'string', enum: ['javascript', 'python'] },
+                    codeFiles:     { type: 'array', items: { type: 'string' } },
+                    isRefinement:  { type: 'boolean' },
+                    testStrategy:  { type: 'string', enum: ['e2e', 'api', 'linked'] }
                 },
                 required: ['testCaseId', 'title', 'steps', 'testData', 'testScript', 'language', 'codeFiles', 'isRefinement']
             }
         }
     },
     required: ['testCases']
+};
+
+/** Structured output for heal/repair — single field keeps parsing reliable. */
+const HEAL_RESPONSE_SCHEMA = {
+    type: 'object',
+    properties: {
+        testScript: { type: 'string' }
+    },
+    required: ['testScript'],
+    additionalProperties: false
 };
 
 // ---------------------------------------------------------------------------
@@ -600,78 +845,162 @@ const TESTCASE_RESPONSE_SCHEMA = {
 const SCENARIO_SYSTEM_INSTRUCTION = `You are a senior QA engineer specialising in functional and non-functional testing.
 Your task is to produce concrete, actionable test scenarios — not vague checks.
 
+These scenarios are consumed by an automated PR pipeline that mostly verifies behaviour through real browser E2E (Playwright)
+when a user interface exists. Write scenarios so each one maps cleanly to a small set of observable checks.
+
 Rules:
 - Each scenario description must clearly state: the exact precondition, the action performed, and the expected outcome.
 - Do NOT use generic phrases like "verify the system works" — be specific about data, state, and expected result.
+- Where the story implies a UI: phrase the expected outcome in terms a user or tester can SEE (visible labels, messages,
+  list contents, disabled buttons, empty states, navigation). Prefer role/label semantics ("Save" button, field "Email")
+  over raw CSS selectors or hex colours. Reserve pixel-exact colours/classes only when the acceptance criterion truly
+  demands visual design compliance.
+- Where the story is API-only (no user-facing surface): state HTTP status, key response fields, and persistence or side
+  effects explicitly so API-level automation can assert them. If both UI and API apply, tie them in one outcome (e.g.
+  submit in UI + reflected data + optional status).
 - Cover all four types for every acceptance criterion where applicable: happy_path, edge_case, negative, boundary.
 - For negative scenarios: specify exactly what invalid input or broken state is used and what error/response is expected.
 - For boundary scenarios: call out the exact limit being tested (e.g. max length, zero value, first/last item).
 - For edge cases: consider concurrency, empty states, special characters, or unusual but valid combinations.
+- Keep one clear verification focus per scenario — avoid stacking many unrelated assertions in a single description.
 - scenarioId must be unique within the array and follow the pattern SCN-<storyKey>-<index> (e.g. SCN-QPT-4-1).
 - storyId must exactly match the story key (e.g. QPT-4).
 - epicId must exactly match the epic key.
-- Return ONLY valid JSON matching the schema. No markdown fences. No explanation text.`;
+Output shape is enforced by the API schema — no markdown or explanation, only the structured response.`;
+
+const FEW_SHOT_EXAMPLES = {
+    javascript: `const { test, expect } = require('@playwright/test');
+
+test.describe('StructuralExample_FrontendFirst', () => {
+  test('creates a record through the UI and verifies it appears', async ({ page }) => {
+    await page.goto('/');
+    await page.getByPlaceholder('Enter title').fill(testData.item.title);
+    await page.getByRole('button', { name: /add/i }).click();
+    await expect(page.getByText(testData.item.title)).toBeVisible();
+  });
+
+  test('validates required field shows error on empty submit', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: /add/i }).click();
+    await expect(page.getByText(/required/i)).toBeVisible();
+  });
+});`,
+    python: `import pytest
+from unittest.mock import MagicMock
+
+@pytest.fixture
+def test_data():
+    return {"req": {"id": "stub-001"}, "expected_ok": True}
+
+def test_structural_fixture_and_mock(test_data):
+    mock_widget = MagicMock()
+    mock_widget.load.return_value = {"id": "mock-record", "ok": test_data["expected_ok"]}
+    out = mock_widget.load(test_data["req"]["id"])
+    assert mock_widget.load.called
+    assert out["ok"] is test_data["expected_ok"]
+`
+};
 
 const TESTCASE_GENERATION_INSTRUCTIONS = `You are an expert QA engineer generating concrete, executable test cases for an isolated Docker sandbox.
+
+TESTING STRATEGY — FRONTEND-FIRST (strictly enforced):
+- DEFAULT: Generate Playwright E2E tests that exercise the REAL UI in a headed browser.
+  Every scenario that involves user-visible behavior (forms, navigation, data display,
+  CRUD operations, authentication flows, page rendering) MUST be tested via Playwright.
+- LINKED FRONTEND+API: When a scenario involves both frontend UI and backend API calls
+  (e.g. form submission → POST /api/todos → result appears in list), the test MUST verify
+  the full round-trip through the UI. Do NOT test the API in isolation — interact with the
+  frontend that calls it and verify the result is visible on the page.
+- API-ONLY FALLBACK: Use Jest+supertest ONLY for pure backend endpoints with NO frontend
+  representation (e.g. webhook handlers, cron jobs, internal microservice APIs, CLI tools).
+  If the API has ANY frontend page that calls it, use Playwright instead.
+- NEVER generate both a Playwright test AND a Jest test for the same scenario.
+- Set testStrategy to "e2e" for Playwright tests, "linked" for Playwright tests that verify
+  API side-effects through the UI, or "api" for Jest+supertest API-only tests.
 
 SEPARATION OF DATA AND LOGIC (mandatory — strictly enforced):
 - Every concrete input value (emails, passwords, names, titles, IDs, amounts, priorities, etc.) MUST go into testData as named keys grouped by entity.
   Example testData: { "user": { "name": "Alice", "email": "alice@test.com", "password": "Pass123!" }, "todo": { "title": "Buy milk", "priority": "high" } }
 - testData must NEVER be empty {}. If the test uses any inputs at all, they belong in testData.
 - The testScript must NEVER hardcode these values inline. Always reference them via the testData variable.
-  Example script usage: request(app).post('/signup').send(testData.user)
+  Example: await page.getByLabel('Email').fill(testData.user.email);
 - The testData variable is injected automatically as the first line of the script at runtime: const testData = <your testData JSON>;
   Do NOT declare const testData = ... yourself in the testScript.
 
 RULES FOR THE testScript:
 - The script runs inside an isolated Docker container where the full app source code is already present.
-- The app's dependencies (express, etc.) are pre-installed but the server is NOT already running.
-- AVAILABLE TEST PACKAGES (already installed): jest, supertest, jest-environment-node, fs, path, vm, crypto, and Node.js built-ins.
-- DO NOT require or import packages that are not listed above (e.g. jsdom, puppeteer, playwright, cheerio, enzyme, testing-library). If you need DOM testing, use Node.js built-in "vm" module with a manual DOM stub, or test the API layer directly with supertest instead.
-- For Node.js Express (and other HTTP frameworks exposed as an app or server): you MUST use "supertest" only — require the server module, pass it to supertest, and do NOT call app.listen() yourself.
+- The app's dependencies (express, etc.) are pre-installed but the server is NOT already running for Jest/API tests.
+- AVAILABLE TEST PACKAGES (already installed): jest, supertest, jest-environment-node, @playwright/test, fs, path, vm, crypto, and Node.js built-ins.
+- DO NOT require or import packages beyond those above (no jsdom, cheerio, enzyme, testing-library, puppeteer).
+
+PLAYWRIGHT BROWSER E2E (primary — use for ALL UI-testable scenarios):
+- Use CommonJS: const { test, expect } = require('@playwright/test');
+- Structure: one test.describe block containing 1-3 focused test() calls per file.
+- The sandbox starts the app dev server (npm run dev or npm start) and runs Playwright against it.
+- Base URL: use process.env.AUTOQA_E2E_BASE_URL if set (trimmed, no trailing slash); otherwise infer from codeContext (Vite → 5173, Next/react-scripts → 3000).
+- Prefer web-first assertions on locators: await expect(page.getByRole('button', { name: /submit/i })).toBeVisible()
+- Use accessibility-driven selectors (getByRole, getByLabel, getByPlaceholder, getByText) over CSS selectors.
+- For linked tests: interact with the UI, then verify the result is visible in the UI.
+- On failure, screenshots and video are captured automatically — do not add page.screenshot() solely for diagnostics.
+- Tests run in headed mode with a live browser viewer — keep actions clear and sequential.
+
+Jest + supertest (API-ONLY fallback — use ONLY when no frontend UI exists for the endpoint):
+- For Node.js Express: use "supertest" only — require the server module, pass it to supertest, do NOT call app.listen().
   Example: const request = require('supertest'); const app = require('./todoServer'); const res = await request(app).post('/todos').send(testData.todo);
-- FORBIDDEN for Express HTTP APIs: reaching into Express internals (e.g. app._router, layer.route, walking middleware stacks, invokeRoute helpers, or hand-rolled req/res mocks). Supertest is the only allowed way to hit HTTP routes unless the app is genuinely non-HTTP.
-- Jest structure: wrap tests in describe() and it() (or test()). When using supertest, use async it('...', async () => { ... }) and await every request(...) chain so promises are never dropped. Use expect() for assertions.
-- Naming hygiene: never use the same identifier for a helper function and a const/let (e.g. do NOT declare function createRes() and later const createRes = ... — that is a SyntaxError). Use distinct names: loginRes, createTodoRes, listRes, etc.
-- Authorization: match the real app from codeContext (e.g. if the server reads the raw token from the Authorization header, send .set('Authorization', token) and do NOT add a "Bearer " prefix unless the server explicitly strips it).
-- Never make raw HTTP calls to localhost URLs or assume a server is running externally.
+- FORBIDDEN: reaching into Express internals (app._router, middleware walking, hand-rolled req/res mocks).
+- Jest structure: wrap tests in describe() and it() with async/await. Use expect() for assertions.
+- Naming hygiene: never use the same identifier for a helper function and a const/let.
 - Use CommonJS require() style (not ES modules import).
 - Never re-declare testData — it is already available as a variable.
 
 SERVER CLEANUP (mandatory — prevents Jest from hanging on open handles):
 - Tests run with --forceExit and --runInBand, but you MUST still ensure clean teardown.
-- If you store a reference to a server or HTTP agent, close it in afterAll: afterAll(() => { if (server) server.close(); });
-- For supertest against an app (not a running server), supertest manages connections automatically, but add afterAll as a safety net.
+- If you store a reference to a server or HTTP agent, close it in afterAll.
 - NEVER leave setInterval, setTimeout, or open socket/database connections running after tests complete.
 
 FILE-BASED STORAGE APPS (important for apps using JSON file storage):
 - If the app under test uses file-based storage (e.g. JSON files like todos.json, users.json), the sandbox resets these files to empty state ([] or {}) before each test execution.
 - Each test script starts with a CLEAN, EMPTY data store. Do NOT assume any pre-existing data.
-- Your test must create all the data it needs (e.g. signup a user, then login, then create todos) — never assume users or records already exist.
-- If tests share state within a single describe block, use beforeAll/beforeEach to set up required data.
-- Use unique test data values per test case to reduce collision risk if tests run in any order.
+- Your test must create all the data it needs (e.g. signup a user, then login, then create todos).
+- Use unique test data values per test case to reduce collision risk.
 
-OUTPUT FORMAT:
-Return a JSON object with a single top-level key "testCases" whose value is an array of 2-4 test case objects.
-Each test case object must have: testCaseId, title, steps, testData, testScript, language, codeFiles, isRefinement.`;
+STEPS (dashboard / RTM):
+- For each test case, "steps" MUST be an array of objects with "action" (string, required) and optional "expectedResult" (string).
+- Each "action" is a short imperative line describing what the user or automation does; "expectedResult" is what should be observable after that step when helpful.
+- Do NOT emit bare strings inside "steps" — only objects { "action": "...", "expectedResult": "..." }.
+
+Produce 2–4 test cases per scenario; required fields and object shape are defined by the API response schema — do not echo the schema in prose.
+
+[REFERENCE EXAMPLES — FORMATTING AND STYLE ONLY]
+These snippets illustrate structure only. They are not the repository under review; do not copy paths or mocks literally—adapt the patterns to the PR's actual modules and filenames.
+At runtime JavaScript scripts receive an injected preamble: const testData = {"..."}; — reference testData the same way (never declare const testData yourself).
+
+--- JavaScript structural example ---
+${FEW_SHOT_EXAMPLES.javascript}
+
+--- Python structural example ---
+${FEW_SHOT_EXAMPLES.python}`;
 
 const HEAL_INSTRUCTIONS = `You are an expert test engineer fixing a failing test script for an isolated Docker sandbox.
 The testData variable is already injected as the first line at runtime — do NOT redeclare it.
 Do not hardcode any values that exist in testData — always reference them as testData.<group>.<key>.
 Fix any SyntaxError or duplicate identifier (e.g. a helper function name reused as const) — rename variables so every binding is unique.
+If the script uses @playwright/test, prefer web-first assertions on locators (expect(locator)...); fix selectors, timeouts, and page.goto origins to respect process.env.AUTOQA_E2E_BASE_URL when set, otherwise match the inferred dev-server port from the repo; do not add page.screenshot() only for failure dumps — failure screenshots are automatic.
 If the script uses app._router, manual middleware walking, or fake req/res mocks for an Express app, rewrite it to use supertest against the exported app with async/await and describe/it.
 If the app uses file-based storage (JSON files), the data files are reset to empty ([] or {}) before each test run. The test must create all data it needs (signup, login, create records) — never assume pre-existing data.
 Ensure no open handles (servers, intervals, sockets) remain after tests — add afterAll cleanup if needed.
 If you already tried a similar approach in a previous turn and it failed, use a completely different strategy.
-Return ONLY the corrected script body. No explanation, no markdown fences, no comments about what changed. Just the raw executable code.`;
+If the error is ERR_CONNECTION_REFUSED, ECONNREFUSED, or net::ERR_CONNECTION_RESET, the dev server is not running or listening on the wrong port. Do NOT rewrite selectors or add waits — instead ensure page.goto uses the correct baseURL (process.env.AUTOQA_E2E_BASE_URL or the framework default port: Next.js=3000, Vite=5173). If a [DEV SERVER LOG] section is present in the failure output, use it to diagnose the root cause.
+Return structured output only: JSON object with one key "testScript" whose value is the full corrected script body as a string (raw executable code, no markdown fences, no commentary outside the string).`;
+
+// FEW_SHOT_EXAMPLES moved above TESTCASE_GENERATION_INSTRUCTIONS (used in instructions for better prompt caching)
 
 // ---------------------------------------------------------------------------
 // Test case generation
 //
 // NOTE: testData is intentionally a dynamic free-form object (keys are arbitrary
-// fixture group names). Strict json_schema requires every property to be declared,
-// which doesn't fit a dynamic map — so this call uses json_object mode.
-// enforceTestData() below acts as a safety net if the model returns testData: {}.
+// fixture group names). We use json_schema with strict: false so testData can be
+// an open object; enforceTestData() remains the safety net if the model returns testData: {}.
 // ---------------------------------------------------------------------------
 
 /**
@@ -691,6 +1020,37 @@ Return ONLY the corrected script body. No explanation, no markdown fences, no co
  * @param {string} opts.previousInteractionId   - when resuming a prior test-case generation
  *                                                 (e.g. refinement) without a conversation id.
  */
+
+/**
+ * Detects frontend files and client-side JS patterns in the provided code context.
+ * Used to explicitly signal the LLM to write Playwright E2E tests instead of API tests.
+ */
+function detectFrontendFiles(codeContextSection) {
+    const FRONTEND_EXTS = /\.(html|htm|jsx|tsx|vue|svelte|css|scss)$/i;
+    const FRONTEND_DIRS = /\b(public|src|pages|components|views|client|frontend)\b/i;
+    const CLIENT_JS_PATTERNS = /\b(document\.|window\.|addEventListener|querySelector|getElementById|fetch\(|XMLHttpRequest|React\.|createApp|mount\()\b/;
+    
+    const lines = (codeContextSection || '').split('\n');
+    const frontendFiles = [];
+    
+    for (const line of lines) {
+        const match = line.match(/^=== FILE: (.+?) ===/);
+        if (match) {
+            const filePath = match[1];
+            if (FRONTEND_EXTS.test(filePath) || FRONTEND_DIRS.test(filePath)) {
+                frontendFiles.push(filePath);
+            }
+        }
+    }
+    
+    const hasClientPatterns = CLIENT_JS_PATTERNS.test(codeContextSection);
+    
+    return {
+        frontendFiles,
+        hasFrontendSignals: frontendFiles.length > 0 || hasClientPatterns
+    };
+}
+
 async function generateTestCasesForScenario({
     scenario,
     codeContextSection,
@@ -700,11 +1060,13 @@ async function generateTestCasesForScenario({
     alreadyGeneratedSummary = [],
     conversationId = null,
     previousInteractionId = null,
-    priorReasoningItems = []
+    priorReasoningItems = [],
+    configuredTestAccounts = null
 }) {
     if (!scenario?.id) {
         throw new Error('generateTestCasesForScenario: scenario.id is required');
     }
+    const traceCorrelationKey = scenario.id;
 
     // Lazily create a conversation for this scenario if we don't already have one.
     let activeConversationId = conversationId;
@@ -726,6 +1088,16 @@ async function generateTestCasesForScenario({
           ).join('\n') + '\n'
         : '';
 
+    let fixtureContext = null;
+    let configuredAccountsSection = '';
+    if (configuredTestAccounts?.accounts?.length) {
+        fixtureContext = {
+            accountFixtureMap: buildAccountFixtureMap(configuredTestAccounts),
+            defaultAccountId: configuredTestAccounts.defaultAccountId || null
+        };
+        configuredAccountsSection = formatConfiguredAccountsPromptSection(configuredTestAccounts);
+    }
+
     // Variable-only portion (scenario-specific); the static rules live in
     // TESTCASE_GENERATION_INSTRUCTIONS for prompt caching.
     const acRef = Array.isArray(scenario.acceptanceCriteriaRef) && scenario.acceptanceCriteriaRef.length > 0
@@ -733,13 +1105,22 @@ async function generateTestCasesForScenario({
         : '';
     const scenarioTitleLine = scenario.title ? `\n  Title: ${scenario.title}` : '';
 
+    const { frontendFiles, hasFrontendSignals } = detectFrontendFiles(codeContextSection);
+    const frontendDetectionSection = hasFrontendSignals
+        ? `\n[FRONTEND DETECTION]:
+Frontend files detected in this codebase: ${frontendFiles.slice(0, 5).join(', ')}${frontendFiles.length > 5 ? ' and more' : ''}
+→ This app HAS a frontend UI. You MUST use Playwright for ALL test cases.
+  Do NOT use Jest+supertest. Test through the browser UI.
+  If the scenario describes REST/API actions (e.g. "POST /todos"), you MUST translate these into corresponding UI interactions. Instead of sending an HTTP request, script the browser to fill out the relevant form or click the relevant button that triggers that submission.`
+        : '';
+
     const rawPrompt = `Scenario to cover:
   ID: ${scenario.id}${scenarioTitleLine}
   Description: ${scenario.description || '(no description provided)'}
   Type: ${scenario.type || '(unspecified)'}
   Priority: ${scenario.priority || 'Medium'}${acRef}
-
-${refinementHint}${alreadyCoveredSection}
+${frontendDetectionSection}
+${refinementHint}${alreadyCoveredSection}${configuredAccountsSection}
 [CHANGED CODE DIFF]:
 ${prDiffSection || 'No diff available.'}
 
@@ -749,13 +1130,31 @@ ${codeContextSection || 'No additional context.'}
 [DEPENDENCIES / PACKAGE INFO]:
 ${dependenciesSection || 'Not available.'}
 
+${(() => {
+        try {
+            const rows = [
+                ...db.getTopReferenceExamples('playwright', 2),
+                ...db.getTopReferenceExamples('jest', 0),
+                ...db.getTopReferenceExamples('pytest', 1)
+            ];
+            if (!rows.length) return '';
+            return (
+                '\n[REPOSITORY-STYLE EXAMPLES — from prior passing runs, formatting only]\n' +
+                rows.map((r) => `--- ${r.framework} (uses ~${r.useCount || 1}×) ---\n${String(r.scriptBody || '').slice(0, 3500)}`).join('\n\n')
+            );
+        } catch {
+            return '';
+        }
+    })()}
+
 Generate 2-4 concrete test cases for this scenario. Each test case must:
 - Have a unique testCaseId in format: TCN-${scenario.id}-<index>
 - Have clear step-by-step actions with expected results (Given/When/Then style)
 - Have a complete, self-contained, runnable testScript (raw code, no markdown fences)
 - Set language to "javascript" or "python" based on what matches the codebase
 - List the codeFiles array with paths of PR files this test case exercises
-- Set isRefinement: ${refinementContext ? 'true' : 'false'}`;
+- Set isRefinement: ${refinementContext ? 'true' : 'false'}
+${hasFrontendSignals ? '\nCRITICAL OVERRIDE: This codebase has frontend files. Generate ONLY Playwright E2E tests.\nDo NOT generate Jest+supertest tests. testStrategy must be "e2e" or "linked" for every test case.\n' : ''}`;
 
     // Soft-trim oversized PRs before token guard so we never hard-fail the pipeline.
     const prompt = ensureWithinBudget(rawPrompt, PROMPT_TOKEN_BUDGET, 'generateTestCasesForScenario');
@@ -774,7 +1173,8 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
         model: DEFAULT_MODEL,
         phase: 'request',
         prompt,
-        conversationId: activeConversationId
+        conversationId: activeConversationId,
+        correlationKey: traceCorrelationKey
     });
 
     // Retry loop for transient "conversation busy" errors from the Conversations API.
@@ -788,6 +1188,7 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
                 model: DEFAULT_MODEL,
                 instructions: TESTCASE_GENERATION_INSTRUCTIONS,
                 input: finalInput,
+                max_output_tokens: MAX_OUTPUT_TOKENS_GEN,
                 text: {
                     format: {
                         type: 'json_schema',
@@ -826,7 +1227,8 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
         durationMs: Date.now() - _tcStartMs,
         conversationId: activeConversationId,
         responseId: response.id,
-        usage
+        usage,
+        correlationKey: traceCorrelationKey
     });
 
     const parsed = safeParseJSON(text);
@@ -835,7 +1237,8 @@ Generate 2-4 concrete test cases for this scenario. Each test case must:
         : (Array.isArray(parsed?.testCases) ? parsed.testCases : null);
     if (!testCases) throw new Error('generateTestCasesForScenario: expected testCases array from LLM');
 
-    enforceTestData(testCases);
+    normalizeTestCaseSteps(testCases);
+    enforceTestData(testCases, fixtureContext);
 
     return {
         testCases,
@@ -875,11 +1278,30 @@ async function repairTestCaseScript({
     previousInteractionId = null,
     priorReasoningItems = [],
     attemptHistory = [],
-    scenarioDescription = ''
+    scenarioDescription = '',
+    configuredTestAccounts = null
 }) {
     if (!testCase?.testCaseId) {
         throw new Error('repairTestCaseScript: testCase.testCaseId is required');
     }
+
+    return runHealQueued(conversationId, async () => {
+    let healPatternSection = '';
+    try {
+        if (testCase?.scenarioId) {
+            const rows = db.findHealPatternsForScenario(testCase.scenarioId);
+            if (rows?.length) {
+                healPatternSection =
+                    `\n[PAST SUCCESSFUL FIXES ON THIS SCENARIO — use as strategy hints only]:\n` +
+                    rows.map((r) => `- ${String(r.workingFixSummary || '').trim() || '(no summary)'}`).join('\n') +
+                    '\n';
+            }
+        }
+    } catch {
+        healPatternSection = '';
+    }
+
+    const configuredAccountsHealReminder = formatConfiguredAccountsHealReminder(configuredTestAccounts || null);
 
     let input;
     const hasState = Boolean(conversationId) || Boolean(previousInteractionId);
@@ -895,7 +1317,7 @@ ${failureOutput}
 The failed script that produced this output:
 ${testCase.testScript}
 
-Fix the script.`;
+Fix the script.${configuredAccountsHealReminder}${healPatternSection}`;
     } else {
         // Stateless fallback — self-contained prompt with manual history injection.
         const historySection = attemptHistory.length > 0
@@ -915,7 +1337,7 @@ Test Case: ${testCase.testCaseId}
 Title: ${testCase.title}
 Language: ${testCase.language}
 Attempt number: ${attemptNumber} of 3
-${intentSection}${historySection}
+${intentSection}${healPatternSection}${historySection}
 [CURRENT FAILED SCRIPT]:
 ${testCase.testScript}
 
@@ -928,7 +1350,7 @@ ${codeContextSection || 'Not available.'}
 [TEST DATA]:
 ${JSON.stringify(testCase.testData, null, 2)}
 
-If you already tried an approach in a previous attempt and it failed, use a different strategy this time.`;
+If you already tried an approach in a previous attempt and it failed, use a different strategy this time.${configuredAccountsHealReminder}`;
     }
 
     // Soft-trim before token guard — heal prompts can be large when the
@@ -949,17 +1371,43 @@ If you already tried an approach in a previous attempt and it failed, use a diff
         model: DEFAULT_MODEL,
         phase: 'request',
         prompt: input,
-        conversationId
+        conversationId,
+        correlationKey: testCase.testCaseId
     });
 
-    const callOpenAI = (statefulParams, inputPayload) => client.responses.create({
-        model: DEFAULT_MODEL,
-        instructions: HEAL_INSTRUCTIONS,
-        input: inputPayload,
-        reasoning: { effort: HEAL_EFFORT, summary: REASONING_SUMMARY },
-        ...buildCacheParams(CACHE_KEYS.TESTCASE_HEAL),
-        ...stripInternalParams(statefulParams)
-    });
+    const callOpenAI = async (statefulParams, inputPayload) => {
+        const MAX_BUSY_RETRIES = 5;
+        for (let busyAttempt = 0; ; busyAttempt++) {
+            try {
+                return await client.responses.create({
+                    model: DEFAULT_MODEL,
+                    instructions: HEAL_INSTRUCTIONS,
+                    input: inputPayload,
+                    max_output_tokens: MAX_OUTPUT_TOKENS_HEAL,
+                    text: {
+                        format: {
+                            type: 'json_schema',
+                            name: 'HealedTestScript',
+                            schema: HEAL_RESPONSE_SCHEMA,
+                            strict: true
+                        },
+                        verbosity: OUTPUT_VERBOSITY
+                    },
+                    reasoning: { effort: HEAL_EFFORT, summary: REASONING_SUMMARY },
+                    ...buildCacheParams(CACHE_KEYS.TESTCASE_HEAL),
+                    ...stripInternalParams(statefulParams)
+                });
+            } catch (err) {
+                if (err?.error?.message?.includes('Another process is currently operating on this conversation') && busyAttempt < MAX_BUSY_RETRIES) {
+                    const delayMs = Math.pow(2, busyAttempt) * 2000;
+                    console.warn(`[LLM] Heal conversation busy — retrying in ${delayMs}ms (attempt ${busyAttempt + 1}/${MAX_BUSY_RETRIES})`);
+                    await new Promise(r => setTimeout(r, delayMs));
+                    continue;
+                }
+                throw err;
+            }
+        }
+    };
 
     let response;
     let chainWasStale = false;
@@ -995,7 +1443,7 @@ ${codeContextSection || 'Not available.'}
 [TEST DATA]:
 ${JSON.stringify(testCase.testData, null, 2)}
 
-If you already tried an approach in a previous attempt and it failed, use a different strategy this time.`;
+If you already tried an approach in a previous attempt and it failed, use a different strategy this time.${configuredAccountsHealReminder}`;
             fallbackInput = ensureWithinBudget(fallbackInput, PROMPT_TOKEN_BUDGET, 'repairTestCaseScript:fallback');
             await assertTokenLimit(fallbackInput, DEFAULT_MODEL);
             const statelessParams = buildStatefulParams({}); // no conversation, no previous_response_id
@@ -1018,10 +1466,20 @@ If you already tried an approach in a previous attempt and it failed, use a diff
         durationMs: Date.now() - _healStartMs,
         conversationId,
         responseId: response.id,
-        usage
+        usage,
+        correlationKey: testCase.testCaseId
     });
 
-    const repairedScript = text.replace(/^```(?:\w+)?\n?/gm, '').replace(/^```$/gm, '').trim();
+    let repairedScript = '';
+    try {
+        const parsed = safeParseJSON(text);
+        if (parsed && typeof parsed.testScript === 'string') repairedScript = parsed.testScript.trim();
+    } catch (_) {
+        repairedScript = '';
+    }
+    if (!repairedScript) {
+        repairedScript = String(text || '').replace(/^```(?:\w+)?\n?/gm, '').replace(/^```$/gm, '').trim();
+    }
     return {
         repairedScript,
         interactionId: response.id || null,
@@ -1034,6 +1492,7 @@ If you already tried an approach in a previous attempt and it failed, use a diff
         reasoningItems,
         usage
     };
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,7 +1516,8 @@ Acceptance Criteria: ${story.acceptanceCriteria || 'None'}
 Supporting Documents: ${localDocsText || 'None'}
 ${alreadyGeneratedSection}
 Generate a thorough set of test scenarios covering all four types (happy_path, edge_case, negative, boundary) for every acceptance criterion.
-Return a JSON object with a "scenarios" array. Each scenario object has: scenarioId, storyId, epicId, title, description, acceptanceCriteriaRef, type, priority.`;
+Bias descriptions toward outcomes that can be verified in a browser when the product has a UI; keep API-only stories precise for HTTP/persistence checks.
+Structured response shape is enforced by the API — focus on substantive scenario content.`;
 
     try {
         await assertTokenLimit(prompt, currentModel);
@@ -1122,9 +1582,9 @@ Valid epicId value: ${epicContext.key || 'N/A'}
 
 ${storiesSection}
 
-Return a JSON object with a "scenarios" array containing all scenarios for all stories.
-Each scenario object must have: scenarioId, storyId, epicId, title, description, acceptanceCriteriaRef, type, priority.
-Cover all four types (happy_path, edge_case, negative, boundary) per acceptance criterion.`;
+Cover all four types (happy_path, edge_case, negative, boundary) per acceptance criterion for every story.
+Bias descriptions toward user-visible, observable outcomes when stories involve a UI; keep pure-API stories explicit on status, body, and storage.
+Structured response shape is enforced by the API — include every story via valid storyId / epicId.`;
 
     try {
         await assertTokenLimit(prompt, currentModel);
@@ -1187,8 +1647,215 @@ Cover all four types (happy_path, edge_case, negative, boundary) per acceptance 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live Site Testing — scenario + test-case generation from a live website
+// ---------------------------------------------------------------------------
+
+const LIVE_SITE_SCENARIO_INSTRUCTIONS = `You are an expert QA engineer. You are given:
+1. An FRD (Functional Requirements Document) describing what a website should do.
+2. An accessibility snapshot / DOM snapshot of the live website.
+
+Your task: generate a comprehensive set of test scenarios that cover the FRD requirements
+against the actual website structure. Each scenario should be concrete and testable via
+browser automation (Playwright).
+
+Focus on:
+- Happy-path flows described in the FRD
+- Edge cases and boundary conditions
+- Negative tests (invalid input, unauthorized access, etc.)
+- UI-specific behaviors visible in the site snapshot (forms, navigation, modals, etc.)
+
+Return ONLY valid JSON — a single object with a "scenarios" array containing the scenario objects.`;
+
+const LIVE_SITE_SCENARIO_SCHEMA = {
+    type: 'object',
+    properties: {
+        scenarios: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    id:          { type: 'string' },
+                    title:       { type: 'string' },
+                    description: { type: 'string' },
+                    type:        { type: 'string', enum: ['Happy Path', 'Edge Case', 'Negative', 'Boundary'] },
+                    priority:    { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }
+                },
+                required: ['id', 'title', 'description', 'type', 'priority'],
+                additionalProperties: false
+            }
+        }
+    },
+    required: ['scenarios'],
+    additionalProperties: false
+};
+
+/**
+ * Generate test scenarios from an FRD + live site snapshot.
+ */
+async function generateLiveSiteScenarios({ frdText, siteSnapshot, baseUrl }) {
+    const prompt = `Generate 5–15 test scenarios that thoroughly cover the requirements against this live site.
+Each scenario needs a unique id (format: LST-<index>), a title, description, type, and priority.
+
+[TARGET URL]: ${baseUrl || '(unknown)'}
+
+[FRD — Functional Requirements Document]:
+${frdText || '(No FRD provided — generate exploratory test scenarios based on what you observe on the site.)'}
+
+[LIVE SITE SNAPSHOT — accessibility tree / DOM structure]:
+${siteSnapshot || '(No snapshot available.)'}`;
+
+    const trimmed = ensureWithinBudget(prompt, PROMPT_TOKEN_BUDGET, 'generateLiveSiteScenarios');
+    await assertTokenLimit(trimmed, DEFAULT_MODEL);
+
+    const _startMs = Date.now();
+    emitLlmTrace({ caller: 'generateLiveSiteScenarios', model: DEFAULT_MODEL, phase: 'request', prompt: trimmed });
+
+    const response = await client.responses.create({
+        model: DEFAULT_MODEL,
+        instructions: LIVE_SITE_SCENARIO_INSTRUCTIONS,
+        input: trimmed,
+        max_output_tokens: MAX_OUTPUT_TOKENS_GEN,
+        store: true,
+        text: {
+            format: {
+                type: 'json_schema',
+                name: 'LiveSiteScenarios',
+                schema: LIVE_SITE_SCENARIO_SCHEMA,
+                strict: true
+            },
+            verbosity: OUTPUT_VERBOSITY
+        },
+        reasoning: { effort: SCENARIO_EFFORT, summary: REASONING_SUMMARY },
+        ...buildCacheParams('qa:livesite:scenarios')
+    });
+
+    const text = extractResponseText(response);
+    const usage = extractUsage(response);
+    emitLlmTrace({
+        caller: 'generateLiveSiteScenarios', model: DEFAULT_MODEL, phase: 'response',
+        response: text, durationMs: Date.now() - _startMs, usage
+    });
+
+    const parsed = safeParseJSON(text);
+    const scenarios = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.scenarios) ? parsed.scenarios : []);
+    return { scenarios, usage };
+}
+
+const LIVE_SITE_TESTCASE_INSTRUCTIONS = `You are an expert QA automation engineer writing Playwright test scripts.
+You are given a test scenario, the accessibility snapshot of a live website, and the target URL.
+
+Rules:
+- Write a COMPLETE, self-contained Playwright test using @playwright/test (import { test, expect } from '@playwright/test').
+- The test will run against the live site via baseURL config — use page.goto('/') or relative paths.
+- Use accessibility-friendly selectors: getByRole, getByText, getByLabel, getByPlaceholder, getByTestId.
+- Include meaningful assertions that verify the scenario's expected behavior.
+- Handle loading states with waitForSelector or expect(...).toBeVisible().
+- The script must be raw JavaScript code, NOT wrapped in markdown fences.
+- Do NOT hardcode absolute URLs — rely on baseURL from Playwright config.
+
+Return ONLY valid JSON.`;
+
+const LIVE_SITE_TESTCASE_SCHEMA = {
+    type: 'object',
+    properties: {
+        testCases: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    testCaseId:  { type: 'string' },
+                    title:       { type: 'string' },
+                    steps: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                action:         { type: 'string' },
+                                expectedResult: { type: 'string' }
+                            },
+                            required: ['action', 'expectedResult'],
+                            additionalProperties: false
+                        }
+                    },
+                    testScript:  { type: 'string' },
+                    language:    { type: 'string', enum: ['javascript'] },
+                    testData:    { type: 'object', additionalProperties: { type: 'string' } }
+                },
+                required: ['testCaseId', 'title', 'steps', 'testScript', 'language', 'testData'],
+                additionalProperties: false
+            }
+        }
+    },
+    required: ['testCases'],
+    additionalProperties: false
+};
+
+/**
+ * Generate Playwright test scripts for a single scenario against a live site.
+ */
+async function generateLiveSiteTestCases({ scenario, siteSnapshot, baseUrl }) {
+    const prompt = `Generate 1-3 concrete Playwright test cases for this scenario. Each test case must:
+- Have a unique testCaseId in format: TCN-${scenario.id}-<index>
+- Have clear steps as objects with "action" and "expectedResult" string fields
+- Have a complete, runnable testScript (raw JS code using @playwright/test)
+- Set language to "javascript"
+- Include testData as a flat object of key-value string pairs (empty {} if none)
+- Use page.goto('/') to start (baseURL is configured)
+
+[TARGET URL]: ${baseUrl || '(unknown)'}
+
+Scenario to cover:
+  ID: ${scenario.id}
+  Title: ${scenario.title}
+  Description: ${scenario.description || '(no description)'}
+  Type: ${scenario.type || 'Happy Path'}
+  Priority: ${scenario.priority || 'Medium'}
+
+[LIVE SITE SNAPSHOT — accessibility tree / DOM structure]:
+${siteSnapshot || '(No snapshot available.)'}`;
+
+    const trimmed = ensureWithinBudget(prompt, PROMPT_TOKEN_BUDGET, 'generateLiveSiteTestCases');
+    await assertTokenLimit(trimmed, DEFAULT_MODEL);
+
+    const _startMs = Date.now();
+    emitLlmTrace({ caller: 'generateLiveSiteTestCases', model: DEFAULT_MODEL, phase: 'request', prompt: trimmed });
+
+    const response = await client.responses.create({
+        model: DEFAULT_MODEL,
+        instructions: LIVE_SITE_TESTCASE_INSTRUCTIONS,
+        input: trimmed,
+        max_output_tokens: MAX_OUTPUT_TOKENS_GEN,
+        store: true,
+        text: {
+            format: {
+                type: 'json_schema',
+                name: 'LiveSiteTestCases',
+                schema: LIVE_SITE_TESTCASE_SCHEMA,
+                strict: true
+            },
+            verbosity: OUTPUT_VERBOSITY
+        },
+        reasoning: { effort: TESTCASE_EFFORT, summary: REASONING_SUMMARY },
+        ...buildCacheParams('qa:livesite:testcases')
+    });
+
+    const text = extractResponseText(response);
+    const usage = extractUsage(response);
+    emitLlmTrace({
+        caller: 'generateLiveSiteTestCases', model: DEFAULT_MODEL, phase: 'response',
+        response: text, durationMs: Date.now() - _startMs, responseId: response.id, usage
+    });
+
+    const parsed = safeParseJSON(text);
+    const testCases = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.testCases) ? parsed.testCases : []);
+    return { testCases, interactionId: response.id || null, usage };
+}
+
 module.exports = {
     client,
+    setLlmRunContext,
+    getLlmRunContext,
     DEFAULT_MODEL,
     SCENARIO_EFFORT,
     TESTCASE_EFFORT,
@@ -1209,6 +1876,7 @@ module.exports = {
     assertTokenLimit,
     ensureWithinBudget,
     PROMPT_TOKEN_BUDGET,
+    MAPPING_TOKEN_BUDGET,
     isStaleChainError,
     createConversation,
     buildStatefulParams,
@@ -1217,5 +1885,8 @@ module.exports = {
     generateTestScenarios,
     generateTestScenariosForEpic,
     generateTestCasesForScenario,
-    repairTestCaseScript
+    repairTestCaseScript,
+    normalizeTestCaseSteps,
+    generateLiveSiteScenarios,
+    generateLiveSiteTestCases
 };

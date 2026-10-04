@@ -8,7 +8,9 @@ function safeJsonParse(text, fallback) {
     try { return JSON.parse(text); } catch { return fallback; }
 }
 
-const dbPath = path.join(__dirname, 'data', 'autoqa.db');
+const dbPath = process.env.AUTOQA_DB_PATH
+    ? path.resolve(process.env.AUTOQA_DB_PATH)
+    : path.join(__dirname, 'data', 'autoqa.db');
 
 let db;
 
@@ -16,6 +18,9 @@ function initDb() {
     // Ensure data directory exists
     if (!fs.existsSync(path.join(__dirname, 'data'))) {
         fs.mkdirSync(path.join(__dirname, 'data'));
+    }
+    if (!fs.existsSync(path.join(__dirname, 'data', 'artifacts'))) {
+        fs.mkdirSync(path.join(__dirname, 'data', 'artifacts'));
     }
 
     db = new Database(dbPath);
@@ -126,6 +131,19 @@ function initDb() {
         // Columns already exist or table doesn't exist yet — both fine.
     }
 
+    // Safe migration: add runType to run_history for distinguishing PR / Jira / live-site runs.
+    try {
+        const columns = db.pragma('table_info(run_history)');
+        if (!columns.find(c => c.name === 'runType')) {
+            db.exec("ALTER TABLE run_history ADD COLUMN runType TEXT DEFAULT 'pr'");
+        }
+        if (!columns.find(c => c.name === 'targetUrl')) {
+            db.exec('ALTER TABLE run_history ADD COLUMN targetUrl TEXT');
+        }
+    } catch (e) {
+        // Column already exists or table doesn't exist yet — both fine.
+    }
+
     // Safe migration: add regression bookkeeping to test_cases so bug-fix
     // regression runs can record a clean pass vs adapted (healed) vs regression_fail,
     // and keep the original failing script + output as a potential regression signal.
@@ -178,6 +196,310 @@ function initDb() {
         CREATE INDEX IF NOT EXISTS idx_runs_repo      ON run_history(repoFullName);
         CREATE INDEX IF NOT EXISTS idx_runs_project   ON run_history(localProjectId);
     `);
+
+    migrateDbV2();
+}
+
+/** User-facing schema batch id (increment when adding migrations below). */
+const DB_MIGRATION_VERSION = 3;
+
+function migrateDbV2() {
+    try {
+        const v = Number(db.pragma('user_version', { simple: true }));
+        if (v >= DB_MIGRATION_VERSION) return;
+
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS llm_trace_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                runId TEXT NOT NULL,
+                traceLabel TEXT,
+                phase TEXT,
+                requestPayload TEXT,
+                responsePayload TEXT,
+                tokenUsage TEXT,
+                createdAt TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_trace_run_created ON llm_trace_rows(runId, createdAt);
+
+            CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                deliveryId TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                receivedAt TEXT NOT NULL,
+                payloadHash TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS heal_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scenarioId TEXT NOT NULL,
+                failureSignature TEXT NOT NULL,
+                workingFixSummary TEXT,
+                createdAt TEXT NOT NULL,
+                expiresAt TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_heal_patterns_scenario ON heal_patterns(scenarioId, expiresAt);
+
+            CREATE TABLE IF NOT EXISTS reference_examples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                framework TEXT NOT NULL,
+                scriptBody TEXT NOT NULL,
+                scenarioType TEXT,
+                useCount INTEGER DEFAULT 1,
+                lastUsedAt TEXT,
+                qualityScore REAL DEFAULT 1.0,
+                UNIQUE(framework, scenarioType)
+            );
+        `);
+
+        try {
+            db.exec(`
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_run_history_active_pr
+                ON run_history(prUrl) WHERE status = 'running' AND prUrl IS NOT NULL AND length(trim(prUrl)) > 0;
+            `);
+        } catch (e) {
+            console.warn('[DB] idx_run_history_active_pr skipped or failed:', e.message);
+        }
+
+        const addRunCol = (name, sqlType) => {
+            const cols = db.pragma('table_info(run_history)');
+            if (!cols.find(c => c.name === name)) {
+                db.exec(`ALTER TABLE run_history ADD COLUMN ${name} ${sqlType}`);
+            }
+        };
+        addRunCol('input_tokens_total', 'INTEGER DEFAULT 0');
+        addRunCol('output_tokens_total', 'INTEGER DEFAULT 0');
+        addRunCol('cached_tokens_total', 'INTEGER DEFAULT 0');
+        addRunCol('overall_success', 'INTEGER');
+        addRunCol('finished_passed_count', 'INTEGER');
+        addRunCol('finished_failed_count', 'INTEGER');
+        addRunCol('finished_test_case_count', 'INTEGER');
+
+        const tcCols = db.pragma('table_info(test_cases)');
+        if (!tcCols.find(c => c.name === 'heal_exhausted')) {
+            db.exec('ALTER TABLE test_cases ADD COLUMN heal_exhausted INTEGER DEFAULT 0');
+        }
+        if (!tcCols.find(c => c.name === 'schema_version')) {
+            db.exec('ALTER TABLE test_cases ADD COLUMN schema_version INTEGER DEFAULT 1');
+        }
+        if (!tcCols.find(c => c.name === 'source')) {
+            db.exec("ALTER TABLE test_cases ADD COLUMN source TEXT DEFAULT 'scenario'");
+        }
+
+        const rtmCols = db.pragma('table_info(rtm_scenarios)');
+        if (!rtmCols.find(c => c.name === 'schema_version')) {
+            db.exec('ALTER TABLE rtm_scenarios ADD COLUMN schema_version INTEGER DEFAULT 1');
+        }
+        if (!rtmCols.find(c => c.name === 'map_attempts')) {
+            db.exec('ALTER TABLE rtm_scenarios ADD COLUMN map_attempts INTEGER DEFAULT 0');
+        }
+        if (!rtmCols.find(c => c.name === 'map_hits')) {
+            db.exec('ALTER TABLE rtm_scenarios ADD COLUMN map_hits INTEGER DEFAULT 0');
+        }
+        if (!rtmCols.find(c => c.name === 'test_pass_count')) {
+            db.exec('ALTER TABLE rtm_scenarios ADD COLUMN test_pass_count INTEGER DEFAULT 0');
+        }
+        if (!rtmCols.find(c => c.name === 'test_fail_count')) {
+            db.exec('ALTER TABLE rtm_scenarios ADD COLUMN test_fail_count INTEGER DEFAULT 0');
+        }
+
+        db.pragma(`user_version = ${DB_MIGRATION_VERSION}`);
+    } catch (e) {
+        console.error('[DB] migrateDbV2 failed:', e.message);
+        throw e;
+    }
+}
+
+function insertWebhookDelivery(deliveryId, source, payloadHash = null) {
+    if (!deliveryId) return { inserted: true };
+    try {
+        db.prepare(`
+            INSERT INTO webhook_deliveries (deliveryId, source, receivedAt, payloadHash)
+            VALUES (@deliveryId, @source, @receivedAt, @payloadHash)
+        `).run({
+            deliveryId,
+            source,
+            receivedAt: new Date().toISOString(),
+            payloadHash
+        });
+        return { inserted: true };
+    } catch (e) {
+        if (String(e.message).includes('UNIQUE')) return { inserted: false };
+        throw e;
+    }
+}
+
+function pruneOldWebhookDeliveries(retentionDays) {
+    const d = Number(retentionDays);
+    if (!Number.isFinite(d) || d <= 0) return 0;
+    const cutoff = new Date(Date.now() - d * 864e5).toISOString();
+    const r = db.prepare('DELETE FROM webhook_deliveries WHERE receivedAt < ?').run(cutoff);
+    return r.changes;
+}
+
+function getActiveRunByPrUrl(prUrl) {
+    if (!prUrl) return null;
+    const row = db.prepare(
+        `SELECT runId FROM run_history WHERE prUrl = ? AND status = 'running' ORDER BY createdAt DESC LIMIT 1`
+    ).get(prUrl);
+    return row || null;
+}
+
+function insertLlmTraceRow(row) {
+    db.prepare(`
+        INSERT INTO llm_trace_rows (runId, traceLabel, phase, requestPayload, responsePayload, tokenUsage, createdAt)
+        VALUES (@runId, @traceLabel, @phase, @requestPayload, @responsePayload, @tokenUsage, @createdAt)
+    `).run({
+        runId: row.runId || '__none__',
+        traceLabel: row.traceLabel || null,
+        phase: row.phase || null,
+        requestPayload: row.requestPayload != null ? String(row.requestPayload) : null,
+        responsePayload: row.responsePayload != null ? String(row.responsePayload) : null,
+        tokenUsage: row.tokenUsage != null ? (typeof row.tokenUsage === 'string' ? row.tokenUsage : JSON.stringify(row.tokenUsage)) : null,
+        createdAt: row.createdAt || new Date().toISOString()
+    });
+}
+
+function listLlmTracesByRun(runId, { limit = 500, offset = 0 } = {}) {
+    return db.prepare(
+        `SELECT * FROM llm_trace_rows WHERE runId = ? ORDER BY id ASC LIMIT ? OFFSET ?`
+    ).all(runId, Math.min(limit, 2000), offset);
+}
+
+function addRunTokenUsage(runId, { inputTokens = 0, outputTokens = 0, cachedTokens = 0 } = {}) {
+    if (!runId || runId === '__jira_sync__') return;
+    db.prepare(`
+        UPDATE run_history SET
+            input_tokens_total = COALESCE(input_tokens_total, 0) + @inTok,
+            output_tokens_total = COALESCE(output_tokens_total, 0) + @outTok,
+            cached_tokens_total = COALESCE(cached_tokens_total, 0) + @cachedTok
+        WHERE runId = @runId
+    `).run({
+        runId,
+        inTok: Number(inputTokens) || 0,
+        outTok: Number(outputTokens) || 0,
+        cachedTok: Number(cachedTokens) || 0
+    });
+}
+
+function listDlqEvents({ status, source, limit = 50, offset = 0 } = {}) {
+    let sql = 'SELECT * FROM dead_letter_queue WHERE 1=1';
+    const args = [];
+    if (status) {
+        sql += ' AND status = ?';
+        args.push(status);
+    }
+    if (source) {
+        sql += ' AND source = ?';
+        args.push(source);
+    }
+    sql += ' ORDER BY createdAt DESC LIMIT ? OFFSET ?';
+    args.push(Math.min(limit, 200), offset);
+    return db.prepare(sql).all(...args).map(res => ({
+        ...res,
+        payload: safeJsonParse(res.payload, {})
+    }));
+}
+
+function getDlqEvent(id) {
+    const row = db.prepare('SELECT * FROM dead_letter_queue WHERE id = ?').get(id);
+    if (!row) return null;
+    return { ...row, payload: safeJsonParse(row.payload, {}) };
+}
+
+function updateDlqStatus(id, status, error = null) {
+    db.prepare('UPDATE dead_letter_queue SET status = ?, error = COALESCE(?, error), retryCount = retryCount + 1 WHERE id = ?').run(status, error, id);
+}
+
+function upsertHealPattern({ scenarioId, failureSignature, workingFixSummary, expiresAt }) {
+    db.prepare(`
+        INSERT INTO heal_patterns (scenarioId, failureSignature, workingFixSummary, createdAt, expiresAt)
+        VALUES (@scenarioId, @failureSignature, @workingFixSummary, @createdAt, @expiresAt)
+    `).run({
+        scenarioId,
+        failureSignature,
+        workingFixSummary: workingFixSummary || '',
+        createdAt: new Date().toISOString(),
+        expiresAt: expiresAt || null
+    });
+}
+
+function findHealPatternsForScenario(scenarioId) {
+    const now = new Date().toISOString();
+    return db.prepare(
+        `SELECT * FROM heal_patterns WHERE scenarioId = ? AND (expiresAt IS NULL OR expiresAt > ?) ORDER BY id DESC LIMIT 5`
+    ).all(scenarioId, now);
+}
+
+function pruneExpiredHealPatterns() {
+    const now = new Date().toISOString();
+    return db.prepare('DELETE FROM heal_patterns WHERE expiresAt IS NOT NULL AND expiresAt <= ?').run(now).changes;
+}
+
+function getTopReferenceExamples(framework, limit = 3) {
+    const rows = db.prepare(
+        `SELECT * FROM reference_examples WHERE framework = ? ORDER BY useCount DESC, lastUsedAt DESC LIMIT ?`
+    ).all(String(framework || 'jest'), Math.min(limit, 10));
+    return rows;
+}
+
+function bumpReferenceExample(framework, scenarioType, scriptBody) {
+    const fw = String(framework || 'jest');
+    const st = scenarioType != null ? String(scenarioType) : '';
+    const body = String(scriptBody || '').slice(0, 12000);
+    const now = new Date().toISOString();
+    db.prepare(`
+        INSERT INTO reference_examples (framework, scriptBody, scenarioType, useCount, lastUsedAt, qualityScore)
+        VALUES (@fw, @body, @st, 1, @now, 1.0)
+        ON CONFLICT(framework, scenarioType) DO UPDATE SET
+            useCount = useCount + 1,
+            lastUsedAt = @now,
+            scriptBody = excluded.scriptBody
+    `).run({ fw, body, st, now });
+}
+
+function incrementScenarioMappingStats(projectKey, scenarioIds, mappedIds) {
+    const hit = new Set((mappedIds || []).map(String));
+    for (const sid of scenarioIds || []) {
+        const isHit = hit.has(String(sid));
+        db.prepare(`
+            UPDATE rtm_scenarios SET
+                map_attempts = COALESCE(map_attempts, 0) + 1,
+                map_hits = COALESCE(map_hits, 0) + ?
+            WHERE scenarioId = ? AND (projectKey = ? OR (projectKey IS NULL AND ? IS NULL))
+        `).run(isHit ? 1 : 0, sid, projectKey ?? null, projectKey ?? null);
+    }
+}
+
+function incrementScenarioTestOutcome(scenarioId, passed) {
+    if (!scenarioId) return;
+    const col = passed ? 'test_pass_count' : 'test_fail_count';
+    db.prepare(`UPDATE rtm_scenarios SET ${col} = COALESCE(${col}, 0) + 1 WHERE scenarioId = ?`).run(scenarioId);
+}
+
+function getHealExhaustedByProject(projectKey) {
+    if (!projectKey) return [];
+    return db.prepare(`
+        SELECT tc.* FROM test_cases tc
+        WHERE tc.projectKey = ? AND COALESCE(tc.heal_exhausted, 0) = 1 AND tc.status = 'fail'
+        ORDER BY tc.lastRunAt DESC
+        LIMIT 200
+    `).all(projectKey).map(r => ({
+        ...r,
+        steps: safeJsonParse(r.steps, []),
+        testData: safeJsonParse(r.testData, {}),
+        codeFiles: safeJsonParse(r.codeFiles, [])
+    }));
+}
+
+function finalizeRunSuccess(runId, overallSuccessBool) {
+    db.prepare(`
+        UPDATE run_history SET overall_success = ?, status = ?, completedAt = ?
+        WHERE runId = ?
+    `).run(
+        overallSuccessBool ? 1 : 0,
+        overallSuccessBool ? 'completed' : 'failed',
+        new Date().toISOString(),
+        runId
+    );
 }
 
 function publishToDLQ(source, payload, errorMsg) {
@@ -256,11 +578,13 @@ function markScenariosObsolete(projectKey, epicId, activeIds = []) {
 function createRun(runId, data) {
     const stmt = db.prepare(`
         INSERT INTO run_history (
-            runId, repoFullName, prUrl, status, createdAt, completedAt, 
-            events, logs, llm_traces, scenario_statuses, localProjectId
+            runId, repoFullName, prUrl, status, createdAt, completedAt,
+            events, logs, llm_traces, scenario_statuses, localProjectId,
+            runType, targetUrl
         ) VALUES (
             @runId, @repoFullName, @prUrl, @status, @createdAt, @completedAt,
-            @events, @logs, @llm_traces, @scenario_statuses, @localProjectId
+            @events, @logs, @llm_traces, @scenario_statuses, @localProjectId,
+            @runType, @targetUrl
         )
     `);
     stmt.run({
@@ -274,7 +598,9 @@ function createRun(runId, data) {
         logs: JSON.stringify(data.logs || []),
         llm_traces: JSON.stringify(data.llm_traces || []),
         scenario_statuses: JSON.stringify(data.scenario_statuses || {}),
-        localProjectId: data.localProjectId || null
+        localProjectId: data.localProjectId || null,
+        runType: data.runType || 'pr',
+        targetUrl: data.targetUrl || null
     });
 }
 
@@ -293,7 +619,16 @@ function updateRun(runId, patch) {
             events = @events,
             logs = @logs,
             llm_traces = @llm_traces,
-            scenario_statuses = @scenario_statuses
+            scenario_statuses = @scenario_statuses,
+            input_tokens_total = @input_tokens_total,
+            output_tokens_total = @output_tokens_total,
+            cached_tokens_total = @cached_tokens_total,
+            overall_success = @overall_success,
+            finished_passed_count = @finished_passed_count,
+            finished_failed_count = @finished_failed_count,
+            finished_test_case_count = @finished_test_case_count,
+            runType = @runType,
+            targetUrl = @targetUrl
         WHERE runId = @runId
     `);
     
@@ -306,10 +641,26 @@ function updateRun(runId, patch) {
         events: JSON.stringify(merged.events || []),
         logs: JSON.stringify(merged.logs || []),
         llm_traces: JSON.stringify(merged.llm_traces || []),
-        scenario_statuses: JSON.stringify(merged.scenario_statuses || {})
+        scenario_statuses: JSON.stringify(merged.scenario_statuses || {}),
+        input_tokens_total: merged.input_tokens_total ?? 0,
+        output_tokens_total: merged.output_tokens_total ?? 0,
+        cached_tokens_total: merged.cached_tokens_total ?? 0,
+        overall_success: merged.overall_success !== undefined && merged.overall_success !== null
+            ? merged.overall_success
+            : null,
+        finished_passed_count: merged.finished_passed_count === undefined || merged.finished_passed_count === null
+            ? null
+            : Number(merged.finished_passed_count),
+        finished_failed_count: merged.finished_failed_count === undefined || merged.finished_failed_count === null
+            ? null
+            : Number(merged.finished_failed_count),
+        finished_test_case_count: merged.finished_test_case_count === undefined || merged.finished_test_case_count === null
+            ? null
+            : Number(merged.finished_test_case_count),
+        runType: merged.runType || 'pr',
+        targetUrl: merged.targetUrl || null
     });
 }
-
 function getRun(runId) {
     const stmt = db.prepare('SELECT * FROM run_history WHERE runId = ?');
     const row = stmt.get(runId);
@@ -402,6 +753,7 @@ function upsertTestCase(tc) {
             status, version, previousVersionId, codeFiles, healAttempts,
             conversationId, latestResponseId,
             regression, originalScript, originalFailureOutput,
+            heal_exhausted, schema_version, source,
             createdAt, lastRunAt
         ) VALUES (
             @testCaseId, @scenarioId, @projectKey, @runId, @prUrl,
@@ -409,6 +761,7 @@ function upsertTestCase(tc) {
             @status, @version, @previousVersionId, @codeFiles, @healAttempts,
             @conversationId, @latestResponseId,
             @regression, @originalScript, @originalFailureOutput,
+            @heal_exhausted, @schema_version, @source,
             @createdAt, @lastRunAt
         )
         ON CONFLICT(testCaseId) DO UPDATE SET
@@ -417,6 +770,9 @@ function upsertTestCase(tc) {
             testData              = excluded.testData,
             steps                 = excluded.steps,
             healAttempts          = excluded.healAttempts,
+            heal_exhausted        = COALESCE(excluded.heal_exhausted, test_cases.heal_exhausted),
+            schema_version        = COALESCE(excluded.schema_version, test_cases.schema_version),
+            source                  = COALESCE(excluded.source, test_cases.source),
             conversationId        = COALESCE(excluded.conversationId, test_cases.conversationId),
             latestResponseId      = COALESCE(excluded.latestResponseId, test_cases.latestResponseId),
             regression            = COALESCE(excluded.regression, test_cases.regression),
@@ -445,6 +801,9 @@ function upsertTestCase(tc) {
         regression:            tc.regression || null,
         originalScript:        tc.originalScript || null,
         originalFailureOutput: tc.originalFailureOutput || null,
+        heal_exhausted:        tc.heal_exhausted != null ? tc.heal_exhausted : 0,
+        schema_version:        tc.schema_version ?? 1,
+        source:                  tc.source || 'scenario',
         createdAt:             tc.createdAt || new Date().toISOString(),
         lastRunAt:             tc.lastRunAt || null
     });
@@ -538,9 +897,16 @@ function getStorySyncRecordsByProject(localProjectId) {
  */
 function deleteRunData(runId) {
     db.transaction(() => {
+        db.prepare('DELETE FROM llm_trace_rows WHERE runId = ?').run(runId);
         db.prepare('DELETE FROM test_cases WHERE runId = ?').run(runId);
         db.prepare('DELETE FROM run_history WHERE runId = ?').run(runId);
     })();
+    try {
+        const artDir = path.join(__dirname, 'data', 'artifacts', runId);
+        fs.rmSync(artDir, { recursive: true, force: true });
+    } catch (e) {
+        console.warn(`[DB] Artifact cleanup warning for ${runId}: ${e.message}`);
+    }
 }
 
 /**
@@ -551,6 +917,8 @@ function clearAllPipelineExecutionData() {
     db.transaction(() => {
         db.prepare('DELETE FROM test_cases').run();
         db.prepare('DELETE FROM run_history').run();
+        db.prepare('DELETE FROM llm_trace_rows').run();
+        db.prepare('DELETE FROM webhook_deliveries').run();
         db.prepare('DELETE FROM dead_letter_queue').run();
         db.prepare(`
             UPDATE rtm_scenarios SET
@@ -560,6 +928,13 @@ function clearAllPipelineExecutionData() {
                 lastRunDate = NULL
         `).run();
     })();
+    try {
+        const artifactsRoot = path.join(__dirname, 'data', 'artifacts');
+        fs.rmSync(artifactsRoot, { recursive: true, force: true });
+        fs.mkdirSync(artifactsRoot, { recursive: true });
+    } catch (e) {
+        console.warn(`[DB] Artifact dir clear warning: ${e.message}`);
+    }
 }
 
 module.exports = {
@@ -567,6 +942,24 @@ module.exports = {
     initDb,
     publishToDLQ,
     getDLQEvents,
+    listDlqEvents,
+    getDlqEvent,
+    updateDlqStatus,
+    insertWebhookDelivery,
+    pruneOldWebhookDeliveries,
+    getActiveRunByPrUrl,
+    insertLlmTraceRow,
+    listLlmTracesByRun,
+    addRunTokenUsage,
+    upsertHealPattern,
+    findHealPatternsForScenario,
+    pruneExpiredHealPatterns,
+    getTopReferenceExamples,
+    bumpReferenceExample,
+    incrementScenarioMappingStats,
+    incrementScenarioTestOutcome,
+    getHealExhaustedByProject,
+    finalizeRunSuccess,
     upsertScenario,
     getScenariosByProject,
     markScenariosObsolete,
@@ -585,5 +978,6 @@ module.exports = {
     getTestCasesByProject,
     getTestCasesByRun,
     deleteRunData,
-    clearAllPipelineExecutionData
+    clearAllPipelineExecutionData,
+    DB_MIGRATION_VERSION
 };

@@ -9,6 +9,7 @@ import ProjectSettings from './pages/ProjectSettings';
 import PipelineRunsList from './pages/PipelineRunsList';
 import ScriptDetail from './pages/ScriptDetail';
 import AgentChatDebug from './pages/AgentChatDebug';
+import LiveSiteTesting from './pages/LiveSiteTesting';
 
 // Create context for global state
 export const AppContext = createContext();
@@ -17,25 +18,12 @@ export const useAppContext = () => useContext(AppContext);
 
 function App() {
   const [activeRuns, setActiveRuns] = useState([]);
-  const [settings, setSettings] = useState({
-    reasoningModel: 'gpt-5.4',
-    codingModel: 'gpt-5.4-mini',
-    largeContextModel: 'gpt-5.4'
-  });
-  const [dashboardMetrics, setDashboardMetrics] = useState({
-    activeSandboxes: 0,
-    healingSuccessRate: 0,
-    mergesBlocked: 0
-  });
-  const [branchPolicies, setBranchPolicies] = useState([]);
-  const [sandboxMatrix, setSandboxMatrix] = useState([]);
-  const [healingHistory, setHealingHistory] = useState([]);
-  const [auditLogs, setAuditLogs] = useState([]);
-  const [selectedRun, setSelectedRun] = useState(null);
   const [toast, setToast] = useState(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0); // For forcing child components to re-fetch data
   const [llmTraces, setLlmTraces] = useState([]);
+  const [vncContainers, setVncContainers] = useState([]); // Live browser VNC containers
+  const [liveExecution, setLiveExecution] = useState(null); // Currently executing test case
   const [darkMode, setDarkMode] = useState(() => {
     const stored = localStorage.getItem('darkMode');
     return stored === 'true';
@@ -81,6 +69,10 @@ function App() {
       setRefreshKey((prev) => prev + 1);
     });
 
+    socket.on('jira_queue_updated', () => {
+      setRefreshKey((prev) => prev + 1);
+    });
+
     socket.on('jira_run_updated', (data) => {
       if (data.status === 'completed') {
         setToast({ message: `Jira run completed for ${data.issueKey}`, type: 'success' });
@@ -92,6 +84,11 @@ function App() {
       }
     });
 
+    socket.on('live_site_run_started', (data) => {
+        setToast({ message: `Live site testing started for ${data.targetUrl}`, type: 'info' });
+        setTimeout(() => setToast(null), 5000);
+    });
+
     socket.on('refresh_data', () => {
         setRefreshKey(prev => prev + 1); // Trigger useEffects in child components
     });
@@ -100,29 +97,33 @@ function App() {
         setLlmTraces(prev => [...prev.slice(-199), trace]); // keep last 200
     });
 
+    // --- Live browser VNC events ---
+    socket.on('sandbox_vnc_ready', (data) => {
+        setVncContainers(prev => {
+            // Avoid duplicates
+            if (prev.some(c => c.containerId === data.containerId && c.runId === data.runId)) return prev;
+            return [...prev, data];
+        });
+    });
+
+    socket.on('run_updated', (updateData) => {
+        // Clear VNC containers when run completes
+        if (updateData.type === 'complete') {
+            setVncContainers([]);
+            setLiveExecution(null);
+        }
+    });
+
+    socket.on('test_execution_started', (data) => {
+        setLiveExecution(data);
+    });
+
+    socket.on('test_execution_ended', () => {
+        setLiveExecution(null);
+    });
+
     return () => socket.disconnect();
   }, []);
-
-  useEffect(() => {
-    const loadData = async () => {
-      try {
-        const storedSettings = localStorage.getItem('settings');
-        
-        if (storedSettings) {
-          setSettings(JSON.parse(storedSettings));
-        }
-      } catch (error) {
-        console.error('Error loading data:', error);
-      }
-    };
-    
-    loadData();
-  }, []);
-
-  // Persist settings to localStorage
-  useEffect(() => {
-    localStorage.setItem('settings', JSON.stringify(settings));
-  }, [settings]);
 
   const showToast = (message, type = 'info') => {
     setToast({ message, type });
@@ -142,29 +143,17 @@ function App() {
 
   const toggleDarkMode = () => setDarkMode(prev => !prev);
 
-  const updateSettings = (newSettings) => {
-    setSettings(newSettings);
-    showToast('Settings updated successfully!', 'success');
-  };
-
   const contextValue = {
     activeRuns,
     setActiveRuns,
-    settings,
-    updateSettings,
-    dashboardMetrics,
-    branchPolicies,
-    sandboxMatrix,
-    healingHistory,
-    auditLogs,
-    selectedRun,
-    setSelectedRun,
     showToast,
     sidebarCollapsed,
     setSidebarCollapsed,
     refreshKey, // Exporting to child components to trigger data refresh automatically
     llmTraces,
     setLlmTraces,
+    vncContainers,
+    liveExecution,
     darkMode,
     toggleDarkMode
   };
@@ -174,7 +163,7 @@ function App() {
       <Router>
         <div className={`flex min-h-screen ${darkMode ? 'bg-[#0D1117]' : 'bg-[#F4F5F7]'}`}>
           <Sidebar />
-          <div className={`flex-1 flex flex-col transition-all duration-300 ${sidebarCollapsed ? 'ml-16' : 'ml-64'}`}>
+          <div className={`flex-1 flex flex-col transition-all duration-300 ${sidebarCollapsed ? 'ml-16' : 'ml-56'}`}>
             <Navbar />
             <main className={`flex-1 p-6 overflow-auto ${darkMode ? 'text-[#E6EDF3]' : 'text-[#172B4D]'}`}>
               <Routes>
@@ -183,6 +172,7 @@ function App() {
                 <Route path="/projects/:projectId/settings" element={<ProjectSettings />} />
                 <Route path="/pipelines" element={<PipelineRunsList />} />
                 <Route path="/projects/:projectId/run/:runId/scripts" element={<ScriptDetail />} />
+                <Route path="/live-site-testing" element={<LiveSiteTesting />} />
                 <Route path="/llm-traces" element={<AgentChatDebug />} />
               </Routes>
             </main>

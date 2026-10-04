@@ -1,71 +1,105 @@
 const { fetchPRDetails, fetchFullFileContents, inferTestFilePaths, fetchPRDependencies } = require('./services/githubService');
-const { cleanupSandboxPool, createSandboxPool, executeTest } = require('./services/sandboxService');
+const {
+    preparePrGitWorkspace,
+    readFilesFromWorkspace,
+    readDepsFromWorkspace
+} = require('./services/prGitWorkspace');
+const { cleanupSandboxPool, createSandboxPool } = require('./services/sandboxService');
 const { findProjectByGithubRepo } = require('./services/projectStore');
+const { readSandboxEnv } = require('./services/sandboxEnvStore');
+const { getDefaultTestAccountsForPipeline } = require('./services/defaultTestAccountsStore');
 const { getDocsForProject } = require('./services/documentAssociationStore');
 const { extractTextFromFiles } = require('./services/documentParserService');
 const { mapPrChangesToScenarios } = require('./services/prScenarioMappingService');
 const { classifyPrAsBugFix } = require('./services/prClassificationService');
-const { generateTestCasesForScenario, repairTestCaseScript } = require('./services/llmService');
-
+const { pruneFileContentForContext } = require('./services/astPrunerService');
+const { generateTestCasesForScenario, setLlmRunContext } = require('./services/llmService');
+const { CURRENT_SCHEMA_VERSION } = require('./schemas');
 const {
-    updateRun, createRun, getScenariosByProject,
+    MAX_HEAL_ATTEMPTS, mapPool, buildGenerationSummaryEntry,
+    createEventLogger, executeWithPool, executeTestCaseWithRetries
+} = require('./pipelineHelpers');
+
+const fssync = require('fs');
+const {
+    createRun, getScenariosByProject,
     getTestCasesByProject, getTestCasesByScenario, markTestCaseSuperseded,
-    upsertTestCase, updateTestCaseStatus
+    upsertTestCase,
+    incrementScenarioMappingStats
 } = require('./db');
 
-const MAX_HEAL_ATTEMPTS = 3;
+/** Max concurrent OpenAI test-case generation calls per run (improves prompt-cache routing vs unbounded fan-out). */
+const LLM_GEN_MAX_CONCURRENT = Math.max(1, parseInt(process.env.AUTOQA_LLM_MAX_CONCURRENT_GENERATION || '4', 10) || 4);
+
+/** Recent completed scenarios passed as alreadyGeneratedSummary (0 = disable). */
+const LLM_ALREADY_GENERATED_MAX = Math.max(0, parseInt(process.env.AUTOQA_LLM_ALREADY_GENERATED_MAX_ENTRIES || '12', 10) || 12);
 
 // ---------------------------------------------------------------------------
-// Event logger: writes to DB and broadcasts via Socket.IO
+// PR file classification
 // ---------------------------------------------------------------------------
-function createEventLogger(runId) {
-    return (type, data) => {
-        const updateParams = {};
-        let logsMsg = null;
-
-        if (type === 'phase_update') {
-            updateParams.status = data.status;
-            logsMsg = `[Phase] ${data.phase}: ${data.status}`;
-        } else if (type === 'log') {
-            console.log(`[Pipeline] ${data.level}: ${data.message}`);
-            logsMsg = data.message;
-        } else if (type === 'pr_details') {
-            updateParams.prDetails = data;
-        } else if (type === 'init') {
-            updateParams.repoFullName = data.repoFullName;
-        } else if (type === 'complete') {
-            updateParams.status = data.success ? 'completed' : 'failed';
-            updateParams.completedAt = new Date().toISOString();
-        } else if (type === 'error') {
-            updateParams.status = 'failed';
-            logsMsg = `[ERROR] ${data.message}`;
-        } else if (type === 'run_summary_updated') {
-            // Store compact summary in events list for fast row rendering
-            updateParams.events = [{ type: 'run_summary_updated', data, timestamp: new Date().toISOString() }];
-        } else if (type === 'test_case_attempt') {
-            // Store each attempt as a detailed event for View Details
-            updateParams.events = [{ type: 'test_case_attempt', data, timestamp: new Date().toISOString() }];
-        } else if (type === 'scenario_execution_updated') {
-            updateParams.events = [{ type: 'scenario_execution_updated', data, timestamp: new Date().toISOString() }];
-        }
-
-        if (logsMsg) {
-            updateParams.logs = [{ timestamp: new Date().toISOString(), level: data.level || 'INFO', message: logsMsg }];
-        }
-
-        updateRun(runId, updateParams);
-
-        if (global.io) {
-            global.io.emit('run_updated', { runId, type, data });
-            global.io.emit('refresh_data');
-        }
-    };
+function shouldSkipFileForFallback(filename) {
+    const n = String(filename || '').replace(/\\/g, '/');
+    if (!n.trim()) return true;
+    const lower = n.toLowerCase();
+    const ext = lower.includes('.') ? lower.slice(lower.lastIndexOf('.')) : '';
+    const skipExts = new Set(['.md', '.json', '.lock', '.yaml', '.yml', '.env', '.gitignore', '.css', '.scss', '.svg', '.png', '.jpg', '.jpeg', '.ico']);
+    if (skipExts.has(ext) || lower.endsWith('.gitignore')) return true;
+    if (lower.endsWith('.d.ts')) return true;
+    if (lower.endsWith('.config.js') || lower.endsWith('.config.ts') || lower.endsWith('.config.cjs')) return true;
+    const skipPathBits = ['/node_modules/', '/__tests__/', '/test/', '/spec/', '/dist/', '/build/', '/migrations/', '/devscripts/'];
+    if (skipPathBits.some(b => lower.includes(b))) return true;
+    return false;
 }
+
+function isFrontendPathForFallback(filename) {
+    const n = String(filename || '').replace(/\\/g, '/');
+    const lower = n.toLowerCase();
+    if (/\.(jsx|tsx|vue|svelte)$/i.test(lower)) return true;
+    if (/\/src\/(components|pages|views|screens|ui)\//i.test(n)) return true;
+    const inClientArea = /\/(frontend|client|web)\//i.test(lower) && !lower.includes('/node_modules/');
+    if (inClientArea) return true;
+    return false;
+}
+
+function isBackendPathForFallback(filename) {
+    const n = String(filename || '').replace(/\\/g, '/');
+    const lower = n.toLowerCase();
+    if (/\.(js|ts)$/i.test(lower) && !lower.endsWith('.d.ts')) return true;
+    if (/\/(api|routes|services|controllers|middleware|backend)\//i.test(lower)) return true;
+    return false;
+}
+
+/**
+ * GitHub PR file list → entries with fileType backend|frontend; non-code paths dropped.
+ * @param {Array<{ filename: string, patch?: string }>} prFiles
+ */
+function classifyChangedFiles(prFiles) {
+    const out = [];
+    for (const f of prFiles || []) {
+        const filename = f.filename;
+        if (!filename || shouldSkipFileForFallback(filename)) continue;
+        let fileType = null;
+        if (isFrontendPathForFallback(filename)) fileType = 'frontend';
+        else if (isBackendPathForFallback(filename)) fileType = 'backend';
+        else continue;
+        out.push({
+            filename,
+            patch: typeof f.patch === 'string' ? f.patch : '',
+            fileType
+        });
+    }
+    return out;
+}
+
 
 // ---------------------------------------------------------------------------
 // PR scenario mapping (unchanged from previous version)
 // ---------------------------------------------------------------------------
-async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent) {
+/**
+ * Runs PR scenario mapping using optional pre-built prDetails from a git workspace (REST-sparing).
+ * @param {{ bootstrapPrDetails?: object | null }} [opts]
+ */
+async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent, opts = {}) {
     try {
         const linkedProject = findProjectByGithubRepo(repoFullName);
         if (!linkedProject?.id) {
@@ -81,8 +115,14 @@ async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent) {
         }
 
         const docs = getDocsForProject(linkedProject.id);
+        const seeded = opts.bootstrapPrDetails || null;
+        const prDetailsLoader = seeded ? Promise.resolve(seeded) : fetchPRDetails(prUrl);
         const [prDetails, documentTexts] = await Promise.all([
-            fetchPRDetails(prUrl),
+            prDetailsLoader.then((p) => {
+                const d = p && typeof p === 'object' ? p : {};
+                if (!d._prUrl) d._prUrl = prUrl;
+                return d;
+            }),
             extractTextFromFiles(docs)
         ]);
         sendEvent('log', { level: 'INFO', message: `PR mapping: fetched PR with ${prDetails?.files?.length || 0} changed file(s): ${(prDetails?.files || []).map(f => f.filename).join(', ')}` });
@@ -94,6 +134,15 @@ async function attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent) {
         const mapping = await mapPrChangesToScenarios({ prDetails, jiraRtmEntry, documentTexts });
         sendEvent('pr_scenario_mapping', { mappings: mapping.mappings });
         sendEvent('log', { level: 'INFO', message: `PR mapping complete: ${mapping.mappings?.length || 0} scenario links found.` });
+
+        try {
+            const pk = linkedProject.jiraProjectKey || linkedProject.id;
+            const mappedIds = (mapping.mappings || []).map((m) => m.scenarioId || m.id).filter(Boolean);
+            const allIds = projectScenarios.map((s) => s.scenarioId).filter(Boolean);
+            incrementScenarioMappingStats(pk, allIds, mappedIds);
+        } catch (mapStatErr) {
+            sendEvent('log', { level: 'WARN', message: `PR mapping stats update skipped: ${mapStatErr.message}` });
+        }
 
         return { ...mapping, _prDetails: prDetails };
     } catch (error) {
@@ -127,11 +176,23 @@ async function buildCodeContext(prDetails) {
             return !NON_CODE_EXTS.has(ext);
         });
 
+    if (prDetails._workspaceRoot && fssync.existsSync(prDetails._workspaceRoot)) {
+        const [fullFiles, testFiles, dependencies] = await Promise.all([
+            readFilesFromWorkspace(prDetails._workspaceRoot, changedPaths),
+            readFilesFromWorkspace(prDetails._workspaceRoot, inferTestFilePaths(changedPaths), { quiet: true })
+                .then(r => r.filter(f => !f.content.startsWith('// Could not fetch'))),
+            readDepsFromWorkspace(prDetails._workspaceRoot).catch(() => 'Not available')
+        ]);
+        return { fullFiles, testFiles, dependencies };
+    }
+
     const [fullFiles, testFiles, dependencies] = await Promise.all([
         fetchFullFileContents(owner, repo, ref, changedPaths),
         fetchFullFileContents(owner, repo, ref, inferTestFilePaths(changedPaths), { quiet: true })
             .then(r => r.filter(f => !f.content.startsWith('// Could not fetch'))),
-        fetchPRDependencies(`https://github.com/${owner}/${repo}/pull/${(prDetails._prUrl || '').split('/').pop() || '1'}`)
+        fetchPRDependencies(`https://github.com/${owner}/${repo}/pull/${(prDetails._prUrl || '').split('/').pop() || '1'}`, {
+            workspaceRoot: prDetails._workspaceRoot
+        })
             .catch(() => 'Not available')
     ]);
 
@@ -153,279 +214,7 @@ function detectRefinementCandidates(repoFullName, prChangedFilenames) {
         .map(tc => ({ testCase: tc, scenarioId: tc.scenarioId }));
 }
 
-// ---------------------------------------------------------------------------
-// Concurrent Sandbox Pool Execution Queue
-// ---------------------------------------------------------------------------
-async function executeWithPool(tasks, pool, executeFn) {
-    if (!pool || pool.length === 0) throw new Error('No containers in pool');
-    const availableContainers = [...pool];
-    const executing = [];
 
-    for (const task of tasks) {
-        const processTask = async (taskItem) => {
-            while (availableContainers.length === 0) {
-                await new Promise(r => setTimeout(r, 50));
-            }
-            const container = availableContainers.pop();
-            try {
-                await executeFn(taskItem, container);
-            } finally {
-                availableContainers.push(container);
-            }
-        };
-
-        const p = processTask(task).then(() => {
-            executing.splice(executing.indexOf(p), 1);
-        });
-        executing.push(p);
-
-        if (executing.length >= pool.length) {
-            await Promise.race(executing);
-        }
-    }
-
-    await Promise.all(executing);
-}
-
-// ---------------------------------------------------------------------------
-// Hard-limit retry controller — the core of the new stateful approach
-// ---------------------------------------------------------------------------
-async function executeTestCaseWithRetries({
-    testCase, containerName, sandboxDir, runId, prUrl, codeContextSection,
-    linkedProject, refinementCandidates, sendEvent,
-    runSummary,
-    regressionMode = false,
-    scenarioDescription = ''
-}) {
-    let currentScript = testCase.testScript;
-    let finalStatus = 'fail';
-    let healAttempts = 0;
-
-    // Regression mode only: capture the pristine script + the first failure output
-    // so we can surface them as a potential-regression signal even when healing succeeds.
-    const originalScriptSnapshot = regressionMode ? (testCase.testScript || '') : null;
-    let firstFailureOutput = null;
-
-    // Stateful bookkeeping for the conversation between the pipeline and the LLM:
-    //   - conversationId: shared Conversations API id for this test case (preferred chain mechanism)
-    //   - currentInteractionId: latest response.id, used as fallback/zdr-mode chain
-    // Both are populated from the initial test-case generation call and mutated after every heal.
-    let conversationId = testCase.conversationId || null;
-    let currentInteractionId = testCase.latestResponseId || testCase.generationInteractionId || null;
-
-    // Manual history — used only as a fallback when neither conversation nor previous_response_id is available.
-    const attemptHistory = [];
-
-    // Encrypted reasoning items (ZDR mode only). Passed back in each subsequent
-    // heal call so the model retains its chain-of-thought across attempts even
-    // when the Conversations API / previous_response_id path is unavailable.
-    let currentReasoningItems = null;
-
-    for (let attempt = 1; attempt <= MAX_HEAL_ATTEMPTS; attempt++) {
-        const attemptStartedAt = new Date().toISOString();
-
-        updateTestCaseStatus(testCase.testCaseId, 'running', attemptStartedAt);
-        testCase.status = 'running';
-
-        sendEvent('test_case_attempt', {
-            testCaseId: testCase.testCaseId,
-            scenarioId: testCase.scenarioId,
-            attempt,
-            status: 'running',
-            startedAt: attemptStartedAt
-        });
-        sendEvent('log', { level: 'INFO', message: `[Sandbox] ${testCase.testCaseId} attempt ${attempt}/${MAX_HEAL_ATTEMPTS}` });
-
-        // Run the script inside the persistent container.
-        // testCase.testData is passed separately and injected as a preamble by the sandbox,
-        // so the script can reference all fixture values via the testData variable.
-        const sandboxResult = await executeTest(
-            containerName,
-            sandboxDir,
-            testCase.language || 'javascript',
-            currentScript,
-            `test_${testCase.testCaseId}_attempt${attempt}.spec.${testCase.language === 'python' ? 'py' : 'js'}`,
-            testCase.testData || {}
-        );
-
-        const attemptEndedAt = new Date().toISOString();
-
-        if (sandboxResult.success) {
-            runSummary.passedCount++;
-            runSummary.runningCount = Math.max(0, runSummary.runningCount - 1);
-        }
-        const genLeft = runSummary.scenariosGeneratingLeft ?? 0;
-        const progressLine = `[Sandbox][${testCase.runId || runId}] ${testCase.testCaseId} attempt ${attempt}/${MAX_HEAL_ATTEMPTS}: ${sandboxResult.success ? 'PASS' : 'FAIL'}. Tests still without final verdict: ${runSummary.runningCount}; scenario(s) still generating: ${genLeft}`;
-        console.log(progressLine);
-        sendEvent('log', { level: 'INFO', message: progressLine });
-
-        if (sandboxResult.success) {
-            finalStatus = 'pass';
-
-            // Regression stamping: clean_pass when the pristine script passed first try,
-            // 'adapted' when healing had to change it to make it green.
-            const regressionStamp = regressionMode
-                ? (healAttempts === 0 ? 'clean_pass' : 'adapted')
-                : null;
-
-            // Persist final passing script back onto the test case
-            upsertTestCase({
-                ...testCase,
-                testScript: currentScript,
-                status: 'pass',
-                healAttempts,
-                conversationId,
-                latestResponseId: currentInteractionId,
-                regression:            regressionStamp,
-                originalScript:        regressionStamp === 'adapted' ? originalScriptSnapshot : null,
-                originalFailureOutput: regressionStamp === 'adapted' ? firstFailureOutput : null,
-                lastRunAt: attemptEndedAt
-            });
-
-            sendEvent('test_case_attempt', {
-                testCaseId: testCase.testCaseId,
-                scenarioId: testCase.scenarioId,
-                attempt,
-                status: 'pass',
-                output: sandboxResult.output,
-                regression: regressionStamp,
-                startedAt: attemptStartedAt,
-                endedAt: attemptEndedAt
-            });
-            sendEvent('log', {
-                level: 'INFO',
-                message: regressionStamp === 'adapted'
-                    ? `[Sandbox] ${testCase.testCaseId}: PASS on attempt ${attempt} (adapted — original failure retained as potential regression)`
-                    : `[Sandbox] ${testCase.testCaseId}: PASS on attempt ${attempt}`
-            });
-            break;
-        }
-
-        // Record this failure in the history before healing
-        const failureOutput = sandboxResult.output || sandboxResult.error || 'No output';
-        // Keep the TAIL of the failure output, not the head — stack traces and
-        // "expected X got Y" lines are almost always at the end. Older code
-        // kept the first 1500 chars which usually showed only boot/log noise.
-        attemptHistory.push({
-            attemptNumber: attempt,
-            scriptUsed: currentScript,
-            failureOutput: failureOutput.slice(-3500)
-        });
-
-        // Regression mode: remember the very first failure so we can retain it
-        // alongside an adapted/healed script as a potential-regression signal.
-        if (regressionMode && firstFailureOutput === null) {
-            firstFailureOutput = failureOutput;
-        }
-
-        // Failed — record the attempt
-        sendEvent('test_case_attempt', {
-            testCaseId: testCase.testCaseId,
-            scenarioId: testCase.scenarioId,
-            attempt,
-            status: 'fail',
-            failureOutput,
-            scriptSnapshot: currentScript,
-            regression: regressionMode ? 'pending' : null,
-            startedAt: attemptStartedAt,
-            endedAt: attemptEndedAt
-        });
-        const failureSnippet = failureOutput.slice(0, 2000);
-        sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId}: FAIL on attempt ${attempt}` });
-        sendEvent('log', { level: 'WARN', message: `[Sandbox] ${testCase.testCaseId} failure output: ${failureSnippet}` });
-
-        if (attempt < MAX_HEAL_ATTEMPTS) {
-            healAttempts++;
-            runSummary.retryCount++;
-            const healMode = conversationId
-                ? `stateful (conversation=${conversationId})`
-                : (currentInteractionId ? `stateful (previous_response_id=${currentInteractionId})` : 'stateless (manual history)');
-            sendEvent('log', { level: 'INFO', message: `[Healing] Requesting patch for ${testCase.testCaseId} (attempt ${attempt + 1}, ${healMode})...` });
-            updateTestCaseStatus(testCase.testCaseId, 'healing');
-            testCase.status = 'healing';
-            try {
-                const healResult = await repairTestCaseScript({
-                    testCase: { ...testCase, testScript: currentScript },
-                    failureOutput,
-                    codeContextSection,
-                    attemptNumber: attempt + 1,
-                    conversationId,
-                    previousInteractionId: currentInteractionId,
-                    attemptHistory,
-                    priorReasoningItems: currentReasoningItems,
-                    scenarioDescription
-                });
-                currentScript = healResult.repairedScript;
-                currentInteractionId = healResult.interactionId || currentInteractionId;
-                // Refresh encrypted reasoning items for the next heal (ZDR mode).
-                // Non-ZDR modes return [] here, which harmlessly overrides nothing.
-                if (Array.isArray(healResult.reasoningItems) && healResult.reasoningItems.length > 0) {
-                    currentReasoningItems = healResult.reasoningItems;
-                }
-                // Stale-chain signal from llmService — the stored conversationId
-                // is invalid (expired/deleted). Drop it so we don't keep trying
-                // the same dead anchor on every subsequent heal.
-                if (healResult.chainWasStale) {
-                    sendEvent('log', { level: 'WARN', message: `[Healing] Stored conversation/response anchor was stale — continuing stateless.` });
-                    conversationId = null;
-                    currentInteractionId = healResult.interactionId || null;
-                }
-
-                // Persist the latest response id so a server restart can resume the chain.
-                upsertTestCase({
-                    ...testCase,
-                    testScript: currentScript,
-                    healAttempts,
-                    conversationId,
-                    latestResponseId: currentInteractionId,
-                    status: 'running'
-                });
-                testCase.status = 'running';
-            } catch (healErr) {
-                sendEvent('log', { level: 'ERROR', message: `[Healing] LLM repair failed: ${healErr.message}` });
-                break;
-            }
-        }
-    }
-
-    if (finalStatus === 'fail') {
-        runSummary.failedCount++;
-        runSummary.runningCount = Math.max(0, runSummary.runningCount - 1);
-
-        const regressionStamp = regressionMode ? 'regression_fail' : null;
-
-        upsertTestCase({
-            ...testCase,
-            testScript: currentScript,
-            status: 'fail',
-            healAttempts,
-            conversationId,
-            latestResponseId: currentInteractionId,
-            regression:            regressionStamp,
-            originalScript:        regressionMode ? originalScriptSnapshot : null,
-            originalFailureOutput: regressionMode ? firstFailureOutput : null,
-            lastRunAt: new Date().toISOString()
-        });
-
-        sendEvent('test_case_attempt', {
-            testCaseId: testCase.testCaseId,
-            scenarioId: testCase.scenarioId,
-            attempt: MAX_HEAL_ATTEMPTS,
-            status: 'final_fail',
-            regression: regressionStamp,
-            endedAt: new Date().toISOString()
-        });
-        sendEvent('log', {
-            level: 'ERROR',
-            message: regressionMode
-                ? `[Regression] ${testCase.testCaseId}: REGRESSION FAIL — existing script could not be made green after ${MAX_HEAL_ATTEMPTS} attempts (${healAttempts} heal(s))`
-                : `[Sandbox] ${testCase.testCaseId}: FINAL FAIL after ${MAX_HEAL_ATTEMPTS} attempts (${healAttempts} heal(s))`
-        });
-    }
-
-    updateTestCaseStatus(testCase.testCaseId, finalStatus);
-    return finalStatus;
-}
 
 // ---------------------------------------------------------------------------
 // Epic-wide regression runner
@@ -443,7 +232,8 @@ async function executeTestCaseWithRetries({
 // ---------------------------------------------------------------------------
 async function runEpicRegression({
     runId, prUrl, mappedScenarios, linkedProject, prDetails,
-    codeContextSection, sandboxPool, sendEvent, runSummary
+    codeContextSection, sandboxPool, sendEvent, runSummary,
+    configuredTestAccounts = null
 }) {
     // 1. Resolve which epic(s) the PR touches via the mapped scenarios.
     const projectKey = linkedProject?.jiraProjectKey || linkedProject?.id;
@@ -516,7 +306,6 @@ async function runEpicRegression({
     });
 
     // 4. Execute every test case against the PR's code concurrently in pool
-    let overallSuccess = false;
     sendEvent('phase_update', { phase: 'Regression Execution', status: 'running' });
 
     const scenarioResults = {};
@@ -552,12 +341,12 @@ async function runEpicRegression({
             sendEvent,
             runSummary,
             regressionMode: true,
-            scenarioDescription: scenario.description || ''
+            scenarioDescription: scenario.description || '',
+            configuredTestAccounts
         });
 
         if (tcStatus === 'pass') {
             scenarioResults[scenario.scenarioId].passed++;
-            overallSuccess = true;
         } else {
             scenarioResults[scenario.scenarioId].failed++;
         }
@@ -585,18 +374,47 @@ async function runEpicRegression({
     }
 
     sendEvent('phase_update', { phase: 'Regression Execution', status: 'completed' });
+
+    const overallSuccess = scenarioPlans.every((p) => {
+        const r = scenarioResults[p.scenario.scenarioId];
+        return r && r.failed === 0 && r.passed > 0;
+    });
+
     return { success: overallSuccess, scenarios: scenarioPlans.map((p) => p.scenario.scenarioId) };
 }
 
 // ---------------------------------------------------------------------------
 // Main pipeline entry point
 // ---------------------------------------------------------------------------
+
 async function runPipeline(runId, prUrl, repoFullName) {
+    setLlmRunContext(runId);
+
+    let sendEvent;
+    try {
+        try {
+            const linkedProjectEarly = findProjectByGithubRepo(repoFullName);
+            const localEarly = linkedProjectEarly?.id || null;
+            createRun(runId, { status: 'running', repoFullName, localProjectId: localEarly, prUrl });
+        } catch (createErr) {
+            if (createErr && createErr.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+                console.warn('[Pipeline] Duplicate active run for same PR skipped:', prUrl);
+                setLlmRunContext(null);
+                return;
+            }
+            throw createErr;
+        }
+
+        sendEvent = createEventLogger(runId);
+        sendEvent('init', { repoFullName });
+    } catch (outer) {
+        setLlmRunContext(null);
+        throw outer;
+    }
+
     const linkedProject = findProjectByGithubRepo(repoFullName);
     const localProjectId = linkedProject?.id || null;
-    createRun(runId, { status: 'running', repoFullName, localProjectId });
-    const sendEvent = createEventLogger(runId);
-    sendEvent('init', { repoFullName });
+    const configuredTestAccounts = localProjectId ? getDefaultTestAccountsForPipeline(localProjectId) : null;
 
     // Shared counters emitted to UI as compact summary on each row
     const runSummary = {
@@ -611,26 +429,86 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
     const emitSummary = () => sendEvent('run_summary_updated', { runId, ...runSummary });
 
-    // Declared here so the catch block can always clean up the pool.
+    // Declared here so the catch/finally block can always clean up the pool and PR workspace.
     let _sandboxPool = null;
+    let _prWsCleanup = null;
 
     try {
         // Phase 1: Initializing
         sendEvent('phase_update', { phase: 'Initializing', status: 'running' });
         sendEvent('phase_update', { phase: 'Initializing', status: 'completed' });
 
-        // Phase 2: PR Mapping
+        // Phase 2: PR Mapping — optional git-first workspace (suppresses REST listFiles + per-file pulls)
         sendEvent('phase_update', { phase: 'PR Mapping', status: 'running' });
-        const prMapping = await attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent);
+
+        const useRestFiles = /^1|true|yes$/i.test(String(process.env.AUTOQA_PR_USE_REST_FILES || '').trim());
+        let bootstrapPrDetails = null;
+        if (!useRestFiles) {
+            sendEvent('log', {
+                level: 'INFO',
+                message: '[PR ingest] Git-first mode: materializing PR via local git checkout (mapping/context skip REST listFiles getContent/raw).'
+            });
+            try {
+                const { prDetails: wsDetails, cleanup } = await preparePrGitWorkspace(runId, prUrl);
+                bootstrapPrDetails = wsDetails;
+                _prWsCleanup = cleanup;
+                sendEvent('log', {
+                    level: 'INFO',
+                    message: `[PR ingest] Git workspace ready: ${wsDetails.files?.length || 0} changed file(s) at ${wsDetails._workspaceRoot}`
+                });
+            } catch (wsErr) {
+                sendEvent('log', {
+                    level: 'WARN',
+                    message: `[PR ingest] Git workspace failed (${wsErr.message}); falling back to REST file listing.`
+                });
+            }
+        } else {
+            sendEvent('log', {
+                level: 'INFO',
+                message: '[PR ingest] AUTOQA_PR_USE_REST_FILES set — legacy REST listFiles + raw fetches for PR files.'
+            });
+        }
+
+        const prMapping = await attachPrScenarioMapping(runId, prUrl, repoFullName, sendEvent, {
+            bootstrapPrDetails
+        });
         sendEvent('phase_update', { phase: 'PR Mapping', status: 'completed' });
 
         const mappedScenarios = prMapping?.mappings || [];
+        const hasMappedScenarios = mappedScenarios.length > 0;
         runSummary.scenarioCount = mappedScenarios.length;
         emitSummary();
 
-        if (mappedScenarios.length === 0) {
-            sendEvent('log', { level: 'WARN', message: 'No scenarios mapped to this PR — nothing to test.' });
-            sendEvent('complete', { success: true });
+        let prDetails = prMapping?._prDetails || bootstrapPrDetails || null;
+        if (!prDetails) {
+            prDetails = await fetchPRDetails(prUrl);
+        }
+        if (prDetails && typeof prDetails === 'object' && !prDetails._prUrl) {
+            prDetails._prUrl = prUrl;
+        }
+
+        const classifiedAll = classifyChangedFiles(prDetails.files || []);
+        const coveredFilenames = new Set(
+            mappedScenarios.flatMap((m) =>
+                (Array.isArray(m.impactedFiles) ? m.impactedFiles : [])
+                    .map((x) => String(x || '').trim())
+                    .filter(Boolean)
+            )
+        );
+
+        if (!hasMappedScenarios) {
+            const reason = classifiedAll.length === 0
+                ? 'No scenarios mapped and no testable PR files — nothing to run.'
+                : `No scenarios mapped (0/${mappedScenarios.length}) despite ${classifiedAll.length} testable file(s). The mapping LLM could not link PR changes to any known scenario. Verify scenario descriptions cover the changed functionality, or reduce PR scope.`;
+            sendEvent('log', { level: 'WARN', message: reason });
+            sendEvent('phase_update', { phase: 'Test Generation', status: 'skipped' });
+            sendEvent('phase_update', { phase: 'Sandbox Testing', status: 'skipped' });
+            sendEvent('complete', {
+                success: true,
+                passedCount: runSummary.passedCount,
+                failedCount: runSummary.failedCount,
+                testCaseCount: runSummary.passedCount + runSummary.failedCount
+            });
             return;
         }
 
@@ -643,14 +521,16 @@ async function runPipeline(runId, prUrl, repoFullName) {
         const rtmRows = rtmProjectKey ? (getScenariosByProject(rtmProjectKey) || []) : [];
         const rtmById = new Map(rtmRows.map(r => [r.scenarioId, r]));
         const enrichedCount = mappedScenarios.reduce((acc, m) => acc + (rtmById.has(m.scenarioId || m.id) ? 1 : 0), 0);
-        sendEvent('log', { level: 'INFO', message: `[Enrichment] Resolved ${enrichedCount}/${mappedScenarios.length} mapped scenarios against RTM rows (project "${rtmProjectKey || 'n/a'}").` });
+        sendEvent('log', {
+            level: 'INFO',
+            message: `[Enrichment] Resolved ${enrichedCount}/${mappedScenarios.length} mapped scenario(s) against RTM rows (project "${rtmProjectKey || 'n/a'}").`
+        });
 
         // Phase 2.5 + 3 + Sandbox — run in parallel.
         // Classification, code context fetch, and sandbox creation are all
         // independent and only need prDetails. Running them concurrently
         // saves 15-30 seconds per run (Docker clone + npm install overlaps
         // with LLM classification + GitHub file fetches).
-        const prDetails = prMapping?._prDetails || await fetchPRDetails(prUrl);
         const regressionFeatureEnabled = String(process.env.REGRESSION_ENABLED || 'true').toLowerCase() !== 'false';
 
         // --- Classification task (async) ---
@@ -693,8 +573,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // --- Sandbox task (async) ---
         const sandboxTask = (async () => {
             sendEvent('phase_update', { phase: 'Sandbox Setup', status: 'running' });
-            // Spin up a pool of 2 Docker containers for parallel testing
-            const pool = await createSandboxPool(runId, prDetails, 2);
+            const sandboxEnvForRun = localProjectId ? readSandboxEnv(localProjectId) : {};
+            const pool = await createSandboxPool(runId, prDetails, 2, { sandboxEnv: sandboxEnvForRun });
             sendEvent('log', { level: 'INFO', message: `[Sandbox] Created pool of ${pool.length} containers` });
             sendEvent('phase_update', { phase: 'Sandbox Setup', status: 'completed' });
             return pool;
@@ -705,13 +585,30 @@ async function runPipeline(runId, prUrl, repoFullName) {
             classifyTask, codeContextTask
         ]);
 
-        // Build single concatenated context string for LLM prompts
+        // Build single concatenated context string for LLM prompts (prune very large files for token budget)
         const codeContextSection = [
-            ...(codeContext.fullFiles || []).map(f => `=== FILE: ${f.path} ===\n${f.content}`),
-            ...(codeContext.testFiles || []).map(f => `=== EXISTING TEST: ${f.path} ===\n${f.content}`)
+            ...(codeContext.fullFiles || []).map(f => {
+                const text = pruneFileContentForContext(f.path, f.content, {
+                    onPrune: p => sendEvent('log', { level: 'DEBUG', message: `[Code context] Pruned large file body for tokens: ${p}` })
+                });
+                return `=== FILE: ${f.path} ===\n${text}`;
+            }),
+            ...(codeContext.testFiles || []).map(f => {
+                const text = pruneFileContentForContext(f.path, f.content, {
+                    onPrune: p => sendEvent('log', { level: 'DEBUG', message: `[Code context] Pruned large file body for tokens: ${p}` })
+                });
+                return `=== EXISTING TEST: ${f.path} ===\n${text}`;
+            })
         ].join('\n\n');
 
+        const NON_CODE_EXTS_DIFF = new Set(['.md', '.txt', '.rst', '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.lock', '.log', '.webm', '.mp4', '.zip']);
+        const codeContextPaths = new Set((codeContext.fullFiles || []).map(f => f.path));
         const prDiffSection = (prDetails.files || [])
+            .filter(f => {
+                const ext = f.filename.includes('.') ? '.' + f.filename.split('.').pop().toLowerCase() : '';
+                return !NON_CODE_EXTS_DIFF.has(ext);
+            })
+            .filter(f => !codeContextPaths.has(f.filename))
             .map(f => `--- ${f.filename} ---\n${f.patch || '(no patch)'}`)
             .join('\n\n');
 
@@ -729,12 +626,14 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
         // ------------------------------------------------------------------
         // Regression path: PR classified as a bug fix — re-run existing test
-        // cases for every scenario in every epic the PR touches. Skip the
-        // normal generation loop.
+        // cases for every scenario in every epic the PR touches. Skip mapped
+        // scenario generation.
         // ------------------------------------------------------------------
-        if (regressionFeatureEnabled && classification.isBugFix) {
+        if (regressionFeatureEnabled && classification.isBugFix && mappedScenarios.length > 0) {
             sendEvent('log', { level: 'INFO', message: '[Pipeline] Entering epic-wide regression path (bug fix PR). Waiting for sandbox pool...' });
+            
             sendEvent('phase_update', { phase: 'Test Generation', status: 'skipped' });
+            
             runSummary.scenariosGeneratingLeft = 0;
 
             const sandboxPool = await sandboxTask;
@@ -749,7 +648,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 codeContextSection,
                 sandboxPool,
                 sendEvent,
-                runSummary
+                runSummary,
+                configuredTestAccounts
             });
 
             overallSuccess = regressionResult.success;
@@ -763,7 +663,12 @@ async function runPipeline(runId, prUrl, repoFullName) {
 
             emitSummary();
             cleanupSandboxPool(runId, sandboxPool);
-            sendEvent('complete', { success: overallSuccess });
+            sendEvent('complete', {
+                success: overallSuccess,
+                passedCount: runSummary.passedCount,
+                failedCount: runSummary.failedCount,
+                testCaseCount: runSummary.passedCount + runSummary.failedCount
+            });
             return;
         }
 
@@ -780,7 +685,7 @@ async function runPipeline(runId, prUrl, repoFullName) {
         const executionQueue = [];
         let isGenerationFinished = false;
         const scenarioResults = {};
-        
+
         for (const m of mappedScenarios) {
             scenarioResults[m.id || m.scenarioId] = { passed: 0, failed: 0 };
         }
@@ -818,12 +723,12 @@ async function runPipeline(runId, prUrl, repoFullName) {
                             refinementCandidates,
                             sendEvent,
                             runSummary,
-                            scenarioDescription
+                            scenarioDescription,
+                            configuredTestAccounts
                         });
 
                         if (tcStatus === 'pass') {
                             scenarioResults[scenarioId].passed++;
-                            overallSuccess = true;
                         } else {
                             scenarioResults[scenarioId].failed++;
                         }
@@ -837,20 +742,26 @@ async function runPipeline(runId, prUrl, repoFullName) {
                         });
                     } finally {
                         availableContainers.push(container);
-                        executing.splice(executing.indexOf(p), 1);
+                        const idx = executing.indexOf(p);
+                        if (idx !== -1) executing.splice(idx, 1);
                     }
                 })();
-                
-                // Clear out from executing array when done
-                p.finally(() => {
-                    executing.splice(executing.indexOf(p), 1);
-                });
+
                 executing.push(p);
             }
         })();
 
-        // Map over all scenarios and run LLM generation in parallel
-        const generationPromises = mappedScenarios.map(async (scenarioMapping) => {
+        // Test-case LLM generation: bounded concurrency + sliding-window summary for dedupe hints
+        const generationSummary = [];
+        sendEvent('log', {
+            level: 'INFO',
+            message: `Test-case LLM pool: max ${LLM_GEN_MAX_CONCURRENT} concurrent; already-covered hint window=${LLM_ALREADY_GENERATED_MAX}`
+        });
+
+        const generatedResults = (await mapPool(
+            mappedScenarios,
+            LLM_GEN_MAX_CONCURRENT,
+            async (scenarioMapping) => {
             try {
             const scenarioId = scenarioMapping.id || scenarioMapping.scenarioId;
             // Merge RTM row (authoritative for description, type, priority,
@@ -863,6 +774,11 @@ async function runPipeline(runId, prUrl, repoFullName) {
             const scenarioPriority = scenarioMapping.priority || rtmRow.priority || 'Medium';
             const scenarioTitle = rtmRow.title || '';
             const scenarioAcRef = Array.isArray(rtmRow.acceptanceCriteriaRef) ? rtmRow.acceptanceCriteriaRef : [];
+
+            const alreadyGeneratedSummary =
+                LLM_ALREADY_GENERATED_MAX > 0
+                    ? generationSummary.slice(-LLM_ALREADY_GENERATED_MAX)
+                    : [];
 
             sendEvent('scenario_execution_updated', {
                 scenarioId,
@@ -899,21 +815,36 @@ async function runPipeline(runId, prUrl, repoFullName) {
                     prDiffSection,
                     dependenciesSection: codeContext.dependencies || '',
                     refinementContext,
-                    alreadyGeneratedSummary: [], // Context tracking removed to allow parallel execution
+                    alreadyGeneratedSummary,
                     conversationId: priorConversationId,
-                    previousInteractionId: priorResponseId
+                    previousInteractionId: priorResponseId,
+                    configuredTestAccounts
                 });
                 generatedTestCases = genResult.testCases;
                 generationInteractionId = genResult.interactionId;
                 scenarioConversationId = genResult.conversationId || scenarioConversationId;
                 sendEvent('log', { level: 'INFO', message: `[Generation] conversation=${scenarioConversationId || 'n/a'} response=${generationInteractionId || 'unavailable'} (stateful chain anchors)` });
             } catch (genErr) {
+                scenarioResults[scenarioId].failed++;
                 sendEvent('log', { level: 'ERROR', message: `Test case generation failed for ${scenarioId}: ${genErr.message}` });
                 sendEvent('scenario_execution_updated', { scenarioId, status: 'error', totals: { passed: 0, failed: 0, running: 0 } });
                 return null;
             }
 
             sendEvent('log', { level: 'INFO', message: `Generated ${generatedTestCases.length} test case(s) for ${scenarioId}` });
+
+            if (generatedTestCases.length > 0) {
+                generationSummary.push(
+                    buildGenerationSummaryEntry(scenarioId, scenarioTitle, scenarioType, generatedTestCases)
+                );
+            }
+
+            if (generatedTestCases.length === 0) {
+                scenarioResults[scenarioId].failed++;
+                sendEvent('log', { level: 'WARN', message: `[Generation] Scenario ${scenarioId}: model returned zero test cases — counted as failure for run success rollup.` });
+                sendEvent('scenario_execution_updated', { scenarioId, status: 'fail', totals: { passed: 0, failed: 0, running: 0 } });
+                return { scenarioId, persistedCases: [], scenarioDescription };
+            }
             runSummary.testCaseCount += generatedTestCases.length;
             runSummary.runningCount += generatedTestCases.length;
             emitSummary();
@@ -943,7 +874,8 @@ async function runPipeline(runId, prUrl, repoFullName) {
                     conversationId:          scenarioConversationId,
                     latestResponseId:        generationInteractionId,
                     generationInteractionId,
-                    createdAt:               new Date().toISOString()
+                    createdAt:               new Date().toISOString(),
+                    schema_version:          CURRENT_SCHEMA_VERSION
                 };
                 upsertTestCase(saved);
                 persistedCases.push(saved);
@@ -964,11 +896,9 @@ async function runPipeline(runId, prUrl, repoFullName) {
                 runSummary.scenariosGeneratingLeft = Math.max(0, runSummary.scenariosGeneratingLeft - 1);
                 emitSummary();
             }
-        });
+            }
+        )).filter(Boolean);
 
-        // Wait for all scenarios to finish generating in parallel
-        const generatedResults = (await Promise.all(generationPromises)).filter(Boolean);
-        
         // Signal that no more test cases will be queued
         isGenerationFinished = true;
         sendEvent('phase_update', { phase: 'Test Generation', status: 'completed' });
@@ -976,15 +906,24 @@ async function runPipeline(runId, prUrl, repoFullName) {
         // Wait for the background executor to finish the remaining queue and all active executions
         await executionTaskPromise;
 
+        const scenarioRollupOk = mappedScenarios.every((m) => {
+            const sid = m.id || m.scenarioId;
+            const r = scenarioResults[sid];
+            return r && r.failed === 0 && r.passed > 0;
+        });
+
+        overallSuccess = scenarioRollupOk;
+
         // Finalize statuses for Phase 5
-        for (const result of generatedResults) {
-            const { passed, failed } = scenarioResults[result.scenarioId];
+        for (const m of mappedScenarios) {
+            const scenarioId = m.id || m.scenarioId;
+            const { passed, failed } = scenarioResults[scenarioId];
             const scenarioStatus = failed === 0 && passed > 0 ? 'pass'
                 : passed === 0 ? 'fail'
                 : 'partial';
 
             sendEvent('scenario_execution_updated', {
-                scenarioId: result.scenarioId,
+                scenarioId,
                 status: scenarioStatus,
                 totals: { passed, failed, running: 0 }
             });
@@ -1005,7 +944,12 @@ async function runPipeline(runId, prUrl, repoFullName) {
         if (_sandboxPool) {
             cleanupSandboxPool(runId, _sandboxPool);
         }
-        sendEvent('complete', { success: overallSuccess });
+        sendEvent('complete', {
+            success: overallSuccess,
+            passedCount: runSummary.passedCount,
+            failedCount: runSummary.failedCount,
+            testCaseCount: runSummary.passedCount + runSummary.failedCount
+        });
 
     } catch (error) {
         console.error('\n================ PIPELINE CRASHED =================');
@@ -1014,10 +958,24 @@ async function runPipeline(runId, prUrl, repoFullName) {
         sendEvent('phase_update', { phase: 'Test Generation', status: 'error' });
         sendEvent('log', { level: 'ERROR', message: `Fatal Error: ${error.message}` });
         sendEvent('error', { message: error.message });
-        sendEvent('complete', { success: false });
+        sendEvent('complete', {
+            success: false,
+            passedCount: runSummary.passedCount,
+            failedCount: runSummary.failedCount,
+            testCaseCount: runSummary.passedCount + runSummary.failedCount
+        });
         if (_sandboxPool) {
             cleanupSandboxPool(runId, _sandboxPool);
         }
+    } finally {
+        try {
+            if (typeof _prWsCleanup === 'function') {
+                await _prWsCleanup();
+            }
+        } catch (cleanupErr) {
+            console.warn('[Pipeline] PR workspace cleanup failed:', cleanupErr.message);
+        }
+        setLlmRunContext(null);
     }
 }
 

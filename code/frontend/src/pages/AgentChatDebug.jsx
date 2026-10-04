@@ -1,5 +1,11 @@
 import React, { useEffect, useRef, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useAppContext } from '../App';
+
+const API_BASE =
+  typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL
+    ? String(import.meta.env.VITE_API_BASE_URL).replace(/\/$/, '')
+    : 'http://localhost:3001';
 import { Bot, User, Activity, Trash2, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
 
 const CALLER_LABELS = {
@@ -8,6 +14,7 @@ const CALLER_LABELS = {
     generateTestScenarios:           'Generate Scenarios (Story)',
     generateTestScenariosForEpic:    'Generate Scenarios (Epic)',
     mapPrChangesToScenarios:         'PR → Scenario Mapping',
+    classifyPrAsBugFix:               'PR Bug-fix Classifier',
     generateScenariosFromJiraContext:'Jira Scenario Generation',
 };
 
@@ -30,7 +37,7 @@ function pairTraces(traces) {
     const pendingByKey = new Map(); // key → index in pairs
 
     for (const trace of traces) {
-        const key = `${trace.caller}`;
+        const key = `${trace.caller || 'unknown'}::${trace.correlationKey || trace.idPersisted || ''}`;
         if (trace.phase === 'request') {
             const idx = pairs.length;
             pairs.push({ request: trace, response: null });
@@ -177,13 +184,66 @@ function ResponseBubble({ trace, pending }) {
 
 function AgentChatDebug() {
     const { llmTraces, setLlmTraces } = useAppContext();
+    const [searchParams] = useSearchParams();
+    const runId = searchParams.get('run');
+    const [persistedSynthetic, setPersistedSynthetic] = useState([]);
     const bottomRef = useRef(null);
 
     useEffect(() => {
-        bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [llmTraces]);
+        if (!runId) {
+            setPersistedSynthetic([]);
+            return;
+        }
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/llm-traces?limit=500`);
+                if (!res.ok) throw new Error(await res.text());
+                const rows = await res.json();
+                if (cancelled) return;
+                const synth = [];
+                for (const row of rows) {
+                    let usage;
+                    try {
+                        usage = row.tokenUsage ? JSON.parse(row.tokenUsage) : undefined;
+                    } catch {
+                        usage = undefined;
+                    }
+                    const idp = `p${row.id}`;
+                    synth.push({
+                        caller: row.traceLabel || 'llm',
+                        correlationKey: idp,
+                        idPersisted: idp,
+                        phase: 'request',
+                        prompt: row.requestPayload || '',
+                        timestamp: row.createdAt,
+                        model: ''
+                    });
+                    synth.push({
+                        caller: row.traceLabel || 'llm',
+                        correlationKey: idp,
+                        idPersisted: idp,
+                        phase: 'response',
+                        response: row.responsePayload || '',
+                        usage,
+                        timestamp: row.createdAt,
+                        model: ''
+                    });
+                }
+                setPersistedSynthetic(synth);
+            } catch {
+                setPersistedSynthetic([]);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [runId]);
 
-    const pairs = useMemo(() => pairTraces(llmTraces), [llmTraces]);
+    useEffect(() => {
+        bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, [llmTraces, persistedSynthetic]);
+
+    const displayTraces = runId ? persistedSynthetic : llmTraces;
+    const pairs = useMemo(() => pairTraces(displayTraces), [displayTraces]);
 
     const handleClear = () => setLlmTraces([]);
 
@@ -197,11 +257,11 @@ function AgentChatDebug() {
                         Agent Console
                     </h1>
                     <p className="text-xs text-[#5E6C84] mt-1">
-                        Global real-time log of all system LLM calls &mdash; prompts on the right, responses on the left
+                        Global real-time log of LLM calls (add <span className="font-mono">?run=&lt;runId&gt;</span> to load stored traces from the backend).
                     </p>
                 </div>
                 <div className="flex items-center gap-3">
-                    <span className="text-xs text-[#8993A4]">{llmTraces.length} trace{llmTraces.length !== 1 ? 's' : ''}</span>
+                    <span className="text-xs text-[#8993A4]">{displayTraces.length} trace{displayTraces.length !== 1 ? 's' : ''}{runId ? ' (stored)' : ''}</span>
                     <button
                         onClick={handleClear}
                         className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-[#DFE1E6] hover:bg-[#C9372C]/20 border border-[#5E6C84]/40 hover:border-[#C9372C]/50 text-[#5E6C84] hover:text-[#C9372C] transition-colors"
